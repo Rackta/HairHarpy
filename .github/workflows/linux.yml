@@ -1,0 +1,50 @@
+# The Linux release: built here on GitHub (Ubuntu 22.04, so it runs on distributions from 2022 on) for every tag v*,
+# and by hand (Actions → Linux release → Run workflow). A tag puts the AppImage, the tar.gz and SHA256SUMS-linux.txt
+# into a draft release of that tag; the Windows files are added to the same draft by hand.
+name: Linux release
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build glslang-tools g++-12 libgl1-mesa-dev libegl1-mesa-dev libxkbcommon-dev \
+            libxkbcommon-x11-0 libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 \
+            libxcb-render-util0 libxcb-shape0 libxcb-xinerama0 libxcb-xkb1 libfontconfig1 libdbus-1-3 file
+      - uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.8.3'
+          host: linux
+          target: desktop
+          arch: linux_gcc_64
+          cache: true
+      - name: Build
+        env:
+          CC: gcc-12
+          CXX: g++-12
+        run: bash installer/linux/build-linux.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: HairHarpy-linux
+          path: |
+            dist/*.AppImage
+            dist/*.tar.gz
+            dist/SHA256SUMS-linux.txt
+          if-no-files-found: error
+      - name: Attach to the release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          files: |
+            dist/*.AppImage
+            dist/*.tar.gz
+            dist/SHA256SUMS-linux.txt

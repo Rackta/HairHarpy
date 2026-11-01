@@ -1,0 +1,2 @@
+// the program's icon (the exe in Explorer, the taskbar, the window)
+IDI_ICON1 ICON "app.ico"

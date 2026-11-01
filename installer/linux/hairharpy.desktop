@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=HairHarpy
+GenericName=Stylized hair modeller
+Comment=Stylized hair for games and animation: hair cards and meshes from curves, retopology, UV
+Exec=HairHarpy %f
+Icon=hairharpy
+Terminal=false
+Categories=Graphics;3DGraphics;
+MimeType=application/x-hairmesh;
+Keywords=hair;mesh;3D;retopology;UV;
