@@ -1,10 +1,7 @@
 # HairHarpy
 
-A Windows and Linux program for modelling stylized hair for games and animation — hair cards and hair meshes built from curves,
-plus a retopology and UV room for the rest of the character.
+A Windows and Linux program for modeling voluminous, stylized hairstyles with clean topology. The hair is constructed using curves and NURBS surfaces stretched between them, with mesh density and edge loops controlled via parameters—allowing for the creation of complex hairstyles without the need for time-consuming manual geometry editing.
 
-*По-русски: HairHarpy — программа для моделирования стилизованных причёсок для игр и анимации: волосы из кривых в
-меши, ретопология и UV. Ниже — где скачать и как проверить, что программа безопасна.*
 
 ## Download
 
