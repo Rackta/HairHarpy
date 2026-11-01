@@ -1,0 +1,17 @@
+{
+  "problemMatcher": [
+    {
+      "owner": "gcc-errors",
+      "pattern": [
+        {
+          "regexp": "^(?:/home/runner/work/[^/]+/[^/]+/)?([^:\\s]+):(\\d+):(\\d+):\\s+(?:fatal\\s+)?(error):\\s+(.*)$",
+          "file": 1,
+          "line": 2,
+          "column": 3,
+          "severity": 4,
+          "message": 5
+        }
+      ]
+    }
+  ]
+}

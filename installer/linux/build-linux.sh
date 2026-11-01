@@ -17,7 +17,7 @@ while [ $# -gt 0 ]; do case $1 in --qt) qt=$2; shift 2 ;; *) echo "unknown optio
 
 bld=$root/build/Linux; app=$root/build/AppDir; tools=$root/build/linux-tools; dist=$root/dist
 cmake -S "$root" -B "$bld" -G Ninja -DCMAKE_BUILD_TYPE=Release "-DCMAKE_PREFIX_PATH=$qt" -DHM_DEVTOOLS=ON
-cmake --build "$bld" --target HairHarpy
+cmake --build "$bld" --target HairHarpy -- -k 0   # (-k 0: on past a failed file — every error in one run)
 
 # linuxdeploy + its Qt plugin (they run without FUSE: extracted on the fly)
 mkdir -p "$tools"

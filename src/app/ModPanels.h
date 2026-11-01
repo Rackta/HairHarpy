@@ -17,10 +17,12 @@ class Scene;
 // Profile editor: LMB drags a point (Shift — snap to 0.05), RMB adds a point on the nearest edge, double click deletes one
 // (at least 3 stay). glue: a point brought within 8 px of a neighbour sticks to it (Ctrl + drag pulls one away);
 // onInsert / onDelete: the caller adds / removes the point (in several profiles at once) instead of this one alone
+// (Opts outside the class: GCC refuses a nested struct with member defaults as a default argument of its own class)
+struct ProfileEditorOpts { bool glue = false; std::function<void(int, double, std::array<double, 2>)> onInsert; std::function<void(int)> onDelete; };
 class ProfileEditor : public QWidget {
   Q_OBJECT
 public:
-  struct Opts { bool glue = false; std::function<void(int, double, std::array<double, 2>)> onInsert; std::function<void(int)> onDelete; };
+  using Opts = ProfileEditorOpts;
   ProfileEditor(std::function<tube::Profile*()> get, std::function<void()> onEdit, std::function<void()> onDone, Opts opts = {}, QWidget* parent = nullptr);
   QSize sizeHint() const override { return {238, 188}; }
 protected:

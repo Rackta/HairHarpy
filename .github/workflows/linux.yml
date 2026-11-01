@@ -1,6 +1,7 @@
 # The Linux release: built here on GitHub (Ubuntu 22.04, so it runs on distributions from 2022 on) for every tag v*,
 # and by hand (Actions → Linux release → Run workflow). A tag puts the AppImage, the tar.gz and SHA256SUMS-linux.txt
-# into a draft release of that tag; the Windows files are added to the same draft by hand.
+# into a draft release of that tag; the Windows files are added to the same draft by hand. Compiler errors show as the
+# run's annotations (.github/gcc-errors.json).
 name: Linux release
 on:
   push:
@@ -12,7 +13,7 @@ jobs:
   linux:
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Packages
         run: |
           sudo apt-get update
@@ -30,7 +31,9 @@ jobs:
         env:
           CC: gcc-12
           CXX: g++-12
-        run: bash installer/linux/build-linux.sh
+        run: |
+          echo "::add-matcher::.github/gcc-errors.json"
+          bash installer/linux/build-linux.sh
       - uses: actions/upload-artifact@v4
         with:
           name: HairHarpy-linux
