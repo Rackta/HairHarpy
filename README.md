@@ -7,7 +7,7 @@ A Windows and Linux program for modeling voluminous, stylized hairstyles with cl
 
 Everything is on the [Releases](../../releases) page:
 
-- **Windows**: `HairHarpy Setup <version>.exe` (the installer) or `HairHarpy-<version>-portable.zip`, hashes in
+- **Windows**: `HairHarpy-<version>-Setup.exe` (the installer) or `HairHarpy-<version>-portable.zip`, hashes in
   `SHA256SUMS.txt`;
 - **Linux**: `HairHarpy-<version>-x86_64.AppImage` (one file: `chmod +x` and run) or
   `HairHarpy-<version>-linux-x86_64.tar.gz` (a folder; `sh install.sh` adds it to the menu), hashes in

@@ -1,4 +1,4 @@
-# Builds "Native\dist\HairHarpy Setup <version>.exe": the native program (build.ps1 -Package — the exe,
+# Builds "Native\dist\HairHarpy-<version>-Setup.exe": the native program (build.ps1 -Package — the exe,
 # Qt, the MSVC runtime) zipped into Setup.exe with the uninstaller, the icons (<Hair_Modeller>\Icons) and the example
 # projects (Native\Examples\*.hairmesh, if any). Setup is C# compiled by the .NET Framework's csc (part of Windows).
 # Usage: powershell -NoProfile -ExecutionPolicy Bypass -File build-installer.ps1 [-Version 2.0.0] [-SkipBuild] [-Publish] [-Install]
@@ -51,7 +51,7 @@ $res = @("/resource:$obj\program.zip,payload.program.zip", "/resource:$obj\Unins
 $exDir = Join-Path $native 'Examples'
 if (Test-Path $exDir) { Get-ChildItem $exDir -File -Filter *.hairmesh | ForEach-Object { $res += "/resource:$($_.FullName),payload.example.$($_.Name)" } }
 New-Item -ItemType Directory -Force (Join-Path $native 'dist') | Out-Null
-$setup = Join-Path $native "dist\$name Setup $ver.exe"
+$setup = Join-Path $native "dist\$name-$ver-Setup.exe"   # (no spaces: GitHub turns them into dots in release files)
 Compile $setup "$obj\app.ico" @("$src\Common.cs", "$src\Setup.cs", "$obj\BuildInfo.cs") $res
 Write-Host "Built: $setup ($([math]::Round((Get-Item $setup).Length/1MB,1)) MB, version $ver, examples: $(@($res | Where-Object { $_ -like '*payload.example.*' }).Count))"
 if ($Publish) {

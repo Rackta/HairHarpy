@@ -39,7 +39,7 @@ powershell -ExecutionPolicy Bypass -File installer\build-installer.ps1 -Publish
 ```
 
 It builds the program (as above), then compiles the installer with `csc.exe` from the .NET Framework 4 that is part of
-Windows — nothing to install. The result is `dist\HairHarpy Setup <version>.exe`, plus `dist\SHA256SUMS.txt` and the
+Windows — nothing to install. The result is `dist\HairHarpy-<version>-Setup.exe`, plus `dist\SHA256SUMS.txt` and the
 portable zip.
 
 ## Build on Linux (x86_64)

@@ -14,8 +14,11 @@ building the program from source.
 Every release has a `SHA256SUMS.txt` file next to the downloads. Compare it with the hash of the file you downloaded:
 
 ```powershell
-Get-FileHash "HairHarpy Setup 2.0.0.exe" -Algorithm SHA256
+Get-FileHash "HairHarpy-<version>-Setup.exe" -Algorithm SHA256
 ```
+
+(Use the name of the file you downloaded. The 2.0.0 installer is `HairHarpy.Setup.2.0.0.exe`; GitHub put the dots in
+place of spaces. Later installers are named `HairHarpy-<version>-Setup.exe`. On Linux: `sha256sum -c SHA256SUMS-linux.txt`.)
 
 The hash must match the line in `SHA256SUMS.txt` exactly. If it doesn't, the file was changed or damaged on the way:
 don't run it.
@@ -23,9 +26,11 @@ don't run it.
 ## 2. Scan it (1 minute)
 
 Upload the installer to [VirusTotal](https://www.virustotal.com/) — it checks the file with about 70 antivirus engines.
-The release notes link the report for each release. An unsigned program from a small author may get one or two
-"generic" or "ML" detections from less known engines. That is common for unsigned files. Detections by name from
-several major engines are not.
+The release notes link the report for each release. An unsigned program from a small author usually gets a few
+detections from smaller engines that judge by machine learning or by how new and rare a file is: "Unsafe",
+"Malicious", "ml.score", or a "name" that is just the file's hash. The 2.0.0 installer got 6 of 64 of this kind, with
+every major engine clean. That is common for new unsigned files and fades as more people download them. A named threat
+from several major engines (Microsoft, Kaspersky, ESET, Bitdefender and the like) is not.
 
 ## 3. Don't install anything: use the portable version
 
