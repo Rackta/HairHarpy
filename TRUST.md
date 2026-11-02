@@ -82,7 +82,8 @@ Your build is a program you made yourself from code you can read. You don't have
   - exchange files for RizomUV into `%TEMP%\HairHarpy`, when you send a mesh there;
   - **only while you record a session** (the **● Rec** button, pressed again to stop): a folder
     `Documents\HairHarpy Sessions\session_<date>` with a log of the session — the tools, actions and buttons you used,
-    the program's messages, moments the window froze, the project's name and path, the camera, the names and polygon
+    which of the program's windows got a mouse press or the wheel (no position), the system's and desktop's names and the
+    Qt version, the program's messages, moments the window froze, the project's name and path, the camera, the names and polygon
     counts of the selected and shown meshes — and your notes (**✎ Note** / F9): your text and a picture of the program's
     window with your drawing over it. No mesh data and no other files go into it;
   - **if the program crashes**: a crash dump `crash_<time>.dmp` into `Documents\HairHarpy Sessions` (into the session's
@@ -120,7 +121,7 @@ with `sha256sum -c SHA256SUMS-linux.txt`.
   `~/.local/share/mime/packages/hairharpy.xml`. `uninstall.sh` removes exactly these.
 - The program behaves as described in section 5, with Linux places: settings in `~/.config/Catarackta/HairHarpy.conf`;
   projects, presets and autosaves in `~/.local/share/Catarackta/HairHarpy`; RizomUV exchange files in
-  `/tmp/HairHarpy`; session recordings in `~/Documents/HairHarpy Sessions`. The Linux build writes no crash dumps.
+  `/tmp/HairHarpy`; session recordings in `~/Documents/HairHarpy Sessions` (in `~/HairHarpy Sessions` where there is no Documents folder). The Linux build writes no crash dumps.
 - To see it yourself: `strace -f -e trace=network` or `ss -tp` show that its only connection is the bridge's
   `127.0.0.1`.
 

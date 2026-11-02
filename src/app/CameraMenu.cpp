@@ -243,7 +243,7 @@ public:
     for (int i : vp_->shownPanes()) { QRect r = vp_->paneRect(i); sig += QString("%1:%2,%3,%4,%5:%6;").arg(i).arg(r.x()).arg(r.y()).arg(r.width()).arg(r.height()).arg(vp_->paneLabel(i)); }
     for (auto& l : vp_->viewLabels()) sig += QString("%1,%2,%3;").arg(int(l.p.x())).arg(int(l.p.y())).arg(l.text);
     const Quat& q = vp_->camera().quat; QString qs = QString("%1,%2,%3,%4").arg(q.x, 0, 'f', 4).arg(q.y, 0, 'f', 4).arg(q.z, 0, 'f', 4).arg(q.w, 0, 'f', 4);
-    if (sig != sig_) { sig_ = sig; labels_->setGeometry(g); labels_->update(); if (!labels_->isVisible()) labels_->show(); }
+    if (sig != sig_) { sig_ = sig; labels_->setGeometry(g); labels_->syncMask(); labels_->update(); if (!labels_->isVisible()) labels_->show(); }
     if (vp_->camera().view == "uv") { axes_->hide(); return; }   // (the UV Editor: no 3D axes)
     QRect ar(g.right() - 112 - 6, g.bottom() - 112 - 6, 112, 112);
     if (ar != axes_->geometry()) axes_->setGeometry(ar);
@@ -254,7 +254,19 @@ private:
   class Labels : public QWidget {
   public:
     explicit Labels(ViewOverlay* o) : QWidget(o->host_->window(), Qt::Tool | Qt::FramelessWindowHint | Qt::WindowTransparentForInput | Qt::WindowDoesNotAcceptFocus | Qt::NoDropShadowWindowHint), o_(o) {
-      setAttribute(Qt::WA_TranslucentBackground); setAttribute(Qt::WA_ShowWithoutActivating); setAttribute(Qt::WA_TransparentForMouseEvents);
+      setObjectName("viewLabels"); setAttribute(Qt::WA_TranslucentBackground); setAttribute(Qt::WA_ShowWithoutActivating); setAttribute(Qt::WA_TransparentForMouseEvents);
+    }
+    // (off Windows: the window only where it paints — the size of the viewport and over it, it must not stand in the mouse's
+    // way even where the window system doesn't let the input through)
+    void syncMask() {
+#ifndef Q_OS_WIN
+      QFont f = font(); f.setPointSizeF(8.5); const QFontMetrics fm(f); QRegion r;
+      auto panes = o_->vp_->shownPanes();
+      for (int i : panes) { QRect pr = o_->vp_->paneRect(i), tr = fm.boundingRect(o_->vp_->paneLabel(i)).adjusted(-6, -3, 6, 3); tr.moveTopLeft(QPoint(pr.x() + 10, pr.y() + (panes.size() > 1 ? 6 : 8))); r += tr.adjusted(-2, -2, 2, 2); }
+      f.setBold(true); const QFontMetrics fb(f);
+      for (auto& l : o_->vp_->viewLabels()) { QRectF tr = QRectF(fb.boundingRect(l.text)).adjusted(-5, -2, 5, 2); tr.moveCenter(l.p); r += tr.toAlignedRect().adjusted(-2, -2, 2, 2); }
+      setMask(r.isEmpty() ? QRegion(0, 0, 1, 1) : r);   // (an empty mask is no mask: the whole window)
+#endif
     }
   protected:
     void paintEvent(QPaintEvent*) override {
@@ -281,7 +293,7 @@ private:
   class Axes : public QWidget {
   public:
     explicit Axes(ViewOverlay* o) : QWidget(o->host_->window(), Qt::Tool | Qt::FramelessWindowHint | Qt::WindowDoesNotAcceptFocus | Qt::NoDropShadowWindowHint), o_(o) {
-      setAttribute(Qt::WA_TranslucentBackground); setAttribute(Qt::WA_ShowWithoutActivating); setMouseTracking(true);
+      setObjectName("viewAxes"); setAttribute(Qt::WA_TranslucentBackground); setAttribute(Qt::WA_ShowWithoutActivating); setMouseTracking(true);
     }
   protected:
     struct End { int k, s; QColor col; double x, y, z; };

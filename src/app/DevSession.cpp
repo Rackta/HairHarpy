@@ -9,7 +9,11 @@
 #include "view/Viewport.h"
 #include <QAbstractButton>
 #include <QApplication>
+#include <QGuiApplication>
 #include <QMenu>
+#include <QSysInfo>
+#include <QWheelEvent>
+#include <QWindow>
 #include <QClipboard>
 #include <QDateTime>
 #include <QDialog>
@@ -134,7 +138,10 @@ void DevSession::start() {
   dir_ = QDir(sessionsRoot()).filePath("session_" + QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss")); QDir().mkpath(dir_);
   file_ = QDir(dir_).filePath("session.jsonl"); notes_ = 0; on_ = true; clock_.start(); tick_.start(); timer_->start(); qApp->installEventFilter(this);
   lastTool_ = vp_->tool(); lastMode_ = vp_->topoMode; lastSel_ = vp_->pickedInfo();
-  event("start", state());
+  { QJsonObject s = state();   // (the system: what a problem on one of them depends on)
+    s.insert("system", QJsonObject{{"os", QSysInfo::prettyProductName()}, {"qt", qVersion()}, {"platform", QGuiApplication::platformName()},
+                                   {"session", QString::fromLocal8Bit(qgetenv("XDG_SESSION_TYPE"))}, {"desktop", QString::fromLocal8Bit(qgetenv("XDG_CURRENT_DESKTOP"))}});
+    event("start", s); }
 #ifdef _WIN32
   setCrashDir(dir_, true); g_t0 = GetTickCount64() - ULONGLONG(clock_.elapsed());
 #endif
@@ -214,6 +221,17 @@ bool DevSession::eventFilter(QObject* o, QEvent* e) {
   if (on_ && e->type() == QEvent::KeyPress) { auto* k = static_cast<QKeyEvent*>(e);
     if (!k->isAutoRepeat() && k->timestamp() != lastKeyStamp_) { lastKeyStamp_ = k->timestamp(); QWidget* fw = QApplication::focusWidget();
       event("key", {{"key", QKeySequence(k->keyCombination()).toString()}, {"focus", fw ? QString(fw->metaObject()->className()) + (fw->objectName().isEmpty() ? QString() : " " + fw->objectName()) : QString()}}); } }
+  // (a mouse press or the wheel: which of the program's windows got it — what stands over the viewport shows; no position)
+  if (on_ && (e->type() == QEvent::MouseButtonPress || e->type() == QEvent::Wheel)) if (auto* w = qobject_cast<QWindow*>(o)) {
+    static qint64 lastWheel = -1000; const bool wheel = e->type() == QEvent::Wheel;
+    if (!wheel || clock_.elapsed() - lastWheel > 1000 || clock_.elapsed() < lastWheel) {   // (a turn of the wheel: one line)
+      if (wheel) lastWheel = clock_.elapsed();
+      QString name = QString(w->metaObject()->className()) + (w->objectName().isEmpty() ? QString() : " " + w->objectName());
+      for (QWidget* t : QApplication::topLevelWidgets()) if (t->windowHandle() == w) { name = QString(t->metaObject()->className()) + (t->objectName().isEmpty() ? QString() : " " + t->objectName()); break; }
+      QJsonObject in{{"window", name}, {"what", wheel ? "wheel" : "press"}, {"mods", int(static_cast<QInputEvent*>(e)->modifiers().toInt() >> 24)}};
+      if (!wheel) in.insert("button", int(static_cast<QMouseEvent*>(e)->button()));
+      event("input", in);
+    } }
   if (on_ && e->type() == QEvent::MouseButtonRelease) {
     if (auto* b = qobject_cast<QAbstractButton*>(o); b && b->isEnabled() && b->underMouse()) event("ui", {{"button", b->text()}, {"name", b->objectName()}, {"tip", b->toolTip().left(70)}, {"checked", b->isCheckable() ? QJsonValue(!b->isChecked()) : QJsonValue()}});
     else if (auto* m = qobject_cast<QMenu*>(o); m && m->activeAction()) event("ui", {{"menu", m->activeAction()->text()}});
