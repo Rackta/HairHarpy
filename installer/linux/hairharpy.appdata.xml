@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- AppStream metainfo: what software catalogs (the AppImage catalog among them) show about the program — its name, its
+     description and a screenshot of the real main window. build-linux.sh puts it into usr/share/metainfo of the AppDir.
+     Named after hairharpy.desktop: appimagetool looks for <desktop file's name>.appdata.xml. -->
+<component type="desktop-application">
+  <id>io.github.rackta.HairHarpy</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>LicenseRef-proprietary=https://github.com/Rackta/HairHarpy/blob/main/LICENSE.md</project_license>
+  <name>HairHarpy</name>
+  <summary>Model stylized hair with clean topology</summary>
+  <description>
+    <p>HairHarpy is a program for modelling voluminous, stylized hairstyles with clean topology. The hair is built from
+      curves and surfaces stretched between them; mesh density and edge loops are set by parameters, so a complex
+      hairstyle needs no manual geometry editing.</p>
+    <p>It has three rooms:</p>
+    <ul>
+      <li>Hair: locks from curves, cocoons, braids, curls, conversion into a welded mesh</li>
+      <li>Topology: retopology and modelling over a high-poly model, modifiers, a UV editor</li>
+      <li>Paint: painting on the model in layers, baking, PSD exchange with image editors</li>
+    </ul>
+    <p>The program does not connect to the internet. It needs a graphics driver with Vulkan 1.1.</p>
+  </description>
+  <launchable type="desktop-id">hairharpy.desktop</launchable>
+  <developer id="io.github.rackta">
+    <name>catarackta</name>
+  </developer>
+  <url type="homepage">https://github.com/Rackta/HairHarpy</url>
+  <url type="bugtracker">https://github.com/Rackta/HairHarpy/issues</url>
+  <url type="vcs-browser">https://github.com/Rackta/HairHarpy</url>
+  <categories>
+    <category>Graphics</category>
+    <category>3DGraphics</category>
+  </categories>
+  <keywords>
+    <keyword>hair</keyword>
+    <keyword>mesh</keyword>
+    <keyword>3D</keyword>
+    <keyword>retopology</keyword>
+    <keyword>UV</keyword>
+  </keywords>
+  <provides>
+    <binary>HairHarpy</binary>
+    <mediatype>application/x-hairmesh</mediatype>
+  </provides>
+  <screenshots>
+    <screenshot type="default">
+      <caption>The Hair room: cocoons and a lock converted into a mesh</caption>
+      <image type="source" width="1440" height="810">https://raw.githubusercontent.com/Rackta/HairHarpy/main/installer/linux/screenshot.png</image>
+    </screenshot>
+  </screenshots>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="2.0.1" date="2026-11-22">
+      <url type="details">https://github.com/Rackta/HairHarpy/releases/tag/v2.0.1</url>
+    </release>
+    <release version="2.0.0" date="2026-11-02">
+      <url type="details">https://github.com/Rackta/HairHarpy/releases/tag/v2.0.0</url>
+    </release>
+  </releases>
+</component>

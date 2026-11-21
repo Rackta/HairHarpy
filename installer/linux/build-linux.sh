@@ -34,6 +34,14 @@ cp "$bld/HairHarpy" "$app/usr/bin/"
 for f in LICENSE.md THIRD_PARTY_NOTICES.md TRUST.md TRUST.ru.md; do
   for p in "$root/public/$f" "$root/$f"; do [ -f "$p" ] && { cp "$p" "$app/usr/share/doc/hairharpy/"; break; }; done
 done
+# the AppStream metainfo: the name, the description and a screenshot of the real main window for software catalogs
+# (screenshot.png here is what its link shows; it stays in the repository, not in the package). Checked here, if
+# appstreamcli is installed, without stopping the build: the file is a description, not a part of the program
+mkdir -p "$app/usr/share/metainfo"
+cp "$here/hairharpy.appdata.xml" "$app/usr/share/metainfo/"
+if command -v appstreamcli >/dev/null 2>&1; then
+  appstreamcli validate --no-net "$here/hairharpy.appdata.xml" || echo "::warning::AppStream metainfo: appstreamcli reports problems (see the log; the build goes on)"
+fi
 linuxdeploy-x86_64.AppImage --appdir "$app" --executable "$app/usr/bin/HairHarpy" \
   --desktop-file "$here/hairharpy.desktop" --icon-file "$here/hairharpy.png" --plugin qt
 # (no network plugins: the program's only connection is the bridge to 127.0.0.1 — TRUST.md)
@@ -42,7 +50,8 @@ rm -rf "$app/usr/plugins/tls" "$app/usr/plugins/networkinformation" "$app/usr/pl
 mkdir -p "$dist"
 appimage=HairHarpy-$ver-x86_64.AppImage; tarball=HairHarpy-$ver-linux-x86_64.tar.gz
 rm -f "$dist/$appimage" "$dist/$tarball"
-(cd "$dist" && LINUXDEPLOY_OUTPUT_VERSION=$ver OUTPUT=$appimage linuxdeploy-x86_64.AppImage --appdir "$app" --output appimage)
+# (LDAI_NO_APPSTREAM: appimagetool would stop the build on any remark about the metainfo — it is checked above instead)
+(cd "$dist" && LINUXDEPLOY_OUTPUT_VERSION=$ver OUTPUT=$appimage LDAI_OUTPUT=$appimage LDAI_NO_APPSTREAM=1 linuxdeploy-x86_64.AppImage --appdir "$app" --output appimage)
 
 # the folder version: the AppDir as it is, with install.sh / uninstall.sh and the icon at its top
 stage=$root/build/linux-stage; rm -rf "$stage"; mkdir -p "$stage"
