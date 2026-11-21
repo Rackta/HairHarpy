@@ -1,7 +1,5 @@
 # Can I trust the installer?
 
-*Русская версия: [TRUST.ru.md](TRUST.ru.md)*
-
 HairHarpy is made by one person. A code-signing certificate costs hundreds of dollars a year, so the installer and the
 program are **not signed**. Because of that, Windows SmartScreen shows "Windows protected your PC" the first time you
 run them. That warning means "unknown publisher", not "a virus was found".

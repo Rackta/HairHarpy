@@ -14,7 +14,7 @@ Everything is on the [Releases](../../releases) page:
   `SHA256SUMS-linux.txt`.
 
 The files are **not code-signed** (the author is one person, and a certificate costs hundreds of dollars a year), so
-Windows SmartScreen warns on the first run. **[TRUST.md](TRUST.md)** ([по-русски](TRUST.ru.md)) explains what the
+Windows SmartScreen warns on the first run. **[TRUST.md](TRUST.md)** explains what the
 installer and the program do on your computer and how to check every word of it yourself — from comparing a hash to
 building the program from this source code.
 

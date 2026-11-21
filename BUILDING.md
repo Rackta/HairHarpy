@@ -1,7 +1,5 @@
 # Building HairHarpy from source
 
-*Коротко по-русски — в конце файла.*
-
 Everything here is free. The build takes about 10 minutes the first time (CMake downloads a few dependencies) and a
 couple of minutes after that.
 
@@ -92,16 +90,3 @@ have the same hash as ours. What you can compare:
 | `installer` | the installer and the release scripts |
 | `tools` | console checks (`hm_selftest`, `hm_uvtest`) |
 
----
-
-## Коротко по-русски
-
-1. Установите Visual Studio 2022 (Community) с «Разработкой классических приложений на C++», Qt 6.8.3 для
-   MSVC 2022 64-bit (`C:\Qt\6.8.3\msvc2022_64`) и Git.
-2. В папке репозитория в PowerShell: `.\build.ps1 -Package -Publish`.
-3. Запустите `dist\HairHarpy\HairHarpy.exe`. Это та же программа, что и в релизе, только собранная вами.
-
-Установщик (не обязательно): `powershell -ExecutionPolicy Bypass -File installer\build-installer.ps1 -Publish`.
-
-Linux: Qt 6.8.3 gcc 64-bit, пакеты из раздела «Build on Linux», затем
-`bash installer/linux/build-linux.sh --qt ~/Qt/6.8.3/gcc_64` — в `dist/` появятся AppImage, tar.gz и хеши.

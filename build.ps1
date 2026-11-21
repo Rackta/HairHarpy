@@ -46,7 +46,7 @@ if ($Package -and -not $Debug) {
   Copy-Item (Join-Path $crt.FullName "*.dll") $dist
   # the license, the third-party notices (Qt's LGPL asks for them beside its DLLs), what the program does — public\ here,
   # the root in the published source
-  foreach ($f in "LICENSE.md", "THIRD_PARTY_NOTICES.md", "TRUST.md", "TRUST.ru.md") {
+  foreach ($f in "LICENSE.md", "THIRD_PARTY_NOTICES.md", "TRUST.md") {
     $p = @((Join-Path $root "public\$f"), (Join-Path $root $f)) | Where-Object { Test-Path $_ } | Select-Object -First 1
     if ($p) { Copy-Item $p $dist } }
   $zip = Join-Path $root "dist\HairHarpy.zip"

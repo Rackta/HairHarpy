@@ -31,7 +31,7 @@ export PATH="$tools:$PATH"
 # the AppDir: the program, Qt (xcb only: Vulkan through X11 / XWayland), the licence and the notices beside it
 rm -rf "$app"; mkdir -p "$app/usr/bin" "$app/usr/share/doc/hairharpy"
 cp "$bld/HairHarpy" "$app/usr/bin/"
-for f in LICENSE.md THIRD_PARTY_NOTICES.md TRUST.md TRUST.ru.md; do
+for f in LICENSE.md THIRD_PARTY_NOTICES.md TRUST.md; do
   for p in "$root/public/$f" "$root/$f"; do [ -f "$p" ] && { cp "$p" "$app/usr/share/doc/hairharpy/"; break; }; done
 done
 # the AppStream metainfo: the name, the description and a screenshot of the real main window for software catalogs
