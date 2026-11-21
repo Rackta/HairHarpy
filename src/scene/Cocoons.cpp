@@ -1,4 +1,5 @@
-#include "scene/Cocoons.h"
+﻿#include "scene/Cocoons.h"
+#include <array>
 #include <QJsonArray>
 #include <QJsonObject>
 #include <algorithm>
@@ -48,10 +49,107 @@ double cocoonF(const CocoonGeo& G, double s) {
 Vec3 cocoonPt(const CocoonGeo& G, int i, double th) { return G.c[i] + G.u[i] * (std::cos(th) * G.a[i]) + G.v[i] * (std::sin(th) * G.b[i]); }
 double cmaskAt(const std::vector<double>& M, double f) {
   if (M.empty()) return 0;
+  if (M.size() < size_t(CMASK_N)) {                             // (a record with fewer values than the mask has: read over its own length)
+    const int n = int(M.size()); if (n == 1) return M[0];
+    const double x = clamp(f, 0, 1) * (n - 1); const int i = std::min(n - 2, int(std::floor(x))); return M[size_t(i)] + (M[size_t(i + 1)] - M[size_t(i)]) * (x - i); }
   double x = clamp(f, 0, 1) * (CMASK_N - 1); int i = std::min(CMASK_N - 2, int(std::floor(x)));
   return M[i] + (M[i + 1] - M[i]) * (x - i);
 }
+// how many full turns a polyline's direction makes (a coil: as many as it winds); COIL_TURNS and up it is taken for a coil
+double turnsOf(const std::vector<Vec3>& Q) {   // (bends one way and the other cancel: a wavy lock is not a coil)
+  std::vector<Vec3> b; std::vector<double> a; Vec3 p, B; bool have = false;
+  for (size_t i = 1; i < Q.size(); i++) { const Vec3 d = Q[i] - Q[i - 1]; if (d.lengthSq() < 1e-16) continue; const Vec3 u = d.normalized(); if (have) { const double an = std::acos(clamp(p.dot(u), -1, 1)); const Vec3 c = p.cross(u); if (c.lengthSq() > 1e-18) { const Vec3 cn = c.normalized(); b.push_back(cn); a.push_back(an); B += cn * an; } } p = u; have = true; }
+  if (B.lengthSq() < 1e-18) return 0; const Vec3 Bn = B.normalized(); double s = 0; for (size_t i = 0; i < a.size(); i++) s += a[i] * b[i].dot(Bn); return std::abs(s) / (2 * PI);
+}
+const double COIL_TURNS = 2.0;
+// each point's place along a polyline as a share 0…1 of its turns (and a little of its length: a straight stretch still goes on)
+std::vector<double> turnParam(const std::vector<Vec3>& Q) {
+  std::vector<double> a{0}, l{0}; Vec3 p; bool have = false;
+  for (size_t i = 1; i < Q.size(); i++) { const Vec3 d = Q[i] - Q[i - 1]; const double n = d.length(); double da = 0; if (n > 1e-12) { const Vec3 u = d * (1 / n); if (have) da = std::acos(clamp(p.dot(u), -1, 1)); p = u; have = true; } a.push_back(a.back() + da); l.push_back(l.back() + n); }
+  const double A = a.back() > 1e-9 ? a.back() : 1, L = l.back() > 1e-12 ? l.back() : 1; std::vector<double> o; for (size_t i = 0; i < a.size(); i++) o.push_back(0.85 * a[i] / A + 0.15 * l[i] / L); return o;
+}
+std::vector<Vec3> resampleBy(const std::vector<Vec3>& Q, const std::vector<double>& v, int n) {
+  std::vector<Vec3> out; size_t j = 0; for (int k = 0; k < n; k++) { const double s = double(k) / (n - 1); while (j + 2 < Q.size() && v[j + 1] < s) j++; const double g = v[j + 1] - v[j]; out.push_back(Q[j].lerp(Q[j + 1], g > 0 ? clamp((s - v[j]) / g, 0, 1) : 0)); } return out;
+}
 std::vector<double> numbers(const QJsonValue& v) { std::vector<double> o; for (const QJsonValue& x : v.toArray()) o.push_back(x.toDouble()); return o; }
+
+// ---- Spiral: a stretch of the spine that winds round an axis ----
+// The loops of a coil go `loops` to a turn, all at the same phase of every turn — whatever the coil is like now (hand-shaped,
+// uneven, a flatter turn here and a looser one there). The axis is found from the spine itself: round each point the plane of
+// the tangents over about a turn and a half (its normal); how far the tangent has turned round that axis, summed along the stretch, is the phase.
+// Where it winds less than a turn and a quarter (or hardly leaves the axis) it is no spiral → empty (the usual loops).
+// → the places s (arc length of the spine) of the loops inside [sa, sb], both ends included; turns — how many it winds.
+std::vector<double> spiralLattice(const CocoonGeo& G, double sa, double sb, int loops, double phase01, double* turns = nullptr) {
+  std::vector<double> out; if (turns) *turns = 0;
+  const double len = sb - sa; if (G.N < 4 || !(len > 0) || loops < 2) return out;
+  const double st = G.D[size_t(G.N - 1)] / double(G.N - 1);
+  const int M = std::clamp(int(len / std::max(st, 1e-12) * 2), 64, 4000); const double ds = len / M;
+  auto pointAt = [&](double s) {
+    s = std::clamp(s, 0.0, G.D[size_t(G.N - 1)]);
+    int i = int(std::upper_bound(G.D.begin(), G.D.end(), s) - G.D.begin()); i = std::clamp(i, 1, G.N - 1);
+    const double d = G.D[size_t(i)] - G.D[size_t(i - 1)]; return G.c[size_t(i - 1)].lerp(G.c[size_t(i)], d > 0 ? clamp((s - G.D[size_t(i - 1)]) / d, 0, 1) : 0);
+  };
+  std::vector<Vec3> P(size_t(M) + 1), T(size_t(M) + 1);
+  for (int j = 0; j <= M; j++) P[size_t(j)] = pointAt(sa + ds * j);
+  for (int j = 0; j <= M; j++) { Vec3 d = P[size_t(std::min(j + 1, M))] - P[size_t(std::max(j - 1, 0))]; T[size_t(j)] = d.lengthSq() > 1e-30 ? d.normalized() : (j ? T[size_t(j - 1)] : Vec3(0, 1, 0)); }
+  // (the tangents of a coil lie on a small circle of the sphere, in a plane across the axis: the axis is that plane's normal —
+  // the direction the tangents vary least in, found from their covariance over a window of a turn and a half)
+  std::vector<Vec3> pre{Vec3()}; std::vector<std::array<double, 6>> pre2{{0, 0, 0, 0, 0, 0}};
+  for (const Vec3& t : T) { pre.push_back(pre.back() + t); auto q = pre2.back(); q[0] += t.x * t.x; q[1] += t.x * t.y; q[2] += t.x * t.z; q[3] += t.y * t.y; q[4] += t.y * t.z; q[5] += t.z * t.z; pre2.push_back(q); }
+  auto leastDir = [](const double c[6], Vec3& axis, double& spread) {   // symmetric 3×3 (xx xy xz yy yz zz): Jacobi sweeps → the eigenvector of the least eigenvalue
+    double a[3][3] = {{c[0], c[1], c[2]}, {c[1], c[3], c[4]}, {c[2], c[4], c[5]}}, v[3][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
+    for (int sweep = 0; sweep < 12; sweep++) for (int p = 0; p < 2; p++) for (int q = p + 1; q < 3; q++) {
+      if (std::abs(a[p][q]) < 1e-15) continue;
+      const double th = (a[q][q] - a[p][p]) / (2 * a[p][q]), t = (th >= 0 ? 1 : -1) / (std::abs(th) + std::sqrt(th * th + 1)), cs = 1 / std::sqrt(t * t + 1), sn = t * cs;
+      for (int k = 0; k < 3; k++) { const double x = a[k][p], y = a[k][q]; a[k][p] = cs * x - sn * y; a[k][q] = sn * x + cs * y; }
+      for (int k = 0; k < 3; k++) { const double x = a[p][k], y = a[q][k]; a[p][k] = cs * x - sn * y; a[q][k] = sn * x + cs * y; }
+      for (int k = 0; k < 3; k++) { const double x = v[k][p], y = v[k][q]; v[k][p] = cs * x - sn * y; v[k][q] = sn * x + cs * y; }
+    }
+    int lo = 0, hi = 0; for (int k = 1; k < 3; k++) { if (a[k][k] < a[lo][lo]) lo = k; if (a[k][k] > a[hi][hi]) hi = k; }
+    axis = Vec3(v[0][lo], v[1][lo], v[2][lo]); spread = a[hi][hi];
+  };
+  double bend = 0; for (int j = 1; j <= M; j++) bend += std::acos(clamp(T[size_t(j - 1)].dot(T[size_t(j)]), -1, 1));
+  double W = clamp(1.5 * len / std::max(bend / (2 * PI), 0.5), 4 * ds, len);   // (about a turn and a fifth: the axis is the tangents' mean over it)
+  std::vector<double> phi(size_t(M) + 1, 0.0), phiKeep; double perp = 0, perpKeep = 0;
+  for (int it = 0; it < 3; it++) {
+    if (it) { phiKeep = phi; perpKeep = perp; }
+    std::vector<Vec3> A(size_t(M) + 1); const int hw = std::max(1, int(W / ds / 2));
+    for (int j = 0; j <= M; j++) {
+      const int lo = std::max(0, j - hw), hi = std::min(M, j + hw); const double n = hi - lo + 1;
+      const Vec3 m = (pre[size_t(hi) + 1] - pre[size_t(lo)]) * (1 / n); double c[6]; for (int k = 0; k < 6; k++) c[k] = (pre2[size_t(hi) + 1][size_t(k)] - pre2[size_t(lo)][size_t(k)]) / n;
+      c[0] -= m.x * m.x; c[1] -= m.x * m.y; c[2] -= m.x * m.z; c[3] -= m.y * m.y; c[4] -= m.y * m.z; c[5] -= m.z * m.z;
+      Vec3 a; double spread = 0; leastDir(c, a, spread);
+      if (spread < 1e-9 || a.lengthSq() < 0.5) a = j ? A[size_t(j - 1)] : T[size_t(j)];                 // (the tangents hardly vary: no axis here)
+      if (j ? a.dot(A[size_t(j - 1)]) < 0 : (m.lengthSq() > 1e-6 && a.dot(m) < 0)) a = a * -1;         // (the axis keeps its sense along the stretch)
+      A[size_t(j)] = a.normalized();
+    }
+    auto flat = [](const Vec3& t, const Vec3& a) { Vec3 u = t - a * t.dot(a); return u.lengthSq() > 1e-12 ? u.normalized() : Vec3(); };
+    std::vector<double> d(size_t(M), 0.0); double sum = 0; perp = 0;
+    for (int j = 0; j < M; j++) {
+      const Vec3 a = (A[size_t(j)] + A[size_t(j + 1)]).normalized(); perp += (T[size_t(j)] - a * T[size_t(j)].dot(a)).length();
+      const Vec3 u0 = flat(T[size_t(j)], a), u1 = flat(T[size_t(j + 1)], a); if (u0.lengthSq() < 0.5 || u1.lengthSq() < 0.5) continue;
+      d[size_t(j)] = std::atan2(a.dot(u0.cross(u1)), u0.dot(u1)); sum += d[size_t(j)];
+    }
+    perp /= M; const double sg = sum < 0 ? -1 : 1; phi[0] = 0;
+    for (int j = 0; j < M; j++) phi[size_t(j + 1)] = phi[size_t(j)] + std::max(0.0, d[size_t(j)] * sg);
+    // (a refinement only while it agrees with what the turn length before it gave: a window shorter than a turn tilts the axis
+    // along the tangent and the phase runs away — then the earlier result stands)
+    if (it && (phi[size_t(M)] > 1.25 * phiKeep[size_t(M)] || phi[size_t(M)] < 0.8 * phiKeep[size_t(M)])) { phi = phiKeep; perp = perpKeep; break; }
+    const double w = phi[size_t(M)] / len; if (w < 1e-9) break; const double nW = clamp(1.5 * 2 * PI / w, 4 * ds, len); if (std::abs(nW - W) < 0.05 * W) break; W = nW;
+  }
+  const double total = phi[size_t(M)]; if (turns) *turns = total / (2 * PI);
+  if (total < 2 * PI * 1.25 || perp < 0.25) return out;
+  const double step = 2 * PI / loops, typ = len / (total / step);
+  out.push_back(sa);
+  for (int k = 0; ; k++) {
+    const double psi = (phase01 > 0 ? phase01 : 0) * step + k * step; if (psi >= total) break;
+    const int j = int(std::upper_bound(phi.begin(), phi.end(), psi) - phi.begin()); if (j <= 0 || j > M) continue;
+    const double a = phi[size_t(j - 1)], b = phi[size_t(j)], s = sa + ds * (j - 1 + (b > a ? (psi - a) / (b - a) : 0.0));
+    if (s - out.back() < 0.35 * typ || sb - s < 0.35 * typ) continue;
+    out.push_back(s);
+  }
+  out.push_back(sb); return out;
+}
 std::string joinIds(const std::vector<int>& ids) { std::string s; for (size_t i = 0; i < ids.size(); i++) { if (i) s += ','; s += std::to_string(ids[i]); } return s; }
 
 struct Shape { std::vector<Vec3> c, u; std::vector<double> a, b; };
@@ -84,10 +182,12 @@ public:
         for (const QJsonValue& v : sh.value("c").toArray()) x.shape.c.push_back(vec(v));
         for (const QJsonValue& v : sh.value("u").toArray()) x.shape.u.push_back(vec(v));
         x.shape.a = numbers(sh.value("a")); x.shape.b = numbers(sh.value("b"));
+        const size_t n = x.shape.c.size();                       // (a record whose four lists are not one length: no shape — never indexed past one)
+        if (x.shape.u.size() != n || x.shape.a.size() != n || x.shape.b.size() != n) { x.shape.c.clear(); x.shape.u.clear(); x.shape.a.clear(); x.shape.b.clear(); }
       }
       QJsonObject live = k->raw.value("live").toObject();
       x.live = !live.isEmpty();
-      for (const QJsonValue& e : live.value("ends").toArray()) { std::vector<int> v; for (const QJsonValue& q : e.toArray()) v.push_back(q.toInt()); x.ends.push_back(v); }
+      for (const QJsonValue& e : live.value("ends").toArray()) { std::vector<int> v; for (const QJsonValue& q : e.toArray()) v.push_back(q.toInt()); if (v.size() >= 2) x.ends.push_back(v); }   // (a strand's ends: two ids at least)
       x.hasLock = live.value("lock").isArray();
       for (const QJsonValue& q : live.value("lock").toArray()) x.lock.push_back(q.toInt());
     }
@@ -115,7 +215,7 @@ public:
     return dirty;
   }
   bool liveState(int id, QJsonObject& shape, QJsonArray& ends) const {
-    auto it = ks.find(id); if (it == ks.end() || it->second.shape.c.empty()) return false;
+    auto it = ks.find(id); if (it == ks.end() || sc.item(id) != it->second.it || it->second.shape.c.empty()) return false;
     const K& k = it->second;
     auto v3 = [](const Vec3& p) { return QJsonArray{p.x, p.y, p.z}; };
     QJsonArray c, u, a, b;
@@ -174,7 +274,7 @@ private:
 public:
   // ---------- Convert to geometry ----------
   bool lockInput(int id, LockInput& out) {
-    auto it = ks.find(id); if (it == ks.end()) return false;
+    auto it = kOf(id); if (it == ks.end()) return false;
     K& k = it->second; if (k.shape.c.size() < 3) return false;
     out = {}; out.id = id; out.G = geo(k);
     out.h = conv(k).first; if (!(out.h > 0)) out.h = levelH;
@@ -189,13 +289,16 @@ public:
     }
     return true;
   }
-  std::vector<int> depIds(int id) { std::vector<int> o; auto it = ks.find(id); if (it != ks.end()) for (K* d : deps(it->second)) o.push_back(d->it->id); return o; }
+  std::vector<int> depIds(int id) { std::vector<int> o; auto it = kOf(id); if (it != ks.end()) for (K* d : deps(it->second)) o.push_back(d->it->id); return o; }
   bool dependsOn(int a, int b) {
     std::set<int> seen; std::vector<int> st{a};
     while (!st.empty()) { int x = st.back(); st.pop_back(); if (!seen.insert(x).second) continue; for (int d : depIds(x)) { if (d == b) return true; st.push_back(d); } }
     return false;
   }
-  int lockGroupId(int id) { auto it = ks.find(id); if (it == ks.end()) return -1; const Item* g = lockGroup(it->second); return g ? g->id : -1; }
+  // (a cocoon by its id — none when the scene's item of that id is no longer the one it was made of: a project opened in place
+  // of another keeps the ids, the old items are gone; read before the hair was rebuilt, a crash)
+  std::map<int, K>::iterator kOf(int id) { auto it = ks.find(id); if (it != ks.end() && sc.item(id) != it->second.it) return ks.end(); return it; }
+  int lockGroupId(int id) { auto it = kOf(id); if (it == ks.end()) return -1; const Item* g = lockGroup(it->second); return g ? g->id : -1; }
   bool trialShape(std::vector<std::vector<int>>& ends, const std::vector<int>& lock, int* host, QJsonObject* shapeOut) {
     K T; T.live = true; T.ends = ends; T.lock = lock; T.hasLock = true; T.it = nullptr;
     Polys P = livePolys(T.ends, T.lock, T.hasLock); ends = T.ends;
@@ -224,17 +327,17 @@ public:
     return true;
   }
   std::vector<int> strandsOf(int id) {
-    auto it = ks.find(id); if (it == ks.end() || !it->second.live) return {};
+    auto it = kOf(id); if (it == ks.end() || !it->second.live) return {};
     K& k = it->second; auto e = k.ends; return livePolys(e, k.lock, k.hasLock).cids;
   }
-  CocoonGeo geoOf(int id) { auto it = ks.find(id); if (it == ks.end() || it->second.shape.c.size() < 3) return {}; return geo(it->second); }
-  double loopStepOf(int id) { auto it = ks.find(id); if (it == ks.end()) return levelH; double h = conv(it->second).first; return h > 0 ? h : levelH; }
+  CocoonGeo geoOf(int id) { auto it = kOf(id); if (it == ks.end() || it->second.shape.c.size() < 3) return {}; return geo(it->second); }
+  double loopStepOf(int id) { auto it = kOf(id); if (it == ks.end()) return levelH; double h = conv(it->second).first; return h > 0 ? h : levelH; }
   void setFolds(int id, const std::vector<double>& s) {
-    auto it = ks.find(id); if (it == ks.end()) return;
+    auto it = kOf(id); if (it == ks.end()) return;
     it->second.foldS = s;
     for (const Item* c : kOrder) if (c->id == id || dependsOn(c->id, id)) ks[c->id].ringsOk = false;
   }
-  const std::vector<double>& foldsOf(int id) { static const std::vector<double> none; auto it = ks.find(id); return it == ks.end() ? none : it->second.foldS; }
+  const std::vector<double>& foldsOf(int id) { static const std::vector<double> none; auto it = kOf(id); return it == ks.end() ? none : it->second.foldS; }
 
 private:
 
@@ -262,6 +365,8 @@ private:
   std::vector<K*> deps(const K& k) {
     std::vector<K*> out;
     auto add = [&](K* x) { if (x && std::find(out.begin(), out.end(), x) == out.end()) out.push_back(x); };
+    // (the parent first: inside it — by the root above all — its loops rule; the links take over where the cocoon has left it,
+    // within their wider reach — cocoonRings)
     add(cocoonParent(k));
     for (const QJsonValue& v : k.it->raw.value("links").toArray()) { int id = v.toInt(); const Item* L = sc.item(id); if (L && L->type == ItemType::Cocoon && id != k.it->id) add(&ks[id]); }
     return out;
@@ -522,17 +627,24 @@ private:
       for (int k = 0; k < n; k++) { double s = T * k / (n - 1); while (j < Q.size() - 2 && L[j + 1] < s) j++; out.push_back(Q[j].lerp(Q[j + 1], L[j + 1] > L[j] ? clamp((s - L[j]) / (L[j + 1] - L[j]), 0, 1) : 0)); }
       return out;
     };
-    const int N = COCOON_NS; double lv = levelH;
-    std::vector<double> lens; double mx = 0; for (auto& Q : polys) { lens.push_back(len(Q)); mx = std::max(mx, lens.back()); }
-    std::vector<std::vector<Vec3>> R; for (size_t i = 0; i < polys.size(); i++) if (lens[i] >= 0.85 * mx) R.push_back(resample(polys[i], N));
+    // (a lock wound into a coil: its stations and its smoothing go by the turn, or the spine averages the coil away; and a strand is cut only
+    // on the turn the station is on — the next turn's band may lie nearer than this one's own edge)
+    double lv = levelH; std::vector<double> lens; double mx = 0; size_t longest = 0; for (size_t i = 0; i < polys.size(); i++) { lens.push_back(len(polys[i])); if (lens.back() > mx) { mx = lens.back(); longest = i; } }
+    const double coilTurns = turnsOf(polys[longest]); const bool coil = coilTurns >= COIL_TURNS;
+    const int N = coil ? std::clamp(int(coilTurns * 24), COCOON_NS, 900) : COCOON_NS; const double coilHw = coil ? 0.45 / coilTurns : 1.0;
+    std::vector<std::vector<double>> arcs; for (auto& Q : polys) arcs.push_back(turnParam(Q));
+    { bool same = coil; for (auto& Q : polys) if (Q.size() != polys[0].size()) same = false;   // (edges of one converted lock: point i of each is one cross-section)
+      if (same) for (auto& a : arcs) for (size_t j = 0; j < a.size(); j++) a[j] = double(j) / std::max<size_t>(a.size() - 1, 1); }   // (how far along each strand: by the turns it has made — a small turn at the tip counts as a big one at the root)
+    std::vector<std::vector<Vec3>> R; for (size_t i = 0; i < polys.size(); i++) if (lens[i] >= 0.85 * mx) R.push_back(coil ? resampleBy(polys[i], arcs[i], N) : resample(polys[i], N));
     std::vector<Vec3> S(N); for (int k = 0; k < N; k++) { Vec3 s; for (auto& r : R) s += r[k]; S[k] = s / double(R.size()); }
     double rad = 0; for (auto& Q : polys) for (auto& q : Q) rad = std::max(rad, q.distanceTo(S[std::clamp(jsRound(nearestF(S, q)), 0, N - 1)]));
     double reach = 2 * rad + lv;
     struct Raw { Vec3 c, u, t; double a, b; bool ok = false; };
     std::vector<Raw> raw(N);
-    auto crossAt = [&](const std::vector<Vec3>& Q, const Vec3& o, const Vec3& t, double lim, Vec3& best) {
-      double bd = lim; bool found = false;
+    auto crossAt = [&](size_t qi, double f, const Vec3& o, const Vec3& t, double lim, Vec3& best) {
+      const std::vector<Vec3>& Q = polys[qi]; double bd = lim; bool found = false;
       for (size_t j = 0; j + 1 < Q.size(); j++) {
+        if (coil && std::abs(arcs[qi][j] - f) > coilHw) continue;
         double d0 = (Q[j] - o).dot(t), d1 = (Q[j + 1] - o).dot(t); if (d0 == d1 || d0 * d1 > 0) continue;
         Vec3 q = Q[j].lerp(Q[j + 1], d0 / (d0 - d1)); double dd = q.distanceTo(o);
         if (dd < bd) { bd = dd; best = q; found = true; }
@@ -541,7 +653,7 @@ private:
     };
     for (int i = 0; i < N; i++) {
       Vec3 o = S[i], t = (S[std::min(i + 1, N - 1)] - S[std::max(i - 1, 0)]).normalized();
-      std::vector<Vec3> pts; for (auto& Q : polys) { Vec3 b; if (crossAt(Q, o, t, reach, b)) pts.push_back(b); }
+      std::vector<Vec3> pts; for (size_t qi = 0; qi < polys.size(); qi++) { Vec3 b; if (crossAt(qi, double(i) / (N - 1), o, t, reach, b)) pts.push_back(b); }
       Vec3 e1 = std::abs(t.y) < 0.9 ? Vec3(0, 1, 0).cross(t).normalized() : Vec3(1, 0, 0).cross(t).normalized(), e2 = t.cross(e1);
       if (pts.size() >= 4) {
         Vec3 m0; for (auto& p : pts) m0 += p; m0 = m0 / double(pts.size());
@@ -574,7 +686,7 @@ private:
       if (!F.empty()) { Vec3 pu = F[i - 1].u; if (std::abs(u.dot(pu)) < std::sqrt(0.5)) { u = raw[i].t.cross(u); std::swap(a, b); } if (u.dot(pu) < 0) u = -u; }
       F.push_back({raw[i].c, u, a, b});
     }
-    const int Wn = 6; double minR = 0.04 * lv;
+    const int Wn = coil ? 1 : 6; double minR = 0.04 * lv;
     auto sm = [&](auto g, int i) { int w = std::min({Wn, i, N - 1 - i}); double s = 0; int n = 0; for (int q = i - w; q <= i + w; q++) { s += g(q); n++; } return s / n; };
     Shape out; std::vector<double> A, B;
     for (int i = 0; i < N; i++) {
@@ -587,7 +699,7 @@ private:
       Vec3 t = (fc[std::min(i + 1, N - 1)] - fc[std::max(i - 1, 0)]).normalized(), u0 = out.u[i];
       Vec3 u = (u0 - t * u0.dot(t)).normalized(), v = t.cross(u), o = fc[i];
       double nearL = 1.6 * std::max(A[i], B[i]), a0 = INF, a1 = -INF, b0 = INF, b1 = -INF; int m = 0;
-      for (auto& Q : polys) { Vec3 b; if (crossAt(Q, o, t, std::min(reach, nearL), b)) { Vec3 d = b - o; double x = d.dot(u), y = d.dot(v); a0 = std::min(a0, x); a1 = std::max(a1, x); b0 = std::min(b0, y); b1 = std::max(b1, y); m++; } }
+      for (size_t qi = 0; qi < polys.size(); qi++) { Vec3 b; if (crossAt(qi, double(i) / (N - 1), o, t, std::min(reach, nearL), b)) { Vec3 d = b - o; double x = d.dot(u), y = d.dot(v); a0 = std::min(a0, x); a1 = std::max(a1, x); b0 = std::min(b0, y); b1 = std::max(b1, y); m++; } }
       if (m >= 2) { ra[i] = std::max((a1 - a0) / 2, minR); rb[i] = std::max((b1 - b0) / 2, minR); }
     }
     std::vector<double> big; for (int i = 0; i < N; i++) big.push_back(std::max(ra[i], rb[i]));
@@ -595,7 +707,7 @@ private:
     for (int i = 0; i < N; i++) { ra[i] = std::max({ra[i], floorR, rb[i] / 3}); rb[i] = std::max({rb[i], floorR, ra[i] / 3}); }
     int iS = int(std::floor(0.75 * (N - 1)));
     for (int i = iS + 1; i < N; i++) { double x = double(i - iS) / (N - 1 - iS), cap = std::sqrt(std::max(0.0, 1 - x * x)); ra[i] = std::max(ra[i], ra[iS] * cap); rb[i] = std::max(rb[i], rb[iS] * cap); }
-    const int w = 4;
+    const int w = coil ? 2 : 4;
     auto avg = [&](const std::vector<double>& r) { std::vector<double> o(N); for (int i = 0; i < N; i++) { double s = 0; int n = 0; for (int q = std::max(0, i - w); q <= std::min(N - 1, i + w); q++) { s += r[q]; n++; } o[i] = 1.04 * s / n; } return o; };
     auto ea = avg(ra), eb = avg(rb);
     for (int i = 0; i < N; i++) { double tipK = clamp((N - 1 - i) / 3.0, 0, 1), k = 0.15 + 0.85 * tipK; out.a.push_back(r3(ea[i] * k)); out.b.push_back(r3(eb[i] * k)); }
@@ -652,7 +764,10 @@ private:
       if (c->junc && c->anchors.size() > 1) { for (int a : c->anchors) if (!AN.count(a)) return false; return true; }
       return false;
     };
-    std::vector<const Item*> out; for (const Item* s : surfaces) if (on(s->a) && on(s->b)) out.push_back(s);
+    // (and a wall of its lock's own group with one of its curves on it: the wall a branch hangs by on the trunk it shares —
+    // its other curve stays in the trunk's group when the lock is split by its branches)
+    const Item* lg = k.live ? lockGroup(k) : nullptr;
+    std::vector<const Item*> out; for (const Item* s : surfaces) if ((on(s->a) && on(s->b)) || (lg && sc.isDescendant(s->id, lg->id) && (on(s->a) || on(s->b)))) out.push_back(s);
     return out;
   }
   std::vector<const Item*> lockWalls(K& k) {
@@ -704,13 +819,26 @@ private:
       for (size_t i = 0; i < o.size(); i++) { const Vec3 &a = apos(o[i]), &b = apos(o[(i + 1) % o.size()]); Nn.x += (a.y - b.y) * (a.z + b.z); Nn.y += (a.z - b.z) * (a.x + b.x); Nn.z += (a.x - b.x) * (a.y + b.y); }
       if (Nn.lengthSq() < 1e-16) Nn = {0, 1, 0};
       Nn = Nn.normalized();
+      // (the disc as it is: between its rings — the inner one's nearest point to its middle and the outer one's farthest, in
+      // its plane. A cocoon crossing the plane elsewhere — past its rim, or through its hole — is not on it. Before, anywhere
+      // within 1.5 times rOut of its middle counted: a disc reached cocoons it never crossed — 21.11, the author: "Disc 1 doesn't
+      // even cross RightTail_03")
+      auto inPlane = [&](const Vec3& q) { const Vec3 d = q - C; return (d - Nn * d.dot(Nn)).length(); };
+      std::vector<double> mean; double rOutA = 0, rInA = INF;
+      for (auto* c : rs) { double s = 0; for (int a : c->anchors) s += inPlane(apos(a)); mean.push_back(c->anchors.empty() ? 0 : s / double(c->anchors.size())); }
+      const size_t outer = mean[0] >= mean[1] ? 0 : 1, inner = 1 - outer;
+      for (int a : rs[outer]->anchors) rOutA = std::max(rOutA, inPlane(apos(a)));
+      for (int a : rs[inner]->anchors) rInA = std::min(rInA, inPlane(apos(a)));
+      if (mean[inner] < 1e-6 * std::max(1.0, mean[outer])) rInA = 0;   // (no hole)
       double best = -1, bd = INF; bool found = false;
       for (int i = 0; i < N - 1; i++) {
         double d0 = (G.c[i] - C).dot(Nn), d1 = (G.c[i + 1] - C).dot(Nn); if (d0 == d1 || d0 * d1 > 0) continue;
-        double f = i + d0 / (d0 - d1); double dd = G.c[i].lerp(G.c[i + 1], f - i).distanceTo(C);
-        if (dd < bd) { bd = dd; best = f; found = true; }
+        double f = i + d0 / (d0 - d1); const Vec3 x = G.c[i].lerp(G.c[i + 1], f - i); const double dd = inPlane(x);
+        const double rc = std::max({G.a[i], G.b[i], G.a[i + 1], G.b[i + 1]});   // (the cocoon's own thickness there: touching the rim counts)
+        if (dd > rOutA + rc || dd < rInA - rc) continue;
+        const double dc = x.distanceTo(C); if (dc < bd) { bd = dc; best = f; found = true; }
       }
-      if (!found || bd > 1.5 * std::max(p.value("rOut").toDouble(0), 1e-6)) return std::nullopt;
+      if (!found) return std::nullopt;
       return GuideOn{sAt(best), orient(Nn, best)};
     }
     std::vector<Vec3> pts;                                     // (a line on the lock's curves: its hits)
@@ -738,8 +866,49 @@ private:
 
   // ---------- the rings ----------
   const std::vector<CocoonRing>& ringsOf(K& k) {
-    if (!k.ringsOk) { k.rings = foldRings(k, cocoonRings(k)); k.ringsOk = true; }
+    if (!k.ringsOk) { k.rings = untangle(k, foldRings(k, cocoonRings(k))); k.ringsOk = true; }
     return k.rings;
+  }
+  // neighbouring loops must not cross inside the cocoon: a branch running through its parent at a slant takes the parent's
+  // loop planes, and two of them, tilted differently, met inside it (an X on the lock — the converted mesh folds there).
+  // Of two crossing loops one goes: a loop of its own before one taken from a source, else the more tilted one; a fold's,
+  // a tail's and the end loops stay. A gap left over 1.6 steps gets square loops of its own — kept where they cross nothing
+  std::vector<CocoonRing> untangle(K& k, std::vector<CocoonRing> rs) {
+    if (rs.size() < 2) return rs;
+    const CocoonGeo& G = geo(k); const int N = G.N; if (N < 2) return rs;
+    const double L = G.D[N - 1]; auto [h, dev0] = conv(k); (void)dev0; if (!(h > 0)) h = levelH;
+    std::stable_sort(rs.begin(), rs.end(), [](const CocoonRing& a, const CocoonRing& b) { return a.s < b.s; });
+    auto station = [&](double s) { return std::clamp(jsRound(cocoonF(G, s)), 0, N - 1); };
+    auto nrmOf = [](const CocoonRing& r) { return (r.pn ? *r.pn : r.n).normalized(); };
+    auto square = [&](const CocoonRing& r) { return std::abs(G.t[station(r.s)].dot(nrmOf(r))); };   // (1: square to the cocoon)
+    auto fixed = [&](const CocoonRing& r) { return r.fold || r.tail || r.s <= 1e-6 || r.s >= L - 1e-6; };
+    auto crosses = [&](const CocoonRing& A, const CocoonRing& B) {
+      const int i = station((A.s + B.s) / 2); const Vec3 T = G.t[i];
+      const Vec3 nA = nrmOf(A), nB = nrmOf(B); const double ta = T.dot(nA), tb = T.dot(nB);
+      if (std::abs(ta) < 0.05 || std::abs(tb) < 0.05) return true;            // (a plane along the cocoon: it crosses everything near)
+      for (int j = 0; j < 12; j++) { const Vec3 Lt = cocoonPoint(G, i, j * PI / 6) - G.c[i];
+        if (B.s - Lt.dot(nB) / tb < A.s - Lt.dot(nA) / ta) return true; }    // (where each plane meets the oval, along the cocoon)
+      return false;
+    };
+    auto pass = [&](std::vector<CocoonRing>& v) {
+      for (bool again = true; again;) { again = false;
+        for (size_t q = 1; q < v.size(); q++) { if (!crosses(v[q - 1], v[q])) continue;
+          const bool fa = fixed(v[q - 1]), fb = fixed(v[q]); if (fa && fb) continue;
+          size_t drop;
+          if (fa) drop = q; else if (fb) drop = q - 1;
+          else { const bool pa = v[q - 1].pp.has_value(), pb = v[q].pp.has_value();
+            drop = pa != pb ? (pa ? q : q - 1) : (square(v[q - 1]) < square(v[q]) ? q - 1 : q); }
+          v.erase(v.begin() + long(drop)); again = true; break; } } };
+    const size_t n0 = rs.size(); pass(rs); if (rs.size() == n0) return rs;
+    std::vector<CocoonRing> add;
+    for (size_t q = 1; q < rs.size(); q++) { const double gp = rs[q].s - rs[q - 1].s; const int m = jsRound(gp / h) - 1; if (gp < 1.6 * h || m < 1) continue;
+      for (int j = 1; j <= m; j++) { CocoonRing r; r.s = rs[q - 1].s + gp * j / (m + 1); const double f = cocoonF(G, r.s); const int i = std::min(int(std::floor(f)), N - 2);
+        r.p = atF(G.c, f); r.n = G.t[i].lerp(G.t[i + 1], f - i).normalized(); add.push_back(r); } }
+    if (add.empty()) return rs;
+    rs.insert(rs.end(), add.begin(), add.end());
+    std::stable_sort(rs.begin(), rs.end(), [](const CocoonRing& a, const CocoonRing& b) { return a.s < b.s; });
+    pass(rs);
+    return rs;
   }
   // the loops a fold forced in: each halfway between the two rings round it, its plane halfway between theirs (taken from
   // a source's loops — still of that stretch: r.run)
@@ -768,9 +937,13 @@ private:
     // its shell modifiers
     struct Mod { const Item* it; std::vector<double> cmask, emask; double dens = 1, str = 1; };
     std::vector<Mod> tips, pinfs, etips; std::vector<const Item*> mguides;
+    struct SpMod { std::vector<double> cmask; int loops; double phase; }; std::vector<SpMod> spirals;
     if (!shellModsOff) for (int id : k.it->children) {
       const Item* m = sc.item(id); if (!m) continue;
       bool isGuide = m->type == ItemType::Guide;
+      if (m->type == ItemType::Spiral) {                          // (Spiral: where it is painted, the spine's coils get their loops by turns)
+        if (!m->visible) continue; const QJsonObject sp = m->raw.value("p").toObject();
+        spirals.push_back({numbers(m->raw.value("cmask")), std::clamp(int(std::lround(sp.value("loops").toDouble(8))), 2, 64), clamp(sp.value("phase").toDouble(0), 0, 1)}); continue; }
       if (!(m->type == ItemType::Tip || m->type == ItemType::Even || m->type == ItemType::PInf || isGuide)) continue;
       if (isGuide ? m->raw.value("off").toBool() : !m->visible) continue;
       QJsonObject p = m->raw.value("p").toObject();
@@ -781,7 +954,7 @@ private:
       if (isGuide) mguides.push_back(m);
     }
     auto pinfAt = [&](double s) { double v = 0; for (auto& m : pinfs) v += m.str * cmaskAt(m.cmask, s / L); return clamp(v, -1, 1); };
-    struct Gd { double s; Vec3 n; double R, bl, dens; };
+    struct Gd { double s; Vec3 n; double R, bl, dens; bool own = false; };   // (own: a guide of this cocoon — not a disc of the scene)
     std::vector<Gd> gds;
     std::vector<const Item*> gl = mguides;
     if (!shellModsOff) for (const Item* g : guides) {
@@ -790,10 +963,10 @@ private:
       if (!cc.isEmpty()) { bool inL = false; for (const QJsonValue& x : cc) if (x.toObject().value("id").toInt() == k.it->id) inL = true; if (g->raw.value("p").toObject().value("ccOnly").toBool() ? !inL : inL) continue; }
       gl.push_back(g);
     }
-    for (const Item* g : gl) {
+    for (size_t gi = 0; gi < gl.size(); gi++) { const Item* g = gl[gi];
       auto o = guideOnCocoon(g, G); if (!o) continue;
       QJsonObject p = g->raw.value("p").toObject();
-      gds.push_back({o->s, o->n, std::max(p.value("radius").toDouble(0) * headH, 1e-6), p.contains("blend") && !p.value("blend").isNull() ? p.value("blend").toDouble() : 1, p.contains("density") && !p.value("density").isNull() ? p.value("density").toDouble() : 1});
+      gds.push_back({o->s, o->n, std::max(p.value("radius").toDouble(0) * headH, 1e-6), p.contains("blend") && !p.value("blend").isNull() ? p.value("blend").toDouble() : 1, p.contains("density") && !p.value("density").isNull() ? p.value("density").toDouble() : 1, gi < mguides.size()});
     }
     auto zone = [](const Gd& o, double s) { double d = std::abs(s - o.s); if (d >= o.R) return d < 1e-9 ? 1.0 : 0.0; return clamp((1 - d / o.R) / std::max(o.bl, 1e-3), 0, 1); };
     auto evenE = [&](double s) { double e = 0; for (auto& m : etips) e = std::max(e, cmaskAt(m.emask, s / L)); return clamp(e, 0, 1); };
@@ -826,10 +999,36 @@ private:
     };
     std::vector<double> cuts; for (auto& o : gds) if (o.s > 1e-6 && o.s < L - 1e-6) cuts.push_back(o.s);
     std::sort(cuts.begin(), cuts.end());
-    auto ownAll = [&](double s0, double s1) {
+    auto ownBase = [&](double s0, double s1) {
       std::vector<double> P{s0}; for (double s : cuts) if (s > s0 + 1e-6 && s < s1 - 1e-6) P.push_back(s); P.push_back(s1);
       std::vector<double> out;
       for (size_t i = 0; i + 1 < P.size(); i++) { auto r = own(P[i], P[i + 1]); if (!out.empty()) r.erase(r.begin()); out.insert(out.end(), r.begin(), r.end()); }
+      return out;
+    };
+    // Spiral: the stretches painted and found to wind (spiralLattice) take their loops by turns, the rest the usual way
+    struct SpZone { double a, b; std::vector<double> lat; }; std::vector<SpZone> zones;
+    for (const SpMod& sm : spirals) {
+      const int Q = 400; bool in = false; double a = 0;
+      for (int q = 0; q <= Q; q++) {
+        const double s = L * q / Q; const bool on = cmaskAt(sm.cmask, s / L) >= 0.5;
+        if (on && !in) { in = true; a = s; }
+        if (in && (!on || q == Q)) { in = false; const double b = on ? s : L * (q - 1) / Q;
+          if (b - a > 2 * h) { auto lat = spiralLattice(G, a, b, sm.loops, sm.phase); if (!lat.empty()) zones.push_back({a, b, std::move(lat)}); } }
+      }
+    }
+    std::sort(zones.begin(), zones.end(), [](const SpZone& x, const SpZone& y) { return x.a < y.a; });
+    auto ownAll = [&](double s0, double s1) {
+      if (zones.empty()) return ownBase(s0, s1);
+      std::vector<double> out; const double eps = std::max(1e-9, L * 1e-9);
+      auto add = [&](std::vector<double> r) { if (!out.empty() && !r.empty() && std::abs(out.back() - r.front()) < eps) r.erase(r.begin()); out.insert(out.end(), r.begin(), r.end()); };
+      double cur = s0;
+      for (const SpZone& z : zones) {
+        if (z.b <= cur + eps || z.a >= s1 - eps) continue;
+        const double za = std::max(z.a, cur), zb = std::min(z.b, s1);
+        if (za > cur + eps) add(ownBase(cur, za));
+        std::vector<double> lat{za}; for (double s : z.lat) if (s > za + eps && s < zb - eps) lat.push_back(s); lat.push_back(zb); add(lat); cur = zb;
+      }
+      if (cur < s1 - eps || out.empty()) add(ownBase(cur, s1));
       return out;
     };
     auto planes = [&](const std::vector<double>& ss) { std::vector<CocoonRing> o; for (double s : ss) o.push_back(plane(s)); return o; };
@@ -871,11 +1070,19 @@ private:
     std::vector<RootIn> rootIn; std::vector<SrcA> srcA;
     for (int prio = 0; prio < int(srcs.size()); prio++) {
       K& P = *srcs[prio]; const CocoonGeo PG = geo(P);
-      std::function<bool(int)> inside = [&](int i) { return overlap(G, PG, i, h) <= 0; };
+      // (a linked cocoon — linked on purpose, for the stretch where this one lies on its lock: its loops are taken while this
+      // one is within 2.5 loop steps of its shell. A lock lying on another lock's walls stays outside that cocoon's oval, the
+      // oval being narrower than the walls; with 0 the link did nothing there. The parent: touching, as before)
+      const double reachIn = &P == cocoonParent(k) ? 0.0 : 2.5 * h;
+      std::function<bool(int)> inside = [&](int i) { return overlap(G, PG, i, h) <= reachIn; };
       std::vector<double> Aw;
       if (!pinfs.empty()) {
         Aw.assign(N, 0);
-        for (int i = 0; i < N; i++) { double ov = overlap(G, PG, i, h), pm = pinfAt(G.D[i]); Aw[i] = ov <= 0 ? clamp(1 + pm, 0, 1) : clamp(2 * pm * std::max(0.0, 1 - ov / (4 * h)), 0, 1); }
+        // (the source's pull here, 0…1 — taken as all or nothing, at half: where the mask weakens it by half or more the loops are
+        // the cocoon's own, square to it; elsewhere the source's. Blended by the mask's strength, a stroke's soft edge gave loops
+        // at every angle in between, and neighbours zigzagged across the lock — 21.11, the author: "loops must run square to the
+        // cocoon; where there is no mask, the parent's influence must work")
+        for (int i = 0; i < N; i++) { double ov = overlap(G, PG, i, h), pm = pinfAt(G.D[i]); Aw[i] = ov <= 0 ? clamp(1 + pm, 0, 1) : clamp(2 * pm * std::max(0.0, 1 - ov / (4 * h)), 0, 1); Aw[i] = Aw[i] >= 0.5 ? 1.0 : 0.0; }
         std::vector<CocoonRing> X;
         for (int i = 0; i < N;) { if (Aw[i] <= 0.001) { i++; continue; } int j = i; while (j < N && Aw[j] > 0.001) j++; for (auto& r : parRings(i, j, P, PG)) if (r.pp) X.push_back(r); i = j; }
         srcA.push_back({&P, Aw, X});
@@ -943,6 +1150,22 @@ private:
     { std::vector<CocoonRing> o;
       for (auto& r : PR) { if (!o.empty() && r.s - o.back().s < (parAdj(&o.back(), &r) ? 0.2 : 0.5) * h) { if (*r.prio < *o.back().prio) o.back() = r; } else o.push_back(r); }
       PR = o; }
+    // (a guide line / disc on it rules where it reaches: the source's loops there give way to the cocoon's own, laid by the
+    // guide — its plane, its density. The source's stretch is cut there, so the gap is filled with the cocoon's own loops)
+    // (the same where its Density is painted — at half strength or more, a density other than ×1: the loops there are its own,
+    // as many as the density says. Taken from the source they never changed with the slider)
+    auto ruled = [&](double s) {
+      for (auto& o : gds) if (o.own && std::abs(s - o.s) < std::max(o.R, 0.75 * h)) return true;   // (radius 0: room for the guide's own loop all the same. A scene's disc — not this cocoon's — leaves the source's loops as they are: its reach is wide, it took them over on whole stretches)
+      for (auto& m : tips) if (std::abs(m.dens - 1) > 0.01 && cmaskAt(m.cmask, s / L) >= 0.5) return true;
+      return false; };
+    if (std::any_of(gds.begin(), gds.end(), [](const Gd& o) { return o.own; }) || !tips.empty()) {
+      std::vector<CocoonRing> kept; std::string tag, prev; bool gapSince = false;
+      for (const CocoonRing& r0 : PR) { if (ruled(r0.s)) { gapSince = true; continue; }
+        CocoonRing r = r0; const std::string orig = r.run;
+        if (!kept.empty() && orig == prev && !orig.empty()) { if (gapSince) tag += "|g"; } else tag.clear();
+        gapSince = false; prev = orig; if (!tag.empty()) r.run = orig + tag; kept.push_back(r); }
+      if (kept.size() != PR.size()) { PR = std::move(kept); if (PR.empty()) return pinfFinal(planes(ownAll(0, L))); }
+    }
     std::vector<CocoonRing> rings;
     auto rootRing = [&]() -> std::optional<CocoonRing> {
       Vec3 t0 = (PR[0].p - G.c[0]).normalized();
@@ -957,7 +1180,15 @@ private:
         }
         return n >= 2;
       };
-      struct Best { double sx; int prio; Vec3 QP, QN; }; std::optional<Best> best;
+      struct Best { double sx; int prio; Vec3 QP, QN; }; std::optional<Best> best, above;
+      // (above: the source's loop nearest above the root within 1.5 steps, cutting the lock or not — a root cut at a slant,
+      // only its corner reaching that loop: the root's loop is that loop all the same, as its neighbours' loops go)
+      for (auto& ri : rootIn) { const CocoonGeo PG = geo(*ri.P);
+        for (auto& R : ringsOf(*ri.P)) { Vec3 QP = R.pp ? *R.pp : R.p, QN = R.pn ? *R.pn : R.n; double c = QN.dot(t0); if (std::abs(c) < 0.35) continue;
+          double sx = -(G.c[0] - QP).dot(QN) / c; if (sx > 0 || sx < -1.5 * h) continue;
+          int jR = std::clamp(jsRound(cocoonF(PG, R.s)), 0, PG.N - 1);
+          if ((G.c[0] + t0 * sx).distanceTo(R.p) > 2.5 * std::max(PG.a[jR], PG.b[jR]) + 0.5 * h) continue;
+          if (!above || sx > above->sx || (sx == above->sx && ri.prio < above->prio)) above = Best{sx, ri.prio, QP, QN}; } }
       for (auto& ri : rootIn) {
         const CocoonGeo PG = geo(*ri.P);
         for (auto& R : ringsOf(*ri.P)) {
@@ -971,13 +1202,18 @@ private:
           if (!best || sx > best->sx || (sx == best->sx && ri.prio < best->prio)) best = Best{sx, ri.prio, QP, QN};
         }
       }
+      if (!best) best = above;
       if (!best) return std::nullopt;
       auto r = plane(0); r.par = true; r.pp = best->QP; r.pn = best->QN; r.prio = best->prio; return r;
     };
     if (PR[0].s > 0.5 * h) {
       std::vector<double> ss;
       if (PR[0].s >= 1.5 * h) { ss = ownAll(0, PR[0].s); ss.pop_back(); } else ss = {0};
-      for (double s : ss) { std::optional<CocoonRing> rr; if (s == 0) rr = rootRing(); rings.push_back(rr ? *rr : plane(s)); }
+      for (double s : ss) { std::optional<CocoonRing> rr; if (s == 0) rr = rootRing();
+        // (no source loop just behind the root, but the first one taken lies within a step and a half after it: the root's loop
+        // runs parallel to it, through the root — not square to this cocoon, at a slant to the source's loops round it)
+        if (!rr && s == 0 && PR[0].s < 1.5 * h) { CocoonRing r = plane(0); const Vec3 qn = PR[0].pn ? *PR[0].pn : PR[0].n; r.pp = G.c[0]; r.pn = qn.dot(r.n) < 0 ? -qn : qn; r.par = true; r.prio = PR[0].prio; rr = r; }
+        rings.push_back(rr ? *rr : plane(s)); }
     }
     for (auto& r : PR) {
       if (!rings.empty()) {
@@ -1080,10 +1316,18 @@ private:
     for (auto& r : rings) if (!r.tail) order.push_back(&r);
     for (const CocoonRing* R : order) {
       int i = std::clamp(jsRound(cocoonF(G, R->s)), 0, G.N - 1); double lim = R->lim ? *R->lim : 2.5 * std::max({G.a[i], G.b[i], 1e-3}), lim2 = lim * lim;
+      // (the ring's cut goes on along the wall from the part by the cocoon, to the wall's edge — 21.11, the author: "a problem with
+      //  the cocoon's grid shown": a cocoon of a lock's main branch only, thinner than the lock — its rings stopped halfway across the
+      //  wall at 2.5 of its thickness. Only what runs on without a break from there: a wall curling back through the ring's plane
+      //  further off is not cut; never past 4 times that reach)
+      // (and never less than 3 loop steps: by the root the cocoon is thin, and its loops stopped halfway across a wall)
+      double hk = 0; { auto [hh, dv] = conv(k); (void)dv; hk = hh > 0 ? hh : levelH; }
+      const double far = std::max(4 * lim, 3 * hk), far2 = far * far, eps = 1e-6 * std::max(lim, 1e-9);
       Vec3 PP = R->pp ? *R->pp : R->p, PN = R->pn ? *R->pn : R->n;
       for (const Mesh& g : meshes) {
-        if (g.bc.distanceTo(R->p) > lim + g.br) continue;
+        if (g.bc.distanceTo(R->p) > far + g.br) continue;
         size_t n0 = seg.size();
+        struct S { Vec3 a, b; bool seed; }; std::vector<S> cand;
         for (size_t t = 0; t + 2 < g.I.size(); t += 3) {
           const Vec3 &a = g.P[g.I[t]], &b = g.P[g.I[t + 1]], &c = g.P[g.I[t + 2]];
           double da = (a - PP).dot(PN), db = (b - PP).dot(PN), dc = (c - PP).dot(PN);
@@ -1091,10 +1335,24 @@ private:
           const Vec3* pq[3][2] = {{&a, &b}, {&b, &c}, {&c, &a}}; double dd[3][2] = {{da, db}, {db, dc}, {dc, da}};
           for (int e = 0; e < 3; e++) if ((dd[e][0] < 0) != (dd[e][1] < 0)) o[no++] = pq[e][0]->lerp(*pq[e][1], dd[e][0] / (dd[e][0] - dd[e][1]));
           if (no != 2) continue;
-          Vec3 mid = (o[0] + o[1]) * 0.5;
-          if ((mid - R->p).lengthSq() > lim2 || (!R->tail && nearTail(&g, mid))) continue;
-          seg.push_back(o[0]); seg.push_back(o[1]);
+          Vec3 mid = (o[0] + o[1]) * 0.5; const double d2 = (mid - R->p).lengthSq();
+          if (d2 > far2 || (!R->tail && nearTail(&g, mid))) continue;
+          cand.push_back({o[0], o[1], d2 <= lim2});
         }
+        // (the pieces joined end to end — an edge two triangles share cut at one point — from the ones by the cocoon outward)
+        std::map<std::array<long long, 3>, std::vector<int>> at;
+        auto key = [&](const Vec3& p) { return std::array<long long, 3>{(long long)std::llround(p.x / eps / 64), (long long)std::llround(p.y / eps / 64), (long long)std::llround(p.z / eps / 64)}; };
+        for (int k = 0; k < int(cand.size()); k++) for (const Vec3* p : {&cand[size_t(k)].a, &cand[size_t(k)].b}) at[key(*p)].push_back(k);
+        std::vector<char> keep(cand.size(), 0); std::vector<int> st;
+        for (int k = 0; k < int(cand.size()); k++) if (cand[size_t(k)].seed) { keep[size_t(k)] = 1; st.push_back(k); }
+        // (a wall nowhere within that reach of the ring — a lock's wall standing off further than the cocoon is thick: the cut
+        // starts at its piece nearest the ring, still within the far reach. Before, such a wall had no loops at all)
+        if (st.empty() && !cand.empty()) { int best = -1; double bd = far2;
+          for (int k = 0; k < int(cand.size()); k++) { const double d2 = (((cand[size_t(k)].a + cand[size_t(k)].b) * 0.5) - R->p).lengthSq(); if (d2 <= bd) { bd = d2; best = k; } }
+          if (best >= 0) { keep[size_t(best)] = 1; st.push_back(best); } }
+        while (!st.empty()) { const int k = st.back(); st.pop_back();
+          for (const Vec3* p : {&cand[size_t(k)].a, &cand[size_t(k)].b}) for (int j : at[key(*p)]) if (!keep[size_t(j)]) { keep[size_t(j)] = 1; st.push_back(j); } }
+        for (size_t k = 0; k < cand.size(); k++) if (keep[k]) { seg.push_back(cand[k].a); seg.push_back(cand[k].b); }
         if (R->tail && seg.size() > n0) tailOn[&g].push_back(R);
       }
     }
@@ -1186,12 +1444,6 @@ public:
 
 }  // namespace
 
-std::vector<CocoonResult> buildCocoons(const Scene& sc, const CurveCache& cc, const std::vector<WallMesh>& walls) {
-  std::map<int, WallMesh> wm; for (auto& w : walls) wm[w.surfaceId] = w;
-  CocoonSystem cs(sc, cc, wm); cs.rebuildAll();
-  std::vector<CocoonResult> out; for (auto& [id, r] : cs.results()) out.push_back(r);
-  return out;
-}
 
 struct CocoonSystem::Impl : Ctx { using Ctx::Ctx; };
 CocoonSystem::CocoonSystem(const Scene& sc, const CurveCache& cc, const std::map<int, WallMesh>& walls) : d(std::make_unique<Impl>(sc, cc, walls)) {}
@@ -1213,6 +1465,7 @@ void CocoonSystem::setFolds(int id, const std::vector<double>& s) { d->setFolds(
 const std::vector<double>& CocoonSystem::folds(int id) { return d->foldsOf(id); }
 std::vector<Vec3> CocoonSystem::guideLine(int gid) { return d->guideLineOf(gid); }
 std::vector<CocoonSystem::ZoneLine> CocoonSystem::zone(int gid, double rad, double blend) { return d->zoneOf(gid, rad, blend); }
+double coilTurns(const std::vector<Vec3>& Q) { return turnsOf(Q); }
 double cocoonStation(const CocoonGeo& G, double s) { return cocoonF(G, s); }
 Vec3 cocoonPoint(const CocoonGeo& G, int i, double th) { return cocoonPt(G, i, th); }
 

@@ -190,7 +190,8 @@ InspectorWindow::InspectorWindow(QWidget* host, Viewport* vp) : QFrame(host->win
                     {"insp_interior", "Interior markers: a mesh's loose pieces left inside it (e.g. leftover polygons inside an open tube) — pink, with a marker seen through", &Viewport::Insp::interior},
                     {"top_hard", "Hard edges: the edges the shading breaks along — sky blue", &Viewport::Insp::hard},
                     {"insp_doubles", "Double walls: polygons lying one on another in one place (e.g. doubled by a mirror) or slid partly over each other (a seam not welded) — hot pink", &Viewport::Insp::doubles},
-                    {"insp_nonplanar", "Non-planar polygons: a corner off the polygon's plane — teal (how bent: the slider beside)", &Viewport::Insp::nonPlanar}};
+                    {"insp_nonplanar", "Non-planar polygons: a corner off the polygon's plane — teal (how bent: the slider beside)", &Viewport::Insp::nonPlanar},
+                    {"tt_mirror", "Asymmetry: the polygons whose vertices have no mirror twin (the Symmetry settings' axis — X by default) or stand off its mirrored place — orange, the vertices lit", &Viewport::Insp::asym}};
     for (const H& d : hs) {
       auto* b = pic(d.icon, tr(d.tip)); b->setCheckable(true); b->setChecked(vp->insp.*d.f); auto f = d.f;
       connect(b, &QPushButton::toggled, this, [vp, f](bool on) { vp->insp.*f = on; vp->inspChanged(); });
@@ -213,9 +214,10 @@ InspectorWindow::InspectorWindow(QWidget* host, Viewport* vp) : QFrame(host->win
                               tr("How far apart two locks' points may be to be stitched, in loop steps (0.1 by default): smaller — fewer places reported, only the really close ones"),
                               [sc](double x) { sc->fileRaw.insert("lockWeldR", x); }, [vp](double x) { vp->setWeldSetting("lockWeldR", x); }));
     struct H { const char* icon; const char* tip; bool Viewport::HInsp::*f; };
-    const H hs[] = {{"insp_nearanchors", "Near anchors: anchors of different curves lying practically in one place but not welded — orange", &Viewport::HInsp::near},
+    const H hs[] = {{"insp_nearanchors", "Near anchors: anchors of different curves of one lock lying practically in one place but not welded — orange (locks lying close to each other are not marked)", &Viewport::HInsp::near},
                     {"insp_degenerate", "Degenerate curves: fewer than two anchors or no length — red; anchors lying almost one on another — the curve thin red, the place a big yellow mark", &Viewport::HInsp::degen},
-                    {"insp_twisted", "Twisted: the walls' quads bent by twisting (the wall turning round its length by over the angle beside within one loop step: the polygons there come out bent) — lime", &Viewport::HInsp::twisted}};
+                    {"insp_twisted", "Twisted: the walls' quads bent by twisting (the wall turning round its length by over the angle beside within one loop step: the polygons there come out bent) — lime", &Viewport::HInsp::twisted},
+                    {"insp_selfclip", "Self-clip: a lock passing through itself — its walls crossing one another (or a wall crossing itself): the line they cross along magenta, over everything, the polygons on it tinted", &Viewport::HInsp::clip}};
     for (const H& d : hs) {
       auto* b = pic(d.icon, tr(d.tip)); b->setCheckable(true); b->setChecked(vp->hinsp.*d.f); auto f = d.f;
       connect(b, &QPushButton::toggled, this, [vp, f](bool on) { vp->hinsp.*f = on; vp->hinspChanged(); });
@@ -254,7 +256,7 @@ InspectorWindow::InspectorWindow(QWidget* host, Viewport* vp) : QFrame(host->win
   connect(fpsSet, &QPushButton::clicked, this, [fpsSet, changed] { openStyle(fpsSet, &overlays::cfg().fpsS, changed); });
   connect(stSet, &QPushButton::clicked, this, [stSet, changed] { openStyle(stSet, &overlays::cfg().statsS, changed); });
   connect(histSet, &QPushButton::clicked, this, [histSet, changed] { openStyle(histSet, &overlays::cfg().histS, changed); });
-  setFixedWidth(760);
+  setFixedWidth(820);   // (eight highlights and the slider in a row)
   sync();
   if (QSettings().value("keycast/on", false).toBool()) QTimer::singleShot(0, this, [this] { showKeyCast(true); });   // (left open: open again)
 }

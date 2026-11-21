@@ -63,7 +63,10 @@ static QImage decodeTga(const QByteArray& b) {
   int idLen = d[0], cmap = d[1], type = d[2], w = d[12] | d[13] << 8, h = d[14] | d[15] << 8, bpp = d[16], desc = d[17];
   if (cmap || !(type == 2 || type == 3 || type == 10 || type == 11) || w <= 0 || h <= 0 || !(bpp == 8 || bpp == 16 || bpp == 24 || bpp == 32)) return {};
   const int Bp = bpp / 8; const bool rle = type >= 9; size_t p = 18 + size_t(idLen) + size_t(d[5] | d[6] << 8) * ((d[7] + 7) / 8);
-  QImage img(w, h, QImage::Format_ARGB32);
+  // (the header's size checked against what the file can hold before anything is allocated: a broken file read as nothing)
+  const size_t have = p < size_t(b.size()) ? size_t(b.size()) - p : 0;
+  if (!rle ? size_t(w) * size_t(h) * size_t(Bp) > have : size_t(w) * size_t(h) > have * 128) return {};
+  QImage img(w, h, QImage::Format_ARGB32); if (img.isNull()) return {};
   std::vector<uint32_t> px(size_t(w) * size_t(h));
   auto read = [&](size_t at) -> uint32_t {
     if (at + size_t(Bp) > size_t(b.size())) return 0xff000000;
@@ -121,6 +124,7 @@ QJsonObject norm(const QJsonValue& look, const std::vector<TexSet>& sets) {
     QJsonObject s{{"name", sets[i].name}, {"on", o.value("on").toBool(true)}, {"maps", maps}};
     if (o.value("color").isString() && !o.value("color").toString().isEmpty()) s.insert("color", o.value("color"));
     if (o.contains("alpha") && !o.value("alpha").isNull()) s.insert("alpha", o.value("alpha").toBool());
+    if (o.value("ref").isObject()) s.insert("ref", o.value("ref"));   // (the images an OBJ's MTL names: { map, alphaMap } — the same texture on several models)
     out.append(s);
   }
   return {{"tex", L.value("tex").toBool()}, {"flat", L.value("flat").toBool()}, {"sets", out}};

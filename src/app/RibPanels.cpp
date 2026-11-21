@@ -4,9 +4,12 @@
 #include "scene/Edit.h"
 #include "scene/Rib.h"
 #include "view/Viewport.h"
+#include <QCheckBox>
 #include <QHBoxLayout>
+#include <QTimer>
 #include <QJsonArray>
 #include <QLabel>
+#include <QMenu>
 #include <QPushButton>
 #include <QRegularExpression>
 #include <QVBoxLayout>
@@ -43,6 +46,53 @@ std::pair<std::vector<double>, std::vector<double>> anchorVals(const Item& c, do
   return {w, r};
 }
 }  // namespace
+
+void setRibRootDir(Viewport* vp, int c, const QString& md) {
+  vp->runEdit([c, md, vp](Scene& s, Selection&, const CurveCache&) -> QString {
+    Item* k = s.item(c); if (!k || k->anchors.empty()) return "!";
+    const auto ends = rib::ribEnds(s, *k); if (ends.empty()) return "!" + QObject::tr("This lock doesn't start from anchors");
+    const int root = k->anchors[0];
+    setRib(s, c, "rootDir", md == "along" ? QJsonValue() : QJsonValue(md));
+    if (md == "free") { k->ovr.erase(root); return QObject::tr("Lock root: free — toward its next point"); }
+    const auto d = rib::trunkDir(s, ends); if (!d) return "!" + QObject::tr("No direction from the anchors it starts from");
+    double len = 0; if (auto f = k->ovr.find(root); f != k->ovr.end() && f->second.out) len = f->second.out->length();
+    if (!(len > 0)) len = std::max(rib::ribRoot(s, ends, d).w0 * 2.5, vp->camera().sceneScale * 0.01);
+    k->ovr[root].out = *d * (md == "flip" ? -len : len);
+    return md == "flip" ? QObject::tr("Lock root: the other way") : QObject::tr("Lock root: along the curves");
+  }, true);
+  vp->liveRibs();
+}
+
+// ⧉ Detach into a new group (21.11, the author): the lock leaves the group of the curves it was drawn from for a group of its own
+// (beside that one, its symmetry taken over) — hidden, isolated, picked as a lock by itself; off — back into the group it came from,
+// the emptied group gone. (Its root stays on the anchors it started from.)
+void setRibDetached(Viewport* vp, int c, bool on) {
+  vp->runEdit([c, on](Scene& s, Selection& sl, const CurveCache& cc) -> QString {
+    Item* k = s.item(c); if (!k) return "!";
+    auto kids = [&s](int p) -> std::vector<int>& { return p >= 0 ? s.item(p)->children : s.roots; };
+    auto moveTo = [&](int np, int after) { auto& o = kids(k->parent); o.erase(std::remove(o.begin(), o.end(), c), o.end()); k->parent = np;
+      auto& a = kids(np); auto at = std::find(a.begin(), a.end(), after); a.insert(at == a.end() ? a.end() : at + 1, c); };
+    const QJsonValue from = ribOf(*k).value("detachFrom");
+    if (on) {
+      if (from.isDouble()) return "!";
+      const int old = k->parent; const Item* og = s.item(old); const int gp = og ? og->parent : -1;
+      Item& g = Viewport::newGroup(s, gp, false); const int gid = g.id; g.name = QObject::tr("%1 lock").arg(k->name);
+      if (og) for (const char* key : {"sym", "spos", "logic", "gpivot", "vsym", "q"}) if (og->raw.contains(key)) g.raw.insert(key, og->raw.value(key));
+      { auto& a = kids(gp); a.erase(std::remove(a.begin(), a.end(), gid), a.end()); auto at = std::find(a.begin(), a.end(), old); a.insert(at == a.end() ? a.end() : at + 1, gid); }   // (right after the group it left)
+      moveTo(gid, -1); setRib(s, c, "detachFrom", old); s.reindex();
+      sl.anchors.clear(); sl.items = {c};
+      return QObject::tr("%1: detached into the new group %2").arg(k->name, s.item(gid)->name);
+    }
+    if (!from.isDouble()) return "!";
+    const int back = from.toInt(), was = k->parent; const Item* bg = s.item(back);
+    if (back >= 0 && (!bg || bg->type != ItemType::Group)) { setRib(s, c, "detachFrom", QJsonValue()); return QObject::tr("The group it came from is gone — the lock stays in its own"); }   // (-1: it came from the top level)
+    moveTo(back, -1); setRib(s, c, "detachFrom", QJsonValue()); s.reindex();
+    if (const Item* wg = s.item(was); wg && wg->type == ItemType::Group && wg->children.empty()) { Selection d; d.items = {was}; edit::deleteItems(s, cc, d); s.reindex(); }
+    sl.anchors.clear(); sl.items = {c};
+    return QObject::tr("%1: back in %2").arg(k->name, back >= 0 ? s.item(back)->name : QObject::tr("the top level"));
+  }, true);
+  vp->liveRibs();
+}
 
 void ribAnchorProps(QVBoxLayout* v, Viewport* vp, Scene* sc) {
   struct AC { int a, c; }; std::vector<AC> list;
@@ -82,6 +132,27 @@ void ribCurveProps(QVBoxLayout* v, Viewport* vp, Scene* sc, int c) {
   };
   row(QObject::tr("Profile smoothing"), 0, 1, 0.01, "smooth", 0.4, pct, QObject::tr("Evens out the width and the rotation along the lock: 0 — exactly as set at the anchors, more — smoother changes between them"));
   row(QObject::tr("Tip"), 0, 0.8, 0.01, "tip", 0.25, pct, QObject::tr("Share of the length over which the tip narrows to a point (0 — a cut end)"));
+  // ⤴ the root's direction (a lock started between anchors): on along the curves it starts from (as made), the other way, or
+  // free — no handle of its own, the root turns to its next point (20.11, the author: "the lock drawn by a curve — a change of
+  // direction: by the bend it took its direction wrongly, went up at an angle — a kink")
+  if (!ne.empty() && !it.anchors.empty()) {
+    const QString mode = R.value("rootDir").toString("along");
+    const QString cap = mode == "flip" ? QObject::tr("the other way") : mode == "free" ? QObject::tr("free") : QObject::tr("along the curves");
+    auto* db = new QPushButton(QObject::tr("⤴ Root direction: %1 ▾").arg(cap)); db->setFocusPolicy(Qt::NoFocus);
+    db->setToolTip(QObject::tr("Where the lock leaves its root: on along the curves it starts from, the other way, or free (toward its next point)"));
+    QObject::connect(db, &QPushButton::clicked, vp, [vp, sc, c, db, mode] {
+      QMenu m;
+      auto apply = [vp, c](const QString& md) { setRibRootDir(vp, c, md); };
+      for (auto [md, lab] : {std::pair<QString, QString>{"along", QObject::tr("Along the curves it starts from")}, {"flip", QObject::tr("The other way")}, {"free", QObject::tr("Free — toward its next point")}}) {
+        QAction* a = m.addAction(lab); a->setCheckable(true); a->setChecked(md == mode); QObject::connect(a, &QAction::triggered, vp, [apply, md] { apply(md); }); }
+      m.exec(db->mapToGlobal(QPoint(0, db->height())));
+      (void)sc; });
+    v->addWidget(db, 0, Qt::AlignLeft);
+  }
+  { auto* dg = new QCheckBox(QObject::tr("Detach into a new group")); dg->setFocusPolicy(Qt::NoFocus); dg->setChecked(R.value("detachFrom").isDouble());
+    dg->setToolTip(QObject::tr("The lock goes into a group of its own beside the one it was drawn in (its symmetry taken over); off — back where it was"));
+    QObject::connect(dg, &QCheckBox::toggled, vp, [vp, c](bool on) { QTimer::singleShot(0, vp, [vp, c, on] { setRibDetached(vp, c, on); }); });
+    v->addWidget(dg, 0, Qt::AlignLeft); }
   if (!vol) {
     auto brushBtn = [&](const QString& kind, const QString& label, const QString& tip, std::vector<QString> clearKeys) {
       auto& b = vp->ribBrush; bool on = b.on && b.kind == kind;

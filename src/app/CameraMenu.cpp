@@ -1,5 +1,8 @@
 ﻿#include "app/CameraMenu.h"
 #include "app/Overlays.h"
+#include "app/ViewWindow.h"
+#include <QInputDialog>
+#include <QLineEdit>
 #include "ui/Pie.h"
 #include "view/Viewport.h"
 #include <QApplication>
@@ -37,8 +40,8 @@ namespace hm {
 namespace {
 const char* VIEWS[] = {"persp", "ortho", "front", "right", "left", "back", "top"};
 QString viewName(const QString& v) {
-  return v == "uv" ? QObject::tr("UV Editor") : v == "persp" ? QObject::tr("Perspective") : v == "ortho" ? QObject::tr("Orthographic") : v == "front" ? QObject::tr("Front (ortho)") : v == "right" ? QObject::tr("Right (ortho)")
-       : v == "left" ? QObject::tr("Left (ortho)") : v == "back" ? QObject::tr("Back (ortho)") : QObject::tr("Top (ortho)");
+  return v == "uv" ? QObject::tr("UV Editor") : v == "persp" ? QObject::tr("Perspective") : v == "ortho" ? QObject::tr("Orthographic") : v == "front" ? QObject::tr("Front (ortho)") : v == "right" ? QObject::tr("Left (ortho)")
+       : v == "left" ? QObject::tr("Right (ortho)") : v == "back" ? QObject::tr("Back (ortho)") : QObject::tr("Top (ortho)");
 }
 const std::map<QString, std::vector<std::array<double, 4>>>& layouts() {
   static const std::map<QString, std::vector<std::array<double, 4>>> L = {
@@ -50,17 +53,9 @@ const std::map<QString, std::vector<std::array<double, 4>>>& layouts() {
 // a chip / a window of the miniature: click, drag (its text), drop. The drag is the menu's own — a label follows the
 // pointer, the window under it lit, the release drops — not the system's (on Windows its loop starves the viewport's
 // drawing and the whole program stalls while it lasts)
-// a view's grid switch: "#", a click shows / hides it, a double click opens its step
-class GridBtn : public QPushButton {
-public:
-  std::function<void()> dbl;
-  GridBtn() : QPushButton("#") { setCheckable(true); setFixedSize(22, 22); setFocusPolicy(Qt::NoFocus); setStyleSheet("QPushButton{padding:0;font-weight:600} QPushButton:checked{background:#3d5f99;color:#fff}"); }
-protected:
-  void mouseDoubleClickEvent(QMouseEvent* e) override { QPushButton::mouseDoubleClickEvent(e); if (dbl) QTimer::singleShot(0, this, [this] { dbl(); }); }
-};
 class Chip : public QLabel {
 public:
-  std::function<void()> click; std::function<void(const QString&)> drop; QString dragText;
+  std::function<void()> click; std::function<void(const QString&)> drop; QString dragText; std::function<void(const QPoint&)> context;   // (context: RMB)
   explicit Chip(const QString& t, QWidget* parent = nullptr) : QLabel(t, parent) { setCursor(Qt::PointingHandCursor); setAlignment(Qt::AlignCenter); }
   ~Chip() override { if (ghost_) ghost_->deleteLater(); }
 protected:
@@ -76,7 +71,7 @@ protected:
     Chip* t = target(g); if (t != over_) { lit(over_, false); over_ = t; lit(over_, true); }
   }
   void mouseReleaseEvent(QMouseEvent* e) override {
-    if (!dragged_) { if (rect().contains(e->position().toPoint()) && click) click(); return; }
+    if (!dragged_) { if (rect().contains(e->position().toPoint())) { if (e->button() == Qt::RightButton) { if (context) context(e->globalPosition().toPoint()); } else if (click) click(); } return; }
     dragged_ = false; setCursor(Qt::PointingHandCursor); if (ghost_) { ghost_->deleteLater(); ghost_ = nullptr; }
     Chip* t = target(e->globalPosition().toPoint()); lit(over_, false); over_ = nullptr;
     if (t && t->drop) { auto fn = t->drop; const QString d = dragText; QTimer::singleShot(0, [fn, d] { fn(d); }); }   // (it may rebuild the menu — this chip with it)
@@ -133,28 +128,37 @@ private:
     for (const char* vv : VIEWS) {
       QString view = vv; auto* ch = new Chip(viewName(view)); ch->setProperty("chip", true); ch->setProperty("cur", c.view == view); ch->dragText = "view:" + view;
       ch->click = [this, view] { vp_->setViewMode(view); rebuild(); };
-      // (beside the view: its grid — the floor for the perspective and the top, a wall for the side views; a click shows /
-      // hides it, a double click — its step; the element snap takes its nodes)
-      auto* cell = new QWidget; auto* ch2 = new QHBoxLayout(cell); ch2->setContentsMargins(0, 0, 0, 0); ch2->setSpacing(2); ch2->addWidget(ch, 1);
-      if (view != "ortho") {
-        auto* gb = new GridBtn; gb->setChecked(vp_->viewGrid(view).on);
-        gb->setToolTip((view == "persp" || view == "top" ? QObject::tr("The floor's grid of this view") : QObject::tr("The wall's grid of this view (through the origin)")) + QObject::tr(" — a click: shown / hidden; a double click: its step"));
-        QObject::connect(gb, &QPushButton::toggled, this, [this, view](bool x) { auto G = vp_->viewGrid(view); G.on = x; vp_->setViewGrid(view, G); });
-        gb->dbl = [this, view, gb] {
-          QMenu m; auto* w = new QWidget; auto* h = new QHBoxLayout(w); h->setContentsMargins(8, 4, 8, 4);
-          h->addWidget(new QLabel(QObject::tr("%1 — grid step, cm").arg(viewName(view))));
-          auto* st = new QDoubleSpinBox; st->setDecimals(3); st->setRange(0.001, 1000); st->setValue(vp_->viewGrid(view).step); h->addWidget(st);
-          QObject::connect(st, &QDoubleSpinBox::valueChanged, this, [this, view](double x) { auto G = vp_->viewGrid(view); G.step = x; G.on = true; vp_->setViewGrid(view, G); });
-          auto* wa = new QWidgetAction(&m); wa->setDefaultWidget(w); m.addAction(wa); st->setFocus(); m.exec(gb->mapToGlobal(QPoint(0, gb->height())));
-          gb->setChecked(vp_->viewGrid(view).on); };
-        ch2->addWidget(gb); }
-      r2->addWidget(cell, k / 4, k % 4); k++;
+      r2->addWidget(ch, k / 4, k % 4); k++;   // (its grid: the button in the window's corner — and the snap's grid in the Topology room's snapping menu)
     }
     if (vp_->room() == "topo") {                                // (the Topology room: the UV Editor — the active mesh's UV in this window)
       auto* ch = new Chip(viewName("uv")); ch->setProperty("chip", true); ch->setProperty("cur", c.view == "uv"); ch->dragText = "view:uv";
       ch->setToolTip(QObject::tr("The UV Editor: the selected mesh's UV in this window (the UV mode on: picked and moved there by the mode). Drag it into a split window"));
       ch->click = [this] { vp_->setViewMode("uv"); rebuild(); };
       r2->addWidget(ch, k / 4, k % 4); k++;
+    }
+    if (vp_->room() == "paint") {                               // (the Paint room: a window shows a visibility set — a part alone, to paint it with nothing in the way)
+      const int ap = vp_->activePane(); const QString curSet = vp_->paneHid(ap) ? vp_->paneVis(ap).set : QString();
+      v_->addWidget(h5(QObject::tr("Visibility sets — click: this window shows it; drag into a split window; RMB — more")));
+      auto* r4 = new QGridLayout; r4->setSpacing(4); v_->addLayout(r4); int q = 0;
+      auto setChip = [&](const QString& name, const QString& label, const QString& tip) {
+        auto* ch = new Chip(label); ch->setProperty("chip", true); ch->setProperty("cur", curSet == name); ch->dragText = "vis:" + name; ch->setToolTip(tip);
+        ch->click = [this, name] { const int a = vp_->activePane(); auto v = vp_->paneVis(a); v.set = name; vp_->setPaneVis(a, v); rebuild(); };
+        if (!name.isEmpty()) ch->context = [this, name](const QPoint& g) {
+          QMenu m(this); QAction* sh = m.addAction(QObject::tr("Show it in the scene (the outliner's eyes as the set has them)")); QAction* up = m.addAction(QObject::tr("Update it from the scene's eyes"));
+          QAction* rn = m.addAction(QObject::tr("Rename…")); QAction* dl = m.addAction(QObject::tr("Delete"));
+          QAction* r = m.exec(g); if (!r) return;
+          if (r == sh) vp_->visSetShow(name); else if (r == up) { vp_->visSetSave(name); ui::toast(QObject::tr("Visibility set %1 updated").arg(name)); } else if (r == dl) vp_->visSetDelete(name);
+          else if (r == rn) { bool ok = false; const QString t = QInputDialog::getText(parentWidget(), QObject::tr("Visibility set"), QObject::tr("Name"), QLineEdit::Normal, name, &ok); if (ok) vp_->visSetRename(name, t); }
+          rebuild(); };
+        r4->addWidget(ch, q / 4, q % 4); q++; };
+      setChip(QString(), QObject::tr("As the scene"), QObject::tr("The window shows what the outliner's eyes say — as the main view"));
+      for (const QString& n : vp_->visSetNames()) setChip(n, n, QObject::tr("The window shows this set: what was hidden when it was made stays hidden here, whatever the outliner's eyes are now"));
+      auto* r5 = new QHBoxLayout; v_->addLayout(r5);
+      r5->addWidget(b(QObject::tr("＋ New set of what is shown now"), QObject::tr("What the Paint room shows now (its lists' eyes, the parts hidden with H) kept as a visibility set of the project"), [this] { const QString n = vp_->visSetSave(QString()); ui::toast(QObject::tr("Visibility set %1 made").arg(n)); }));
+      if (ap != vp_->mainPane()) { auto* cb = new QCheckBox(QObject::tr("This window's camera follows the main view")); cb->setChecked(vp_->paneVis(ap).sync);
+        cb->setToolTip(QObject::tr("This window's camera and the main view's (the first window) move as one — turn either, both turn"));
+        QObject::connect(cb, &QCheckBox::toggled, this, [this, ap](bool on) { auto v = vp_->paneVis(ap); v.sync = on; vp_->setPaneVis(ap, v); }); r5->addWidget(cb); }
+      r5->addStretch(1);
     }
     v_->addWidget(h5(QObject::tr("Split screen")));
     auto* r3 = new QHBoxLayout; v_->addLayout(r3);
@@ -169,10 +173,11 @@ private:
     const auto& L = layouts().at(vp_->splitLayout());
     for (size_t i = 0; i < L.size(); i++) {
       auto [x, y, w, h] = L[i]; int pi = int(i);
-      auto* s = new Chip(QString("%1: %2").arg(i + 1).arg(viewName(vp_->paneCamera(pi).view)), box); s->setProperty("slot", true); s->setProperty("act", vp_->split() && pi == vp_->activePane());
+      auto* s = new Chip(QString("%1: %2").arg(i + 1).arg(viewName(vp_->paneCamera(pi).view)) + (vp_->paneHid(pi) ? QString(" · ") + vp_->paneVis(pi).set : QString()), box); s->setProperty("slot", true); s->setProperty("act", vp_->split() && pi == vp_->activePane());
       s->setGeometry(int(x * 300) + 3, int(y * 150) + 3, int(w * 300) - 6, int(h * 150) - 6); s->dragText = QString("slot:%1").arg(i); s->setWordWrap(true);
       s->drop = [this, pi](const QString& d) {
         if (d.startsWith("view:")) vp_->setPaneView(pi, d.mid(5));
+        else if (d.startsWith("vis:")) { auto v = vp_->paneVis(pi); v.set = d.mid(4); vp_->setPaneVis(pi, v); }
         else if (d.startsWith("slot:")) { int j = d.mid(5).toInt(); if (j != pi) vp_->swapPanes(pi, j); }
         rebuild();
       };
@@ -181,6 +186,13 @@ private:
     v_->addWidget(box);
     auto* note = new QLabel(QObject::tr("The window under the pointer is the active one: navigation, F, Reset and the views apply to it.")); note->setWordWrap(true); note->setStyleSheet("color:#8a8a8a;font-size:11px"); note->setMaximumWidth(300);
     v_->addWidget(note);
+    // (views in a window of their own: another screen)
+    v_->addWidget(h5(QObject::tr("View window")));
+    auto* r6 = new QHBoxLayout; v_->addLayout(r6);
+    auto* nv = new QPushButton(viewWindowOpen() ? QObject::tr("＋ Second view in the view window") : QObject::tr("＋ New view in a window of its own")); nv->setFocusPolicy(Qt::NoFocus);
+    nv->setToolTip(QObject::tr("A view in a separate window — drag it to another screen. Tab over that window: its own menu (its views, their visibility sets and cameras, Move into the main viewport)"));
+    QObject::connect(nv, &QPushButton::clicked, this, [this] { QWidget* mw = parentWidget(); Viewport* vp = vp_; close(); openViewWindow(mw, vp); });
+    r6->addWidget(nv); r6->addStretch(1);
   }
   Viewport* vp_; QVBoxLayout* v_;
 };
@@ -233,9 +245,9 @@ public:
   }
   void sync() {
     QWidget* w = host_->window();
-    bool show = host_->isVisible() && !w->isMinimized() && w->isVisible();
+    bool show = host_->isVisible() && !w->isMinimized() && w->isVisible() && !QApplication::activeModalWidget();   // (a modal window over the viewport — the reference canvas: its own labels and view choosers there, none of these over it)
     QRect g(host_->mapToGlobal(QPoint(0, 0)), host_->size());
-    if (!show) { labels_->hide(); axes_->hide(); credits_->hide(); fps_->hide(); stats_->hide(); return; }
+    if (!show) { sig_.clear(); /* (shown again once the window over it is gone — it stayed hidden till a label's text changed, 2026-11-12) */ labels_->hide(); axes_->hide(); credits_->hide(); fps_->hide(); stats_->hide(); return; }
     stats_->sync(g);
     credits_->sync(g.adjusted(0, 0, 0, stats_->isVisible() && overlays::cfg().statsPos.x() < 0 ? -(stats_->height() + 6) : 0));   // (the credits above the model's card, while it is in its corner)
     fps_->sync(g);
@@ -243,7 +255,7 @@ public:
     for (int i : vp_->shownPanes()) { QRect r = vp_->paneRect(i); sig += QString("%1:%2,%3,%4,%5:%6;").arg(i).arg(r.x()).arg(r.y()).arg(r.width()).arg(r.height()).arg(vp_->paneLabel(i)); }
     for (auto& l : vp_->viewLabels()) sig += QString("%1,%2,%3;").arg(int(l.p.x())).arg(int(l.p.y())).arg(l.text);
     const Quat& q = vp_->camera().quat; QString qs = QString("%1,%2,%3,%4").arg(q.x, 0, 'f', 4).arg(q.y, 0, 'f', 4).arg(q.z, 0, 'f', 4).arg(q.w, 0, 'f', 4);
-    if (sig != sig_) { sig_ = sig; labels_->setGeometry(g); labels_->update(); if (!labels_->isVisible()) labels_->show(); }
+    if (sig != sig_) { sig_ = sig; labels_->setGeometry(g); labels_->syncMask(); labels_->update(); if (!labels_->isVisible()) labels_->show(); }
     if (vp_->camera().view == "uv") { axes_->hide(); return; }   // (the UV Editor: no 3D axes)
     QRect ar(g.right() - 112 - 6, g.bottom() - 112 - 6, 112, 112);
     if (ar != axes_->geometry()) axes_->setGeometry(ar);
@@ -254,7 +266,19 @@ private:
   class Labels : public QWidget {
   public:
     explicit Labels(ViewOverlay* o) : QWidget(o->host_->window(), Qt::Tool | Qt::FramelessWindowHint | Qt::WindowTransparentForInput | Qt::WindowDoesNotAcceptFocus | Qt::NoDropShadowWindowHint), o_(o) {
-      setAttribute(Qt::WA_TranslucentBackground); setAttribute(Qt::WA_ShowWithoutActivating); setAttribute(Qt::WA_TransparentForMouseEvents);
+      setObjectName("viewLabels"); setAttribute(Qt::WA_TranslucentBackground); setAttribute(Qt::WA_ShowWithoutActivating); setAttribute(Qt::WA_TransparentForMouseEvents);
+    }
+    // (off Windows: the window only where it paints — the size of the viewport and over it, it must not stand in the mouse's
+    // way even where the window system doesn't let the input through)
+    void syncMask() {
+#ifndef Q_OS_WIN
+      QFont f = font(); f.setPointSizeF(8.5); const QFontMetrics fm(f); QRegion r;
+      auto panes = o_->vp_->shownPanes();
+      for (int i : panes) { QRect pr = o_->vp_->paneRect(i), tr = fm.boundingRect(o_->vp_->paneLabel(i)).adjusted(-6, -3, 6, 3); tr.moveTopLeft(QPoint(pr.x() + 10, pr.y() + (panes.size() > 1 ? 6 : 8))); r += tr.adjusted(-2, -2, 2, 2); }
+      f.setBold(true); const QFontMetrics fb(f);
+      for (auto& l : o_->vp_->viewLabels()) { QRectF tr = QRectF(fb.boundingRect(l.text)).adjusted(-5, -2, 5, 2); tr.moveCenter(l.p); r += tr.toAlignedRect().adjusted(-2, -2, 2, 2); }
+      setMask(r.isEmpty() ? QRegion(0, 0, 1, 1) : r);   // (an empty mask is no mask: the whole window)
+#endif
     }
   protected:
     void paintEvent(QPaintEvent*) override {
@@ -281,7 +305,7 @@ private:
   class Axes : public QWidget {
   public:
     explicit Axes(ViewOverlay* o) : QWidget(o->host_->window(), Qt::Tool | Qt::FramelessWindowHint | Qt::WindowDoesNotAcceptFocus | Qt::NoDropShadowWindowHint), o_(o) {
-      setAttribute(Qt::WA_TranslucentBackground); setAttribute(Qt::WA_ShowWithoutActivating); setMouseTracking(true);
+      setObjectName("viewAxes"); setAttribute(Qt::WA_TranslucentBackground); setAttribute(Qt::WA_ShowWithoutActivating); setMouseTracking(true);
     }
   protected:
     struct End { int k, s; QColor col; double x, y, z; };

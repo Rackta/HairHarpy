@@ -1,4 +1,4 @@
-// The Topology room's edits (the HTML version's tg* / sm* / tt* / topoWrite): each geometry change a new source of the
+﻿// The Topology room's edits (the HTML version's tg* / sm* / tt* / topoWrite): each geometry change a new source of the
 // mesh (an edited copy, 'pmesh' — the file stays, undo goes back to the old one), the polygroups (delete, duplicate,
 // merge, move the selection in, detach, rename, their list's tree and visibility, isolate), the transform's pivot and
 // Bake, the snap mask (from the picked polygroups — the covered parts left out —, the brush, the lasso, mirror, invert),
@@ -10,7 +10,9 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QSettings>
+#include <array>
 #include <cmath>
+#include <map>
 
 namespace hm {
 
@@ -31,8 +33,8 @@ QString plural(int n, const QString& one, const QString& many) { return n == 1 ?
 void Viewport::loadTopoPrefs() {
   QSettings st;
   QJsonObject s = QJsonDocument::fromJson(st.value("topo/set").toByteArray()).object(); tset.snap = s.value("snap").toBool(); tset.esnap = s.value("esnap").toBool(); tset.esnapMode = s.value("esnapMode").toString("vert"); tset.esnapPx = std::clamp(s.value("esnapPx").toDouble(14), 4.0, 60.0); tset.sym = false; /* (Symmetry: off at every start — never brought back from another run) */ tset.uv = false; /* (the UV mode: never brought back from another run) */ tset.keepUv = s.value("keepUv").toBool();
-  tset.selThrough = s.value("selThrough").toBool(); { QString k = s.value("selTool").toString("cursor"); tset.selTool = k == "rect" || k == "lasso" || k == "fill" || k == "outline" || k == "loop" || k == "ring" || k == "hard" ? k : "cursor"; }
-  tset.loopStopSel = s.value("loopStopSel").toBool(); tset.loopStopNgon = s.value("loopStopNgon").toBool(); tset.loopStopTri = s.value("loopStopTri").toBool();
+  tset.fillMode = s.value("fillMode").toString("normal"); tset.selThrough = s.value("selThrough").toBool(); { QString k = s.value("selTool").toString("cursor"); tset.selTool = k == "rect" || k == "lasso" || k == "fill" || k == "outline" || k == "loop" || k == "ring" || k == "hard" ? k : "cursor"; }
+  tset.loopStopSel = s.value("loopStopSel").toBool(); tset.loopStopNgon = s.value("loopStopNgon").toBool(); tset.loopStopTri = s.value("loopStopTri").toBool(); tset.loopStopSeam = s.value("loopStopSeam").toBool(); tset.loopStopCrease = s.value("loopStopCrease").toBool();
   { QString o = s.value("gzOrient").toString("world"); tset.gzOrient = o == "local" || o == "normal" || o == "camera" ? o : "world"; }
   tset.gzFree = s.value("gzFree").toBool(); tset.gzStep = std::clamp(s.value("gzStep").toDouble(1), 0.001, 1000.0); tset.gzWhat = s.value("gzWhat").toString() == "each" ? "each" : "all"; tset.gzSlide = s.value("gzSlide").toBool(); { QString x = s.value("alAxis").toString("x"); tset.alAxis = QStringList{"x", "y", "z", "xy", "yz", "xz"}.contains(x) ? x : "x"; }
   { QString x = s.value("alTo").toString("sel"); tset.alTo = QStringList{"sel", "normal", "view", "world"}.contains(x) ? x : "sel"; }   // (the old To the vertex / Along the edges — The selection)
@@ -42,8 +44,8 @@ void Viewport::loadTopoPrefs() {
   tset.soft = s.value("soft").toBool(); tset.softR = std::clamp(s.value("softR").toDouble(2), 0.01, 1e5); tset.softMode = s.value("softMode").toString() == "volume" ? "volume" : "surface";
   symo.fromJson(QJsonDocument::fromJson(QSettings().value("topo/symmetry").toByteArray()).object());
   QJsonObject uo = QJsonDocument::fromJson(st.value("topo/uv").toByteArray()).object();
-  uvo.checker = uo.value("edChecker").toBool(false); uvo.c3d = uo.value("c3d").toBool(); uvo.s3d = uo.value("s3d").toBool(); uvo.dispOp = std::clamp(uo.value("dispOp").toDouble(0.6), 0.05, 1.0); uvo.tex = uo.value("tex").toBool(true); uvo.stretch = uo.value("stretch").toBool(); uvo.rotate = uo.value("rotate").toBool(true);
-  uvo.density = std::clamp(uo.value("cells").toDouble(64), 8.0, 256.0); uvo.strAmt = std::clamp(uo.value("strAmt").toDouble(0.7), 0.0, 1.0); uvo.strUp = uo.value("strUp").toBool(true); uvo.strSpread = uo.value("strSpread").toBool(true); uvo.boxMid = uo.value("boxMid").toBool(); uvo.warpN = std::clamp(uo.value("warpN").toInt(3), 1, 12);   // (the labelled checker: 64 cells across the tile by default) uvo.pad = std::clamp(uo.value("pad").toDouble(0.01), 0.0, 0.1); uvo.angle = std::clamp(uo.value("angle").toDouble(50), 1.0, 179.0); uvo.symUnfold = uo.value("symUnfold").toBool(true); uvo.symTint = uo.value("symTint").toBool(true); uvo.pivShells = uo.value("pivShells").toBool(); uvo.diag = uo.value("diag").toBool(); uvo.stretchAngle = uo.value("stretchAngle").toBool(); uvo.symAxis = std::clamp(uo.value("symAxis").toDouble(0.5), -10.0, 10.0);
+  uvo.checker = uo.value("edChecker").toBool(false); uvo.c3d = uo.value("c3dv2").toBool() ? uo.value("c3d").toBool() : true;   /* (on by default now: the set's checker on the model in every mode — a saved old "off" is not kept once) */ uvo.s3d = uo.value("s3d").toBool(); uvo.dispOp = std::clamp(uo.value("dispOp").toDouble(0.6), 0.05, 1.0); uvo.tex = uo.value("tex").toBool(true); uvo.stretch = uo.value("stretch").toBool(); uvo.rotate = uo.value("rotate").toBool(true); uvo.packPasses = std::clamp(uo.value("packPasses").toInt(1), 1, 20);
+  uvo.packEqual = uo.value("packEqual").toBool(); uvo.packFree = uo.value("packFree").toBool(false); uvo.packFinal = uo.value("packFinal").toBool(); uvo.rectMode = std::clamp(uo.value("rectMode").toInt(1), 0, 1); uvSetIso = uo.value("soloSet").toBool(true); uvo.density = std::clamp(uo.value("cells").toDouble(64), 8.0, 256.0); uvo.strAmt = std::clamp(uo.value("strAmt").toDouble(0.7), 0.0, 1.0); uvo.strUp = uo.value("strUp").toBool(true); uvo.strSpread = uo.value("strSpreadv2").toBool() ? uo.value("strSpread").toBool() : false;   /* (off by default now: Straighten does not move a shell; an old saved "on" is dropped once) */ uvo.anch = std::clamp(uo.value("anch").toInt(4), 0, 8); uvo.warpN = std::clamp(uo.value("warpN").toInt(3), 1, 12);   /* (the labelled checker: 64 cells across the tile by default) */ uvo.pad = std::clamp(uo.value("pad").toDouble(0.01), 0.0, 0.1); uvo.angle = std::clamp(uo.value("angle").toDouble(50), 1.0, 179.0); uvo.symUnfold = uo.value("symUnfold").toBool(true); uvo.symTint = uo.value("symTint").toBool(true); uvo.pivShells = uo.value("pivShells").toBool(); uvo.diag = uo.value("diag").toBool(); uvo.stretchAngle = uo.value("stretchAngle").toBool(); uvo.symAxis = std::clamp(uo.value("symAxis").toDouble(0.5), -10.0, 10.0);
   QJsonObject d = QJsonDocument::fromJson(st.value("topo/disp").toByteArray()).object();
   tdisp.unlit = d.value("unlit").toBool(); tdisp.noTex = d.value("noTex").toBool(); tdisp.op = clamp(d.value("op").toDouble(1), 0, 1); tdisp.pdo = clamp(d.value("pdo").toDouble(0), 0, 1); tdisp.pdoOn = d.value("pdoOn").toBool(true);
   QJsonObject m = QJsonDocument::fromJson(st.value("topo/snapMask").toByteArray()).object();
@@ -52,8 +54,8 @@ void Viewport::loadTopoPrefs() {
 }
 void Viewport::saveTopoPrefs() const {
   QSettings st;
-  st.setValue("topo/set", QJsonDocument(QJsonObject{{"snap", tset.snap}, {"esnap", tset.esnap}, {"esnapMode", tset.esnapMode}, {"esnapPx", tset.esnapPx}, {"sym", tset.sym}, {"uv", tset.uv}, {"keepUv", tset.keepUv}, {"selThrough", tset.selThrough}, {"selTool", tset.selTool},
-                                                       {"loopStopSel", tset.loopStopSel}, {"loopStopNgon", tset.loopStopNgon}, {"loopStopTri", tset.loopStopTri}, {"soft", tset.soft}, {"softR", tset.softR}, {"softMode", tset.softMode},
+  st.setValue("topo/set", QJsonDocument(QJsonObject{{"fillMode", tset.fillMode}, {"snap", tset.snap}, {"esnap", tset.esnap}, {"esnapMode", tset.esnapMode}, {"esnapPx", tset.esnapPx}, {"sym", tset.sym}, {"uv", tset.uv}, {"keepUv", tset.keepUv}, {"selThrough", tset.selThrough}, {"selTool", tset.selTool},
+                                                       {"loopStopSel", tset.loopStopSel}, {"loopStopNgon", tset.loopStopNgon}, {"loopStopTri", tset.loopStopTri}, {"loopStopSeam", tset.loopStopSeam}, {"loopStopCrease", tset.loopStopCrease}, {"soft", tset.soft}, {"softR", tset.softR}, {"softMode", tset.softMode},
                                                        {"gzOrient", tset.gzOrient == "custom" ? QString("world") : tset.gzOrient}, {"gzFree", tset.gzFree}, {"gzStep", tset.gzStep}, {"gzWhat", tset.gzWhat}, {"gzSlide", tset.gzSlide}, {"alAxis", tset.alAxis}, {"alTo", tset.alTo}, {"brushMode", tset.brushMode}, {"brushStr", tset.brushStr}, {"relaxStars", tset.relaxStars}, {"brushAll", tset.brushAll}, {"brushKind", tset.brushKind}}).toJson(QJsonDocument::Compact));
   st.setValue("topo/symmetry", QJsonDocument(symo.toJson()).toJson(QJsonDocument::Compact));   // (Symmetry's settings — both rooms)
   st.setValue("topo/disp", QJsonDocument(QJsonObject{{"unlit", tdisp.unlit}, {"noTex", tdisp.noTex}, {"op", tdisp.op}, {"pdo", tdisp.pdo}, {"pdoOn", tdisp.pdoOn}}).toJson(QJsonDocument::Compact));
@@ -78,7 +80,17 @@ void Viewport::topoWrite(int m, std::shared_ptr<PolyMesh> B) {
       p.insert("cx", c.x); p.insert("cy", c.y); p.insert("cz", c.z); xi->raw.insert("p", p); } }
   // (painted weights belong to vertices: a changed vertex count drops them; the snap mask belongs to the polygons)
   if (old && old->pos.size() != B->pos.size()) for (int x : meshmods::modsOf(*scene_, m)) { const Item* xi = scene_->item(x); if (xi->raw.value("kind").toString() != "xform") { scene_->removeFromParent(x); scene_->items.erase(x); } }
-  if (old && old->faceCount() != B->faceCount()) { it->raw.remove("smask"); it->raw.remove("hidF"); }   // (by polygon number: no longer theirs)
+  else if (old && old->faceVerts != B->faceVerts) {               // (the same count, the polygons changed: the vertices may be numbered anew — the weights follow them by place, else they go)
+    const size_t n = old->pos.size(); auto eq = [](const Vec3& a, const Vec3& b) { return a.x == b.x && a.y == b.y && a.z == b.z; };
+    bool same = true; for (size_t v = 0; v < n && same; v++) same = eq(old->pos[v], B->pos[v]);
+    if (!same) { std::vector<int> to(n, -1); bool ok = true; std::map<std::array<double, 3>, int> at; std::vector<char> used(n, 0);
+      for (size_t v = 0; v < n && ok; v++) ok = at.emplace(std::array<double, 3>{B->pos[v].x, B->pos[v].y, B->pos[v].z}, int(v)).second;
+      for (size_t v = 0; v < n && ok; v++) { auto f = at.find({old->pos[v].x, old->pos[v].y, old->pos[v].z}); ok = f != at.end() && !used[size_t(f->second)]; if (ok) { to[v] = f->second; used[size_t(f->second)] = 1; } }
+      for (int x : meshmods::modsOf(*scene_, m)) { Item* xi = scene_->item(x); if (xi->raw.value("kind").toString() == "xform") continue;
+        if (!ok) { scene_->removeFromParent(x); scene_->items.erase(x); continue; }
+        for (const char* k : {"mask", "hold"}) { const QJsonArray a = xi->raw.value(k).toArray(); if (size_t(a.size()) != n) continue;
+          QJsonArray b; for (size_t v = 0; v < n; v++) b.append(0.0); for (size_t v = 0; v < n; v++) b[qsizetype(to[v])] = a[qsizetype(v)]; xi->raw.insert(k, b); } } } }
+  if (old && old->faceCount() != B->faceCount()) { it->raw.remove("smask"); it->raw.remove("hidF"); it->raw.remove("pHidF"); it->raw.remove("pLockF"); }   // (by polygon number: no longer theirs — the Paint room's hidden / locked ones too)
   if (old && it->raw.contains("selSets") && (old->faceCount() != B->faceCount() || old->pos.size() != B->pos.size() || old->faceVerts.size() != B->faceVerts.size())) {   // (the same topology: their numbers still hold)
     const QJsonArray s = topo::selSetsFollow(it->raw.value("selSets").toArray(), old, B);   // (the selection sets: onto the new geometry by place)
     if (s.isEmpty()) it->raw.remove("selSets"); else it->raw.insert("selSets", s); }
@@ -121,12 +133,14 @@ QString Viewport::tgDuplicate(int m, int gi) {
   Item* it = scene_->item(m); if (!it) return "!";
   const PolyMesh& d = *baseOf(*it); PolyMesh o = d; const int nf = d.faceCount(), n = int(d.pos.size()), G = int(d.groupNames.size());
   const bool uv = d.cornerUV.size() == d.faceVerts.size() && !d.cornerUV.empty(), fm = int(d.faceMat.size()) == nf;
-  const bool nrm = d.cornerNormal.size() == d.faceVerts.size() && !d.cornerNormal.empty();
+  const bool nrm = d.cornerNormal.size() == d.faceVerts.size() && !d.cornerNormal.empty(), sets = topo::hasUvSets(d);
   std::unordered_map<int, int> vmap;
   for (int f = 0; f < nf; f++) if (d.faceGroup[size_t(f)] == gi) {
     for (int k = d.faceStart[size_t(f)]; k < d.faceStart[size_t(f) + 1]; k++) { int v = d.faceVerts[size_t(k)]; auto r = vmap.emplace(v, n + int(vmap.size())); if (r.second) { o.pos.push_back(d.pos[size_t(v)]); if (d.vcol.size() == d.pos.size() && !d.vcol.empty()) o.vcol.push_back(d.vcol[size_t(v)]); }
-      o.faceVerts.push_back(r.first->second); if (uv) o.cornerUV.push_back(d.cornerUV[size_t(k)]); if (nrm) o.cornerNormal.push_back(d.cornerNormal[size_t(k)]); }
+      o.faceVerts.push_back(r.first->second); if (uv) o.cornerUV.push_back(d.cornerUV[size_t(k)]); if (nrm) o.cornerNormal.push_back(d.cornerNormal[size_t(k)]);
+      if (sets) for (size_t s = 0; s < o.setUV.size(); s++) o.setUV[s].push_back(d.setUV[s][size_t(k)]); }   // (the UV Sets: the copy's corners in each)
     o.faceStart.push_back(int(o.faceVerts.size())); o.faceGroup.push_back(G); if (fm) o.faceMat.push_back(d.faceMat[size_t(f)]);
+    if (sets) { o.faceSets.push_back(d.faceSets[size_t(f)]); o.faceLive.push_back(d.faceLive[size_t(f)]); }
   }
   // (the copy's hard edges and creases: those of the original whose two ends were copied)
   auto cp = [&](int a, int b, auto&& put) { auto ia = vmap.find(a), ib = vmap.find(b); if (ia != vmap.end() && ib != vmap.end()) put(ia->second, ib->second); };
@@ -230,7 +244,7 @@ QString Viewport::tGroupBorder(int m, int gi) {
   auto B = baseSp(*it); auto T = topo::ttopo(B); auto es = topo::groupBorder(*T, *B, gi);
   if (es.empty()) TOPO_NO(tr("This polygroup has no border (it is a closed part of its own)"));
   auto groupFacesAlong = [&] { std::set<int> fs; for (int e : es) for (int f : {T->ef0[size_t(e)], T->ef1[size_t(e)]}) if (f >= 0 && B->faceGroup[size_t(f)] == gi) fs.insert(f); return std::vector<int>(fs.begin(), fs.end()); };
-  if (topoHeavy(m)) { auto fs = groupFacesAlong(); tSelectFaces(m, fs); ui::toast(tr("Border of %1: %2 polygons").arg(B->groupNames[size_t(gi)]).arg(fs.size())); return {}; }
+  
   if (topoMode == "object") setTopoMode("edge");
   const char key = tKey(); std::vector<int> list = es;
   if (key == 'v') { std::set<int> vs; for (int e : es) { vs.insert(T->ea[size_t(e)]); vs.insert(T->eb[size_t(e)]); } list.assign(vs.begin(), vs.end()); }
@@ -258,7 +272,7 @@ QString Viewport::tSelectSymmetric(int m, int gi) {
 // Bake: the Transform written into the points (a mirroring scale turns the polygons back out), the Transform removed
 QString Viewport::topoBakeXform(int m) {
   Item* it = scene_->item(m); if (!it) return "!";
-  if (topoHeavy(m)) TOPO_NO(tr("A high-poly mesh (over 300 000 triangles) is not edited — Object mode only"));
+
   int x = xformOf(*scene_, m); if (x < 0) return "!";
   const Item* xi = scene_->item(x); PolyMesh d = *baseOf(*it); Affine M = meshmods::xformMatrix(xi->raw.value("p").toObject(), d.bounds().center());
   Vec3 piv = M.apply(xformCenter(xi, *baseOf(*it)));
@@ -270,10 +284,11 @@ QString Viewport::topoBakeXform(int m) {
   for (auto& p : d.pos) { p = M.apply(p); if (keepAxes) p = Gi.apply(p); }
   for (auto& n : d.cornerNormal) { Vec3 r = M.normal({n[0], n[1], n[2]}); if (keepAxes) r = Gi.lin(r); n = {float(r.x), float(r.y), float(r.z)}; }
   if (M.det() < 0) {
-    std::vector<int> fv = d.faceVerts; auto uv = d.cornerUV; auto nv = d.cornerNormal;
+    std::vector<int> fv = d.faceVerts; auto uv = d.cornerUV; auto nv = d.cornerNormal; const auto su = d.setUV;   // (the UV Sets' corners turned with the rest)
     const bool hasUV = uv.size() == fv.size() && !uv.empty(), hasN = nv.size() == fv.size() && !nv.empty();
     for (int f = 0; f < d.faceCount(); f++) { int s = d.faceStart[size_t(f)], n = d.faceStart[size_t(f) + 1] - s;
-      for (int k = 1; k < n; k++) { d.faceVerts[size_t(s + k)] = fv[size_t(s + n - k)]; if (hasUV) d.cornerUV[size_t(s + k)] = uv[size_t(s + n - k)]; if (hasN) d.cornerNormal[size_t(s + k)] = nv[size_t(s + n - k)]; } }
+      for (int k = 1; k < n; k++) { d.faceVerts[size_t(s + k)] = fv[size_t(s + n - k)]; if (hasUV) d.cornerUV[size_t(s + k)] = uv[size_t(s + n - k)]; if (hasN) d.cornerNormal[size_t(s + k)] = nv[size_t(s + n - k)];
+        for (size_t q = 0; q < su.size(); q++) if (su[q].size() == fv.size()) d.setUV[q][size_t(s + k)] = su[q][size_t(s + n - k)]; } }
   }
   it->raw.insert("pivot", QJsonArray{piv.x, piv.y, piv.z});        // (the pivot stays where it was shown)
   scene_->removeFromParent(x); scene_->items.erase(x);
@@ -327,7 +342,7 @@ bool Viewport::tgIsolateToggle() {
   QJsonArray h; for (int g = 0; g < int(B->groupNames.size()); g++) if (!gs.count(g)) h.append(g); it->raw.insert("hidGroups", h); pickCache_.erase(m);
   Scene::Isolation iso; iso.keep.insert(m); for (int x : meshmods::modsOf(*scene_, m)) iso.keep.insert(x); scene_->iso = iso;
   staticRev_++; topoRev_++; allWalls_ = true; emit sceneEdited(); requestUpdate();
-  ui::toast(tr("Only %1 shown — Ctrl+H again to show everything").arg(gs.size() == 1 ? B->groupNames[size_t(*gs.begin())] : tr("%1 polygroups").arg(gs.size())));
+  ui::toast(tr("Only %1 shown — Ctrl+X shows everything").arg(gs.size() == 1 ? B->groupNames[size_t(*gs.begin())] : tr("%1 polygroups").arg(gs.size())));
   return true;
 }
 
@@ -545,7 +560,6 @@ void Viewport::smLasso() {
     return;
   }
   const PickCache* pc = pickCacheOf(m); auto bvh = bvhOf(m, false); if (!pc || !bvh) return;
-  const bool thru = false;                                     // (the lasso: only what the camera sees)
   const auto& P = it->poly->pos; const PolyMesh& B = *baseOf(*it); const double size = std::max(1e-9, it->poly->bounds().size().length()), tol = size * 1e-4;
   auto a0 = smArr(m); std::vector<char> arr = !a0.empty() ? a0 : std::vector<char>(size_t(B.faceCount()), td_.erase ? 1 : 0); const char v = td_.erase ? 0 : 1;
   Projector pr = projector(); const bool ortho = cam_.ortho(); const Vec3 eye = cam_.pos, dir = cam_.dir(); std::vector<int> ch;
@@ -554,7 +568,7 @@ void Viewport::smLasso() {
     const Vec3 &a = P[pc->tris[t * 3]], &b = P[pc->tris[t * 3 + 1]], &c = P[pc->tris[t * 3 + 2]]; Vec3 mid = (a + b + c) * (1.0 / 3);
     ScreenPt s = pr.toScreen(mid); if (s.z > 1 || s.x < x0 || s.x > x1 || s.y < y0 || s.y > y1 || !insidePolygon(L, s.x, s.y)) continue;
     int f = pc->tri2f[t]; if (arr[size_t(f)] == v) continue;
-    if (!thru) {
+    {
       Vec3 nrm = (b - a).cross(c - a), vv = ortho ? dir : mid - eye; if (nrm.dot(vv) > 0) continue;
       Vec3 o = ortho ? mid - dir * (size * 10) : eye; double Ld = o.distanceTo(mid); if (bvh->ray(o, (mid - o).normalized(), Ld - tol)) continue;
     }
@@ -592,7 +606,8 @@ Quat quatOfEuler(const std::array<double, 3>& e) {
 // and, under an object, their axes (a group under a group turns with it by itself)
 void Viewport::carryUnder(int id, const Affine& D) {
   const Item* top = scene_->item(id); if (!top) return; const Quat R = rotOf(D);
-  std::function<void(int)> walk = [&](int pid) { for (int c : scene_->item(pid)->children) { Item* ci = scene_->item(c); if (!ci) continue;
+  std::function<void(int)> walk = [&](int pid) { const std::vector<int> kids = scene_->item(pid)->children;   // (a copy: a Transform made for a mesh joins this list)
+    for (int c : kids) { Item* ci = scene_->item(c); if (!ci) continue;
     if (ci->type == ItemType::IMesh && ci->poly) meshmods::setMeshMatrix(*scene_, c, Affine::mul(D, meshmods::meshMatrix(*scene_, *ci)));
     else if (ci->type == ItemType::Group) {
       const QJsonArray a = ci->raw.value("gpivot").toArray(); const Vec3 q = D.apply(a.size() == 3 ? Vec3(a[0].toDouble(), a[1].toDouble(), a[2].toDouble()) : Vec3()); ci->raw.insert("gpivot", QJsonArray{q.x, q.y, q.z});

@@ -50,7 +50,7 @@ const std::vector<Param>& params(const QString& t) {
     {"pcube", {{"w", "Width", 0.05, 5, 0.01, 1, false}, {"h", "Height", 0.05, 5, 0.01, 1, false}, {"d", "Depth", 0.05, 5, 0.01, 1, false}, {"sx", "Segments X", 1, 32, 1, 1, true}, {"sy", "Segments Y", 1, 32, 1, 1, true}, {"sz", "Segments Z", 1, 32, 1, 1, true}}},
     {"pcyl", {{"r", "Radius", 0.05, 5, 0.01, 0.5, false}, {"h", "Height", 0.05, 5, 0.01, 1, false}, {"sides", "Sides", 3, 64, 1, 8, true}, {"hseg", "Height segments", 1, 64, 1, 1, true}}},
     {"pplane", {{"w", "Width", 0.05, 5, 0.01, 1, false}, {"d", "Depth", 0.05, 5, 0.01, 1, false}, {"sx", "Segments X", 1, 64, 1, 4, true}, {"sz", "Segments Z", 1, 64, 1, 4, true}}},
-    {"psphere", {{"r", "Radius", 0.05, 5, 0.01, 0.5, false}, {"div", "Divisions", 1, 32, 1, 4, true}}},
+    {"psphere", {{"r", "Radius", 0.05, 5, 0.01, 0.5, false}, {"div", "Divisions", 1, 32, 1, 4, true}, {"st", "Stretch", 0, 5, 0.01, 0, false}, {"stseg", "Stretch segments", 1, 32, 1, 1, true}}},
     {"ring", {{"R", "Radius", 0.05, 5, 0.01, 0.5, false}, {"r", "Thickness", 0.01, 2, 0.01, 0.15, false}, {"sides", "Sides", 3, 96, 1, 24, true}, {"rsides", "Tube sides", 3, 48, 1, 12, true}}},
     {"sphere", {{"r", "Radius", 0.05, 5, 0.01, 0.5, false}, {"sides", "Sides", 3, 96, 1, 24, true}, {"rings", "Rings", 2, 64, 1, 12, true}}},
   };
@@ -73,12 +73,22 @@ PolyMesh build(const QString& t, const QJsonObject& p, const Vec3& c, double u) 
     const double w = D(p, "w", 1) * u / 2, d = D(p, "d", 1) * u / 2;
     B.grid(I(p, "sx", 4), I(p, "sz", 4), [&](double a, double b) { return c + Vec3(-w + 2 * w * a, 0, -d + 2 * d * b); }, [](const Vec3&) { return Vec3(0, 1, 0); });
   } else if (t == "psphere") {
-    const double r = D(p, "r", 0.5) * u; const int n = I(p, "div", 4);
+    // Stretch: the upper half lifted by st/2, the lower lowered, a straight band of "Stretch segments" rows between them
+    // (Divisions odd: the band is the middle row of the sides, its sphere curve kept)
+    const double r = D(p, "r", 0.5) * u, s = std::max(0.0, D(p, "st", 0)) * u; const int n = I(p, "div", 4), sn = I(p, "stseg", 1);
+    const int k0 = n / 2, k1 = n - n / 2;                                // (the side rows below / above the band)
+    const Vec3 up(0, 1, 0);
     auto onS = [&](const Vec3& q) { return c + q.normalized() * r; };
-    for (int sg : {-1, 1}) {
-      B.grid(n, n, [&](double a, double b) { return onS(Vec3(sg, -1 + 2 * a, -1 + 2 * b)); }, from(c));
-      B.grid(n, n, [&](double a, double b) { return onS(Vec3(-1 + 2 * a, sg, -1 + 2 * b)); }, from(c));
-      B.grid(n, n, [&](double a, double b) { return onS(Vec3(-1 + 2 * a, -1 + 2 * b, sg)); }, from(c)); }
+    auto Y = [&](double k) { return -1 + 2 * k / n; };
+    auto side = [](int f, double a, double y) { return f == 0 ? Vec3(1, y, -1 + 2 * a) : f == 1 ? Vec3(-1, y, -1 + 2 * a) : f == 2 ? Vec3(-1 + 2 * a, y, 1) : Vec3(-1 + 2 * a, y, -1); };
+    auto lateral = [&](const Vec3& x) { return Vec3(x.x - c.x, 0, x.z - c.z); };
+    for (int sg : {-1, 1}) B.grid(n, n, [&](double a, double b) { return onS(Vec3(-1 + 2 * a, sg, -1 + 2 * b)) + up * (sg * s / 2); }, from(c));
+    for (int f = 0; f < 4; f++) {
+      if (k0 > 0) {
+        B.grid(n, k0, [&](double a, double b) { return onS(side(f, a, Y(b * k0))) - up * (s / 2); }, from(c));
+        B.grid(n, k0, [&](double a, double b) { return onS(side(f, a, Y(k1 + b * k0))) + up * (s / 2); }, from(c)); }
+      B.grid(n, sn, [&](double a, double b) { return onS(side(f, a, Y(k0 + b * (k1 - k0)))) + up * (s * (b - 0.5)); }, lateral);   // (no height: its quads drop away)
+    }
   } else if (t == "sphere") {
     const double r = D(p, "r", 0.5) * u;
     B.grid(I(p, "sides", 24), I(p, "rings", 12), [&](double a, double b) { const double th = a * PI2, ph = b * PI2 / 2; return c + Vec3(std::sin(ph) * std::cos(th), -std::cos(ph), std::sin(ph) * std::sin(th)) * r; }, from(c));

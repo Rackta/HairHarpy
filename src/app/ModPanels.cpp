@@ -273,8 +273,10 @@ QWidget* buildModPanel(Viewport* vp, Scene* sc) {
   auto* ed = new ProfileEditor([vp] { return &vp->modProfile; }, [vp, sel] { vp->modPreset.clear(); QSignalBlocker b(sel); sel->setCurrentIndex(0); }, [] {});
   QObject::connect(sel, &QComboBox::currentIndexChanged, vp, [vp, sel, ed](int) { QString n = sel->currentData().toString(); if (n.isEmpty()) return; vp->modPreset = n; vp->modProfile = *tube::profileByName(n); ed->update(); });
   v->addWidget(ed);
-  auto* save = button(QObject::tr("Save preset"), QObject::tr("Save this profile as your own preset"));
-  QObject::connect(save, &QPushButton::clicked, vp, [vp, w] {
+  // (the presets kept and deleted — once in a while: the "more" menu at the end of the Profile row)
+  QMenu* pm = nullptr; ph->addWidget(ui::moreButton(QObject::tr("More: this profile saved as a preset of your own, a preset of your own deleted"), &pm));
+  QAction* save = ui::menuItem(pm, QObject::tr("Save preset"), QObject::tr("Save this profile as your own preset"), nullptr, nullptr);
+  QObject::connect(save, &QAction::triggered, vp, [vp, w] {
     bool builtin = false; for (auto& p : tube::builtinProfiles()) if (p.name == vp->modPreset) builtin = true;
     bool ok = false; QString name = QInputDialog::getText(w, QObject::tr("Save preset"), QObject::tr("Preset name"), QLineEdit::Normal, !vp->modPreset.isEmpty() && !builtin ? vp->modPreset : QObject::tr("My profile"), &ok).trimmed();
     if (!ok || name.isEmpty()) return;
@@ -282,14 +284,13 @@ QWidget* buildModPanel(Viewport* vp, Scene* sc) {
     auto l = tube::userProfiles(); l.erase(std::remove_if(l.begin(), l.end(), [&](auto& p) { return p.name == name; }), l.end()); l.push_back({name, vp->modProfile}); tube::saveUserProfiles(l);
     vp->modPreset = name; emit vp->brushChanged(); ui::toast(QObject::tr("Preset \"%1\" saved").arg(name));
   });
-  auto* del = button(QObject::tr("Delete preset"), QObject::tr("Delete the selected preset of your own (built-in presets stay)"));
-  QObject::connect(del, &QPushButton::clicked, vp, [vp, sel] {
+  QAction* del = ui::menuItem(pm, QObject::tr("Delete preset"), QObject::tr("Delete the selected preset of your own (built-in presets stay)"), nullptr, nullptr);
+  QObject::connect(del, &QAction::triggered, vp, [vp, sel] {
     QString name = sel->currentData().toString(); bool builtin = false; for (auto& p : tube::builtinProfiles()) if (p.name == name) builtin = true;
     if (name.isEmpty() || builtin) { ui::toast(QObject::tr("Pick one of your own presets to delete")); return; }
     auto l = tube::userProfiles(); l.erase(std::remove_if(l.begin(), l.end(), [&](auto& p) { return p.name == name; }), l.end()); tube::saveUserProfiles(l);
     vp->modPreset.clear(); emit vp->brushChanged(); ui::toast(QObject::tr("Preset \"%1\" deleted").arg(name));
   });
-  v->addWidget(hbox({save, del}));
   size_t n = tube::modTargets(*sc, vp->selection(), vp->hair().curves).size();
   auto* ap = button(n > 1 ? QObject::tr("Apply to %1 curves").arg(n) : QObject::tr("Apply"), QObject::tr("Sweep this profile along the selected curve(s): a temporary surface you can shape, then convert"), true);
   QObject::connect(ap, &QPushButton::clicked, vp, [vp] { auto prof = vp->modProfile; vp->runEdit([prof](Scene& s, Selection& sl, const CurveCache& c) { return tube::applyModifier(s, c, sl, prof); }, true); });
@@ -447,10 +448,12 @@ void xmodProps(QVBoxLayout* v, Viewport* vp, Scene* sc, int id) {
     };
     v->addWidget(muted(QObject::tr("Affects only:"))); v->addWidget(zone);
     check(QObject::tr("Ignore"), "ignore", QObject::tr("On: the mask affects every extra modifier of the lock EXCEPT the ones in the list"));
-    auto* cl = button(QObject::tr("Clear")); QObject::connect(cl, &QPushButton::clicked, vp, [maskOp] { maskOp([](double) { return 0.0; }); });
-    auto* fl = button(QObject::tr("Fill")); QObject::connect(fl, &QPushButton::clicked, vp, [maskOp] { maskOp([](double) { return 1.0; }); });
-    auto* iv = button(QObject::tr("Invert")); QObject::connect(iv, &QPushButton::clicked, vp, [maskOp] { maskOp([](double m) { return 1 - m; }); });
-    v->addWidget(hbox({cl, fl, iv, brushBtn(QObject::tr("🖌 Mask brush"))}));
+    // (the brush — the button; the whole mask cleared, filled, inverted — the "more" menu beside it)
+    QMenu* mm = nullptr; auto* mb = ui::moreButton(QObject::tr("The whole mask: cleared, filled, inverted"), &mm);
+    ui::menuItem(mm, QObject::tr("Clear"), {}, vp, [maskOp] { maskOp([](double) { return 0.0; }); });
+    ui::menuItem(mm, QObject::tr("Fill"), {}, vp, [maskOp] { maskOp([](double) { return 1.0; }); });
+    ui::menuItem(mm, QObject::tr("Invert"), {}, vp, [maskOp] { maskOp([](double m) { return 1 - m; }); });
+    v->addWidget(hbox({brushBtn(QObject::tr("🖌 Mask brush")), mb}));
   } else if (kind == "thick" || kind == "twist") {
     v->addWidget(muted(kind == "thick" ? QObject::tr("Painted thickness along the lock: orange — fatter (up to ×2), blue — thinner (down to a point). A mask can limit it.")
                                        : QObject::tr("Painted twist along the lock: green — the profile turns clockwise, pink — anticlockwise (seen from the root along the lock). A mask can limit it.")));
@@ -473,12 +476,43 @@ void xmodProps(QVBoxLayout* v, Viewport* vp, Scene* sc, int id) {
   } else if (kind == "curl") {
     QJsonObject p = P(*x); double ref = p.value("radRef").toDouble(); if (!ref) ref = p.value("radius").toDouble(); if (!ref) ref = p.value("r0").toDouble(); if (!ref) ref = 0.01;
     for (int k = 0; k < 4; k++) setDefault(qPrintable(QString("r%1").arg(k)), p.value("radius").isDouble() ? p.value("radius").toDouble() : ref * 1.5);   // (older saves: one radius)
-    for (const char* k : {"smooth", "shrink", "thin"}) setDefault(k, 0);
+    for (const char* k : {"smooth", "shrink", "thin", "pitch", "endA", "endB"}) setDefault(k, 0);
+    setDefault("seg", 24); setDefault("anch", 8);
     auto sec = [v](const QString& t) { auto* h = new QLabel(t.toUpper()); h->setStyleSheet("color:#cfcfcf;font-weight:600;font-size:11px;margin-top:9px;border-bottom:1px solid #3a3a3a"); v->addWidget(h); };
+    {   // (the preset: a coil of the wire's own thickness along the lock — a coiled phone cord, straight at both ends)
+      auto* cord = new QPushButton(QObject::tr("☎ Telephone cord")); cord->setToolTip(QObject::tr("Sets the curl up as a phone cord: a tight round coil (coil radius ≈ 3.5 wire thicknesses, the coils almost touching), straight at both ends. Then adjust the sliders below"));
+      QObject::connect(cord, &QPushButton::clicked, vp, [vp, sc, id, ref] {
+        vp->runEdit([id, ref](Scene& s, Selection&, const CurveCache&) {
+          for (const char* k : {"r0", "r1", "r2", "r3"}) setP(s, id, k, ref * 3.5);
+          setP(s, id, "pitch", 1.1); setP(s, id, "endA", 0.1); setP(s, id, "endB", 0.1); setP(s, id, "seg", 16); setP(s, id, "anch", 6);
+          for (const char* k : {"smooth", "shrink", "thin", "phase", "spin"}) setP(s, id, k, 0.0); setP(s, id, "thick", 1.0); setP(s, id, "follow", false); setP(s, id, "rev", false);
+          return QString(); }, false);
+        vp->liveTubes(); later(vp, [vp] { vp->commitLive(); }); });
+      v->addWidget(cord);
+      // the anime curl: a cone of flat bands stacked along the axis (the profile becomes a flat band, narrowing toward the tip)
+      auto* anime = new QPushButton(QObject::tr("🌀 Anime curl")); anime->setToolTip(QObject::tr("Sets the curl up as a stylised anime spiral: a cone of wide flat bands lapped like a stack, narrowing toward a small loose curl at the tip (the profile becomes the flat Band). Then shape it by hand — the sliders below, and later the curves and cocoons"));
+      QObject::connect(anime, &QPushButton::clicked, vp, [vp, sc, id, tid, ref] {
+        vp->runEdit([id, tid, ref](Scene& s, Selection&, const CurveCache&) {
+          const double R[4] = {6, 4.4, 2.8, 0.9}; for (int k = 0; k < 4; k++) setP(s, id, QString("r%1").arg(k), ref * R[k]);
+          setP(s, id, "pitch", 0.8); setP(s, id, "endA", 0.0); setP(s, id, "endB", 0.0); setP(s, id, "seg", 12); setP(s, id, "anch", 6); setP(s, id, "ribbon", true); setP(s, id, "ribbonRot", 12.0); setP(s, id, "tipLoose", 4.0);
+          for (const char* k : {"smooth", "shrink", "thin", "phase", "spin"}) setP(s, id, k, 0.0); setP(s, id, "thick", 1.0); setP(s, id, "follow", false); setP(s, id, "rev", false);
+          if (Item* t = s.item(tid)) {            // (the band: the flat profile, wide at the root, narrower toward the tip)
+            QJsonObject p = t->raw.value("p").toObject(); p.insert("r0", ref * 2.4); p.insert("r1", ref * 1.6); p.insert("r2", ref * 0.5); p.insert("rRef", ref); p.insert("collapse", true); p.insert("tipLen", 0.12); t->raw.insert("p", p);
+            if (const auto band = tube::profileByName("Band")) { t->raw.insert("profile", tube::profileJson(*band)); t->raw.remove("profs"); } }
+          return QString(); }, false);
+        vp->liveTubes(); later(vp, [vp] { vp->commitLive(); }); });
+      v->addWidget(anime);
+    }
     sec(QObject::tr("Coil radius"));
     const QString rl[4] = {QObject::tr("Root"), "1/3", "2/3", QObject::tr("Tip")};
     for (int k = 0; k < 4; k++) row(rl[k], 0, ref * 6, ref / 100, QString("r%1").arg(k), fmtLen, QObject::tr("0 — the lock is only twisted here; more — a volume curl, as if it wound around something"));
     row(QObject::tr("Start angle"), -180, 180, 1, "phase", deg, QObject::tr("Where the spiral starts around the lock"));
+    sec(QObject::tr("Telephone cord"));
+    row(QObject::tr("Pitch"), 0, 6, 0.05, "pitch", [](double d) { return d > 0 ? "×" + QString::number(d, 'f', 2) : QObject::tr("off"); }, QObject::tr("The distance between the coils along the lock, in wire thicknesses (1 — touching, bigger — apart). Off (0): the Density below sets the turns instead"));
+    row(QObject::tr("Straight end: root"), 0, 0.45, 0.01, "endA", pct, QObject::tr("The coil starts only after this share of the lock — the root part stays straight (the coil radius grows smoothly)"));
+    row(QObject::tr("Straight end: tip"), 0, 0.45, 0.01, "endB", pct, QObject::tr("The coil ends this share of the lock before the tip — the tip stays straight"));
+    row(QObject::tr("Rings per turn"), 4, 64, 1, "seg", [](double d) { return QString::number(int(d)); }, QObject::tr("How finely each coil is cut: 6–12 for low-poly stylised curls, 24 smooth"));
+    row(QObject::tr("Anchors per turn (Convert)"), 3, 16, 1, "anch", [](double d) { return QString::number(int(d)); }, QObject::tr("Convert to curves puts this many anchors on each turn: fewer — easier to edit by hand"));
     sec(QObject::tr("Density (turns)"));
     const QString dl[4] = {"1/4", "2/4", "3/4", "4/4"};
     for (int k = 0; k < 4; k++) row(dl[k], 0, 4, 0.05, QString("d%1").arg(k), [](double d) { return QString::number(d, 'f', 2); }, QObject::tr("Turns over this quarter of the lock (1/4 — root … 4/4 — tip)"));
@@ -486,6 +520,9 @@ void xmodProps(QVBoxLayout* v, Viewport* vp, Scene* sc, int id) {
     row(QObject::tr("Thickness"), 0.1, 3, 0.01, "thick", [](double t) { return "×" + QString::number(t, 'f', 2); }, QObject::tr("Lock thickness inside the curl"));
     row(QObject::tr("Rotation in spiral"), -180, 180, 1, "spin", deg, QObject::tr("Turns the cross-section inside the spiral"));
     check(QObject::tr("Reverse direction"), "rev", QObject::tr("The spiral winds the other way round (clockwise ↔ anticlockwise)"));
+    check(QObject::tr("Ribbon (flat bands along the axis)"), "ribbon", QObject::tr("The profile's wide side lies along the coil's axis, so a flat profile makes bands stacked like an anime curl; the Pitch is then counted in the band's own width (1 — the bands touch, less — they overlap). Use a flat profile (Band)"));
+    row(QObject::tr("Ribbon turn"), -180, 180, 1, "ribbonRot", deg, QObject::tr("Turns the bands: 0 — flat on the cone the coil makes; a little — lapped like roof tiles; ±90° — standing on edge"));
+    row(QObject::tr("Loose tip"), 0, 12, 0.1, "tipLoose", [](double d) { return "×" + QString::number(1 + d, 'f', 1); }, QObject::tr("The last third of the lock opens out: its turns further apart, so the tip ends in a small loose curl instead of a tight stack"));
     check(QObject::tr("Twist the profile"), "follow", QObject::tr("The cross-section turns with the spiral (twisted lock); off — it keeps its direction"));
     sec(QObject::tr("Anti-clipping"));
     row(QObject::tr("Smooth the path"), 0, 1, 0.01, "smooth", pct, QObject::tr("The spiral winds around a smoothed path, so on bends of a curved lock the coils don't cut into each other (the lock shape gets softer)"));

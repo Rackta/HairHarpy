@@ -79,6 +79,12 @@ bool inPoly2(const std::vector<std::array<double, 2>>& P, double x, double y) {
   bool in = false; for (size_t i = 0, j = P.size() - 1; i < P.size(); j = i++) if ((P[i][1] > y) != (P[j][1] > y) && x < (P[j][0] - P[i][0]) * (y - P[i][1]) / (P[j][1] - P[i][1]) + P[i][0]) in = !in;
   return in;
 }
+// curve i gone (n = 0) or replaced by n pieces in its place: Loft's order and rows renumbered — the curves after it shifted by n - 1
+void renumberCurves(Viewport::PatchSt& S, int i, int n) {
+  auto sh = [&](int x) { return x > i ? x + n - 1 : x; };
+  std::vector<int> o; for (int x : S.order) if (!(n == 0 && x == i)) o.push_back(sh(x)); S.order = o;
+  std::map<std::pair<int, int>, int> r; for (auto& [k, v] : S.loftRows) if (!(n == 0 && (k.first == i || k.second == i))) r[{sh(k.first), sh(k.second)}] = v; S.loftRows = r;
+}
 }  // namespace
 
 // ---------- where things are ----------
@@ -91,6 +97,7 @@ Vec3 Viewport::patchOnRefs(const Vec3& p) const {
   const int tm = patchTarget(); double bd = 1e300; Vec3 best = p;
   for (auto& [id, x] : scene_->items) {
     if (id == tm || x.type != ItemType::IMesh || !x.poly || !scene_->isVisible(x)) continue;
+    if (shellWanted(x)) if (auto sh = bvhSurf(id, true)) { double d = 0; if (auto q = sh->closest(p, nullptr, &d)) if (d < bd) { bd = d; best = *q; } continue; }   // (the outer wall of a double one)
     auto h = heavy_.find(id);
     if (h != heavy_.end() && h->second.bvh && h->second.src.lock() == baseSp(x)) {   // (a high-poly one: its own hierarchy, in its file's space)
       const Affine M = meshmods::meshMatrix(*scene_, x), Mi = M.inverse(); double d = 0;
@@ -119,7 +126,17 @@ std::optional<Vec3> Viewport::patchSnap(const QPointF& mp, int skip) const {
       const double dx = b.x - a.x, dy = b.y - a.y, l2 = dx * dx + dy * dy, t = l2 > 0 ? std::clamp(((mp.x() - a.x) * dx + (mp.y() - a.y) * dy) / l2, 0.0, 1.0) : 0.0;
       const double d = std::hypot(a.x + dx * t - mp.x(), a.y + dy * t - mp.y()); if (d < bd) { bd = d; best = L[i] + (L[i + 1] - L[i]) * t; } } }
   if (best) return best;
-  if (auto h = pickSurface(mp)) return h->point;               // (the surface under the pointer)
+  if (auto h = pickSurface(mp)) {                              // (the surface under the pointer)
+    // (a mesh in a symmetry group: a point near a mirror plane — within 12 px — put onto it, the curve then runs on the axis; off in the group's settings)
+    Vec3 q = h->point; const int sm = patchTarget() >= 0 ? patchTarget() : topoMesh();
+    for (const Item* g = sm >= 0 ? scene_->item(scene_->item(sm)->parent) : nullptr; g; g = scene_->item(g->parent)) {
+      if (g->type != ItemType::Group || !g->raw.value("vsym").isObject()) continue;
+      const QJsonObject vs = g->raw.value("vsym").toObject(); if (vs.value("off").toBool() || vs.value("snapOff").toBool()) break;
+      const Affine G = meshmods::vsymFrame(*scene_, *g), Gi = G.inverse(); Vec3 l = Gi.apply(q); const ScreenPt s0 = P.toScreen(q);
+      for (auto [a, sg] : meshmods::vsymSides(vs)) { Vec3 c = l; (a == 0 ? c.x : a == 1 ? c.y : c.z) = 0; const ScreenPt s1 = P.toScreen(G.apply(c));
+        if (s0.z < 1 && s1.z < 1 && std::hypot(s1.x - s0.x, s1.y - s0.y) <= 12) l = c; }
+      q = G.apply(l); break; }
+    return q; }
   return std::nullopt;
 }
 
@@ -161,6 +178,11 @@ void Viewport::patchBuild() {
     key += "|" + QByteArray::number(C.div) + C.mode; for (auto& p : C.a) key += QByteArray::number(p.x, 'g', 10) + "," + QByteArray::number(p.y, 'g', 10) + "," + QByteArray::number(p.z, 'g', 10) + ";"; }
   if (key == S.key) return;
   S.key = key;
+  // (an edge curve's vertices: still the target mesh's, each where its anchor is — else, the mesh changed / gone / another one picked, a plain curve)
+  if (std::any_of(S.c.begin(), S.c.end(), [](const PatchCurve& C) { return !C.vids.empty(); })) { const std::vector<Vec3> W0 = ti ? ttWorld(tm) : std::vector<Vec3>{};
+    for (auto& C : S.c) { if (C.vids.empty()) continue; bool ok = C.vids.size() == C.a.size();
+      for (size_t q = 0; ok && q < C.vids.size(); q++) ok = C.vids[q] >= 0 && size_t(C.vids[q]) < W0.size() && W0[size_t(C.vids[q])].distanceTo(C.a[q]) <= 1e-6 * (1 + C.a[q].length());
+      if (!ok) C.vids.clear(); } }
   // (built a few ways till every curve closes a zone: the ends onto the rim within a third of its edge — any screen size —
   // or only within the curves' spacing; a curve's end a few pixels off a bare corner of the rim kept apart, or put on it —
   // else it cuts across the rim there; none closing all: the one losing fewest)
@@ -351,7 +373,8 @@ void Viewport::patchBuild() {
     for (int hh : f.hs) { auto L = hPts(hh); for (size_t k = 0; k + 1 < L.size(); k++) f.poly.push_back(to2(L[k])); if (E[size_t(hh >> 1)].curve < 0 || !E[size_t(hh >> 1)].vids.empty()) f.rim = true; if (E[size_t(hh >> 1)].curve < 0) f.bare = true; }   // (an edge curve: the rim; bare — the rim itself in it)
     for (size_t k = 0, j = f.poly.size() - 1; k < f.poly.size(); j = k++) f.area += (f.poly[j][0] * f.poly[k][1] - f.poly[k][0] * f.poly[j][1]) * 0.5;
     if (f.area <= 0) continue;                                  // (the outside of the drawing)
-    bool anyCurve = false; for (int hh : f.hs) if (E[size_t(hh >> 1)].curve >= 0 && E[size_t(hh >> 1)].vids.empty()) anyCurve = true;   // (an edge curve is the rim too) if (!anyCurve) continue;   // (the mesh itself, a hole of it)
+    bool anyCurve = false; for (int hh : f.hs) if (E[size_t(hh >> 1)].curve >= 0 && E[size_t(hh >> 1)].vids.empty()) anyCurve = true;   // (an edge curve is the rim too)
+    if (!anyCurve) continue;                                    // (the mesh itself, a hole of it)
     if (!meshMid.empty()) {                                     // (over the built mesh's polygons: that side is built already)
       Box3 bb; for (int hh : f.hs) for (auto& p : E[size_t(hh >> 1)].L) bb.expand(p); const Vec3 pad = (bb.max - bb.min) * 0.05; bb.expand(bb.min - pad); bb.expand(bb.max + pad);
       for (const Vec3& c : meshMid) { if (c.x < bb.min.x || c.y < bb.min.y || c.z < bb.min.z || c.x > bb.max.x || c.y > bb.max.y || c.z > bb.max.z) continue; const auto q = to2(c); if (inPoly2(f.poly, q[0], q[1])) { f.ok = false; break; } } }
@@ -445,7 +468,10 @@ void Viewport::patchBuild() {
       auto pts = [&](size_t i) { return E[size_t(f.hs[i] >> 1)].curve < 0 || !E[size_t(f.hs[i] >> 1)].vids.empty() ? E[size_t(f.hs[i] >> 1)].vids.size() : size_t(divOf.count(f.hs[i] >> 1) ? divOf[f.hs[i] >> 1] + 1 : 2); };
       bool shortOne = false; for (size_t i = 0; i < nH; i++) if (pts(i) < 3) shortOne = true;
       const int nc0 = int(std::count(corner.begin(), corner.end(), 1));
-      if (shortOne && nH == 4) std::fill(corner.begin(), corner.end(), 1);
+      // (four pieces whose opposite ones have as many edges — a 6-5-6-5 zone: every junction a corner even where it turns
+      //  little, the zone an even grid — not rows of changing length from a side made of two pieces)
+      const bool paired = nH == 4 && pts(0) == pts(2) && pts(1) == pts(3) && pts(0) >= 2 && pts(1) >= 2;
+      if ((shortOne || paired) && nH == 4) std::fill(corner.begin(), corner.end(), 1);
       else if (shortOne && nc0 > 4) { std::vector<size_t> o(nH); std::iota(o.begin(), o.end(), 0); std::sort(o.begin(), o.end(), [&](size_t x, size_t y) { return turnAt[x] > turnAt[y]; });
         std::fill(corner.begin(), corner.end(), 0); for (size_t k = 0; k < 4; k++) corner[o[k]] = 1; } }
     int nCorner = int(std::count(corner.begin(), corner.end(), 1)); if (nCorner < 3 && nH >= 3) { std::fill(corner.begin(), corner.end(), 1); nCorner = int(nH); }
@@ -626,6 +652,8 @@ void Viewport::patchBuild() {
     for (int a = 0; a < 4; a++) { once(a >= 2, a % 2 == 0); if (lost == 0) { bl = -1; break; } if (bl < 0 || lost < bl) { best = S; bl = lost; } }
     if (bl >= 0) S = best; }
   if (S.kind != 'p') patchLoftStrip();
+  else if (S.F.empty() && std::count_if(S.c.begin(), S.c.end(), [](const PatchCurve& c) { return c.a.size() >= 2 && c.vids.empty(); }) >= 2) {   // (no zone closes: the curves joined as in Loft — the rows run between them)
+    const QString note = S.note; S.kind = 'l'; patchLoftStrip(); S.kind = 'p'; if (S.F.empty()) S.note = note; else S.note.clear(); }
   patchLift();
 }
 
@@ -709,19 +737,20 @@ bool Viewport::patchRmb(QMouseEvent* e) {
   const QPointF mp = e->position(); const bool ctrl = e->modifiers() & Qt::ControlModifier; Projector P = projector();
   int bc = -1, ba = -1; double bd = 10;
   for (size_t c = 0; c < pt_.c.size(); c++) for (size_t a = 0; a < pt_.c[c].a.size(); a++) { const ScreenPt s = P.toScreen(pt_.c[c].a[a]); const double d = std::hypot(s.x - mp.x(), s.y - mp.y()); if (s.z < 1 && d < bd) { bd = d; bc = int(c); ba = int(a); } }
-  if (bc >= 0) pt_.c[size_t(bc)].vids.clear();                 // (an edge curve's anchor picked: a curve of its own now, free of the edges)
   pt_.dragPushed = false;
   if (bc >= 0 && ctrl) {                                        // (Ctrl + RMB on an anchor: it goes)
     patchPush();
-    auto& C = pt_.c[size_t(bc)]; C.a.erase(C.a.begin() + ba); if (C.a.size() < 2) { pt_.c.erase(pt_.c.begin() + bc); pt_.selC = pt_.selA = -1; if (pt_.draw == bc) pt_.draw = -1; else if (pt_.draw > bc) pt_.draw--; } else { pt_.selC = bc; pt_.selA = std::min(ba, int(C.a.size()) - 1); }
+    auto& C = pt_.c[size_t(bc)]; C.vids.clear();                // (an edge curve's anchor gone: a curve of its own now, free of the edges — after the step, so Ctrl+Z brings the edge curve back)
+    C.a.erase(C.a.begin() + ba); if (C.a.size() < 2) { pt_.c.erase(pt_.c.begin() + bc); renumberCurves(pt_, bc, 0); pt_.selC = pt_.selA = -1; if (pt_.draw == bc) pt_.draw = -1; else if (pt_.draw > bc) pt_.draw--; } else { pt_.selC = bc; pt_.selA = std::min(ba, int(C.a.size()) - 1); }
     patchChanged(); return true; }
   if (bc < 0) {                                                 // (on a curve: a new anchor there)
-    patchBuild(); double bd2 = 8; size_t bi = 0;
+    patchBuild(); double bd2 = 8, bt = 0; size_t bi = 0;
     for (size_t c = 0; c < pt_.sampled.size(); c++) { const auto& L = pt_.sampled[c]; for (size_t i = 0; i + 1 < L.size(); i++) { const ScreenPt a = P.toScreen(L[i]), b = P.toScreen(L[i + 1]); if (a.z >= 1 || b.z >= 1) continue;
         const double dx = b.x - a.x, dy = b.y - a.y, l2 = dx * dx + dy * dy, t = l2 > 0 ? std::clamp(((mp.x() - a.x) * dx + (mp.y() - a.y) * dy) / l2, 0.0, 1.0) : 0.0;
-        const double d = std::hypot(a.x + dx * t - mp.x(), a.y + dy * t - mp.y()); if (d < bd2) { bd2 = d; bc = int(c); bi = i; } } }
-    if (bc >= 0) { patchPush(); pt_.dragPushed = true; auto& C = pt_.c[size_t(bc)]; C.vids.clear(); const size_t span = std::min(C.a.size() - 2, bi / 16); const auto& L = pt_.sampled[size_t(bc)];
-      C.a.insert(C.a.begin() + long(span) + 1, L[bi]); ba = int(span) + 1; }
+        const double d = std::hypot(a.x + dx * t - mp.x(), a.y + dy * t - mp.y()); if (d < bd2) { bd2 = d; bc = int(c); bi = i; bt = t; } } }
+    if (bc >= 0) { patchPush(); pt_.dragPushed = true; auto& C = pt_.c[size_t(bc)]; const auto& L = pt_.sampled[size_t(bc)];
+      const bool own = L.size() == C.a.size(); const size_t span = std::min(C.a.size() - 2, own ? bi : bi / 16); C.vids.clear();   // (an edge curve's points are its anchors: one span a segment — else sixteen points a span)
+      C.a.insert(C.a.begin() + long(span) + 1, own ? L[bi] + (L[bi + 1] - L[bi]) * bt : L[bi]); ba = int(span) + 1; }   // (on an anchor-to-anchor segment: the place clicked, not its first anchor again)
   }
   if (bc < 0) { if (pt_.draw >= 0) { patchPush(); const int c = pt_.draw; pt_.draw = -1; if (pt_.c[size_t(c)].a.size() < 2) pt_.c.erase(pt_.c.begin() + c); else { patchJoinAsk(c); patchSplitBy(pt_.selC >= 0 ? pt_.selC : c); } }
     pt_.selC = pt_.selA = -1; patchChanged(); return true; }
@@ -734,6 +763,7 @@ bool Viewport::patchMove(const QPointF& mp) {
   if (drag_ == Drag::Topo && tt_.drag == 30 && pt_.dragA && pt_.selC >= 0 && size_t(pt_.selC) < pt_.c.size()) {
     if (!pt_.moved && std::hypot(mp.x() - pt_.press.x(), mp.y() - pt_.press.y()) < 3) return true;
     if (!pt_.moved && !pt_.dragPushed) { patchPush(); pt_.dragPushed = true; }   // (an anchor dragged: a step — at its first move)
+    if (!pt_.moved) pt_.c[size_t(pt_.selC)].vids.clear();       // (an edge curve's anchor moved: a curve of its own now, free of the edges — after the step)
     pt_.moved = true;
     if (auto p = patchSnap(mp, pt_.selC)) { pt_.c[size_t(pt_.selC)].a[size_t(pt_.selA)] = *p; pt_.key.clear(); ttTouch(); }
     return true; }
@@ -760,7 +790,7 @@ bool Viewport::patchKey(int key) {
     return false; }
   if (key == Qt::Key_Backspace && pt_.draw >= 0) { auto& C = pt_.c[size_t(pt_.draw)]; if (!C.a.empty()) C.a.pop_back(); if (C.a.empty()) { pt_.c.erase(pt_.c.begin() + pt_.draw); pt_.draw = -1; pt_.selC = pt_.selA = -1; } patchChanged(); return true; }
   if (key == Qt::Key_Delete && pt_.selC >= 0 && size_t(pt_.selC) < pt_.c.size()) {
-    auto& C = pt_.c[size_t(pt_.selC)]; if (pt_.selA >= 0 && size_t(pt_.selA) < C.a.size() && C.a.size() > 2) { C.a.erase(C.a.begin() + pt_.selA); pt_.selA = std::min(pt_.selA, int(C.a.size()) - 1); } else patchDeleteCurve();
+    auto& C = pt_.c[size_t(pt_.selC)]; if (pt_.selA >= 0 && size_t(pt_.selA) < C.a.size() && C.a.size() > 2) { C.vids.clear(); C.a.erase(C.a.begin() + pt_.selA); pt_.selA = std::min(pt_.selA, int(C.a.size()) - 1); } else patchDeleteCurve();
     patchChanged(); return true; }
   return false;
 }
@@ -778,7 +808,7 @@ void Viewport::patchJoinAsk(int c) {
     std::vector<Vec3> a = A, b = B; if (ea == 0) std::reverse(a.begin(), a.end()); if (eb == 1) std::reverse(b.begin(), b.end());
     a.insert(a.end(), b.begin() + 1, b.end());
     PatchCurve J = pt_.c[size_t(c)]; J.a = a; J.div = pt_.c[size_t(c)].div + pt_.c[o].div;
-    const int lo = std::min(c, int(o)), hi = std::max(c, int(o)); pt_.c.erase(pt_.c.begin() + hi); pt_.c[size_t(lo)] = J; pt_.selC = lo; pt_.selA = -1; pt_.draw = -1;
+    const int lo = std::min(c, int(o)), hi = std::max(c, int(o)); pt_.c.erase(pt_.c.begin() + hi); renumberCurves(pt_, hi, 0); pt_.c[size_t(lo)] = J; pt_.selC = lo; pt_.selA = -1; pt_.draw = -1;
     ui::hud(tr("Joined: one curve of %1 edges").arg(J.div), 1200); return; }
 }
 void Viewport::patchOrderClick(int c) {
@@ -790,7 +820,7 @@ void Viewport::patchOrderClick(int c) {
 void Viewport::patchDeleteCurve() {
   if (pt_.selC >= 0 && size_t(pt_.selC) < pt_.c.size()) patchPush();
   if (pt_.selC < 0 || size_t(pt_.selC) >= pt_.c.size()) return; pt_.c.erase(pt_.c.begin() + pt_.selC);
-  { std::vector<int> o; for (int x : pt_.order) if (x != pt_.selC) o.push_back(x > pt_.selC ? x - 1 : x); pt_.order = o; }   // (Loft's order: the curves after it one back)
+  renumberCurves(pt_, pt_.selC, 0);                             // (Loft's order and rows: the curves after it one back)
   if (pt_.draw == pt_.selC) pt_.draw = -1; else if (pt_.draw > pt_.selC) pt_.draw--; pt_.selC = pt_.selA = -1; patchChanged();
 }
 void Viewport::patchDeleteAll() { if (!pt_.c.empty()) patchPush(); pt_.c.clear(); pt_.order.clear(); pt_.draw = pt_.selC = pt_.selA = -1; patchChanged(); ui::hud(tr("Every curve deleted"), 900); }
@@ -802,8 +832,9 @@ QString Viewport::patchCommit() {
   if (m >= 0) {
     Item* it = scene_->item(m); const PolyMesh& B = *baseOf(*it); MeshEd E = MeshEd::from(B); const Affine Mi = meshmods::meshMatrix(*scene_, *it).inverse();
     std::vector<int> vi(pt_.P.size(), -1); for (size_t i = 0; i < pt_.P.size(); i++) vi[i] = pt_.vOf[i] >= 0 ? pt_.vOf[i] : E.addVert(Mi.apply(pt_.P[i]));
+    // (the polygons made are not picked: the selection stays as it was)
     std::vector<int> made; for (auto& f : pt_.F) { std::vector<int> vs; for (int x : f) vs.push_back(vi[size_t(x)]); made.push_back(E.addFace(vs)); }
-    tt_.symNew = true; const auto used = std::make_shared<const std::vector<PatchCurve>>(pt_.c); const QString r = ttDone(m, E, B, msg, 'f', made);
+    tt_.symNew = true; const auto used = std::make_shared<const std::vector<PatchCurve>>(pt_.c); const QString r = ttDone(m, E, B, msg);
     if (histIdx_ >= 0 && size_t(histIdx_) < history_.size()) history_[size_t(histIdx_)].patchUsed = used;   // (Ctrl+Z on this step: its curves back)
     pt_.c.clear(); pt_.undo.clear(); pt_.redo.clear(); pt_.draw = pt_.selC = pt_.selA = -1; patchChanged(); return r;   // (the curves done with: the next patch from the rim)
   }
@@ -841,7 +872,7 @@ void Viewport::patchOverlay(std::vector<Overlay>& out) const {
   out.push_back({{{s.x, s.y}, {mouse_.x(), mouse_.y()}}, QColor(0xc0, 0x70, 0xe8), false});   // (the next span, to the pointer)
 }
 std::vector<Viewport::ViewLabel> Viewport::viewLabels() const {
-  std::vector<ViewLabel> out; if (tool_ != "tpatch" || room() != "topo" || cam_.view == "uv") return out;
+  std::vector<ViewLabel> out; uvTileLabels(out); if (tool_ != "tpatch" || room() != "topo" || cam_.view == "uv") return out;
   Projector P = projector();
   for (size_t c = 0; c < pt_.c.size() && c < pt_.sampled.size(); c++) { const auto& L = pt_.sampled[c]; if (L.size() < 2) continue;
     const size_t mi = L.size() / 2; const ScreenPt a = P.toScreen(L[mi]), b = P.toScreen(L[std::min(mi + 1, L.size() - 1)]); if (a.z >= 1) continue;
@@ -1026,7 +1057,7 @@ void Viewport::patchSplitBy(int c) {
       layAlong(P, B, cb, pa); P.div = std::max(1, int(std::lround(O.div * (s1 - s0) / std::max(1e-12, T)))); parts.push_back(P); }
     if (parts.size() < 2) continue;
     if (O.vids.empty()) { int sum = 0; for (auto& P : parts) sum += P.div; if (sum != O.div && O.div >= int(parts.size())) parts.back().div = std::max(1, parts.back().div + O.div - sum); }   // (the edges it had, shared among its pieces)
-    pt_.c.erase(pt_.c.begin() + o); pt_.c.insert(pt_.c.begin() + o, parts.begin(), parts.end()); split++;
+    pt_.c.erase(pt_.c.begin() + o); pt_.c.insert(pt_.c.begin() + o, parts.begin(), parts.end()); renumberCurves(pt_, o, int(parts.size())); split++;
     if (pt_.selC > o) pt_.selC += int(parts.size()) - 1; if (pt_.draw > o) pt_.draw += int(parts.size()) - 1; }
   if (split) { pt_.key.clear(); ui::hud(tr("The zone divided: %1 curve%2 it crosses cut in two — each piece's edges set on its own (the wheel over it)").arg(split).arg(split == 1 ? "" : "s"), 1800); }
 }
@@ -1150,8 +1181,30 @@ void Viewport::patchLoftStrip() {
         if (end) L.insert(L.end(), ext.begin(), ext.end()); else { std::reverse(ext.begin(), ext.end()); L.insert(L.begin(), ext.begin(), ext.end()); }
         break; } }
     edges = std::max(1, int(std::lround(edgesOf(i) * cumOf(L).back() / std::max(1e-12, own)))); return L; };
-  for (int i : order) { const auto& C = S.c[size_t(i)]; std::vector<Vec3> p; std::vector<int> v;
-    if (!C.vids.empty() && C.L.size() == C.vids.size()) { p = C.L; v = C.vids; } else { int ne = 0; const auto L = forked(i, ne); p = resampleW(L, ne, C.aw); v.assign(p.size(), -1); }
+  // each curve's points: Equal / Adaptive as its own edges; Match — as many as the neighbour built before it has, each across
+  // from that one's (where it falls on this curve, in order; Equal ↔ Match mixed), so the rows between them run straight
+  std::vector<std::vector<Vec3>> pOf(order.size()); std::vector<std::vector<int>> vOf(order.size()); std::vector<char> built(order.size(), 0);
+  auto plainPts = [&](size_t q) { const int i = order[q]; const auto& C = S.c[size_t(i)];
+    if (!C.vids.empty() && C.L.size() == C.vids.size()) { pOf[q] = C.L; vOf[q] = C.vids; } else { int ne = 0; const auto L = forked(i, ne); pOf[q] = resampleW(L, ne, C.aw); vOf[q].assign(pOf[q].size(), -1); }
+    built[q] = 1; };
+  auto matchPts = [&](size_t q, size_t ref) { const int i = order[q]; int ne = 0; const auto L = forked(i, ne); std::vector<Vec3> R = pOf[ref]; const auto lc = cumOf(L);
+    if (R.size() < 3 || lc.empty() || lc.back() <= 0) { plainPts(q); return; }
+    if (R.front().distanceTo(L.front()) + R.back().distanceTo(L.back()) > R.front().distanceTo(L.back()) + R.back().distanceTo(L.front())) std::reverse(R.begin(), R.end());
+    const auto ac = cumOf(R); if (ac.back() <= 0) { plainPts(q); return; }
+    const size_t n = R.size(); const double step = lc.back() / double(n - 1), gap = step * 0.25, mw = std::clamp(S.c[size_t(i)].mw, 0.0, 1.0); double prevS = 0; std::vector<Vec3> p;
+    for (size_t k = 0; k < n; k++) { const double even = ac[k] / ac.back() * lc.back(); double s = even;
+      if (k > 0 && k + 1 < n) { double bd = 1e300, sp = even; for (size_t j = 0; j + 1 < L.size(); j++) { const Vec3 d = L[j + 1] - L[j]; const double l2 = d.dot(d), t = l2 > 0 ? std::clamp((R[k] - L[j]).dot(d) / l2, 0.0, 1.0) : 0.0;
+          const double dd = (L[j] + d * t).distanceTo(R[k]); if (dd < bd) { bd = dd; sp = lc[j] + (lc[j + 1] - lc[j]) * t; } }
+        if (std::abs(sp - even) < step * 1.5) s = even + (sp - even) * mw;
+        s = std::clamp(s, prevS + gap, std::max(prevS + gap, lc.back() - double(n - 1 - k) * gap)); }
+      prevS = s; p.push_back(atLen(L, lc, s)); }
+    pOf[q] = p; vOf[q].assign(p.size(), -1); built[q] = 1; };
+  auto isMt = [&](size_t q) { const auto& C = S.c[size_t(order[q])]; return order.size() > 1 && C.mode == 'm' && C.mw > 0 && C.vids.empty(); };
+  for (size_t q = 0; q < order.size(); q++) if (!isMt(q)) plainPts(q);
+  for (size_t pass = 0; pass < order.size(); pass++) for (size_t q = 0; q < order.size(); q++) if (!built[q]) {
+    if (q > 0 && built[q - 1]) matchPts(q, q - 1); else if (q + 1 < order.size() && built[q + 1]) matchPts(q, q + 1); }
+  for (size_t q = 0; q < order.size(); q++) if (!built[q]) plainPts(q);
+  for (size_t q = 0; q < order.size(); q++) { std::vector<Vec3> p = pOf[q]; std::vector<int> v = vOf[q];
     if (!prev.empty() && p.front().distanceTo(prev.front()) + p.back().distanceTo(prev.back()) > p.front().distanceTo(prev.back()) + p.back().distanceTo(prev.front())) { std::reverse(p.begin(), p.end()); std::reverse(v.begin(), v.end()); }
     std::vector<int> r; for (size_t k = 0; k < p.size(); k++) r.push_back(add(p[k], v[k])); rowsAt.push_back(r); prev = p; }
   auto posOf = [&](const std::vector<int>& r) { std::vector<Vec3> p; for (int x : r) p.push_back(S.P[size_t(x)]); return p; };

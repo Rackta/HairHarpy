@@ -194,6 +194,8 @@ void Viewport::loadModelPrefs() {
   d("optWeld", T.optWeld, 1e-6, 1e4); T.fixSplit = s.value("fixSplit").toBool(true); T.fixWeld = s.value("fixWeld").toBool(true); T.fixDoubles = s.value("fixDoubles").toBool(true); T.fixManifold = s.value("fixManifold").toBool(true); T.fixOrient = s.value("fixOrient").toBool(true); T.optMidSide = s.value("optMidSide").toBool(false); T.optMode = s.value("optMode").toString("safe") == "merge" ? "merge" : "safe"; i("mirAxis", T.mirAxis, 0, 2); b("mirLocal", T.mirLocal); i("mirCount", T.mirCount, 2, 64); d("normLen", T.normLen, 0.01, 10); d("normOp", T.normOp, 0.05, 1); b("normShow", T.normShow);
   { QString t = s.value("mirType").toString("mirror"); T.mirType = t == "radial" || t == "radialMirror" || t == "radialHalf" ? t : "mirror"; }
   T.mirReplace = s.value("mirReplace").toBool(false); T.mirNormals = s.value("mirNormals").toBool(true);
+  T.subdLevels = std::clamp(s.value("subdLevels").toInt(1), 1, 4); T.subdSmooth = s.value("subdSmooth").toBool(false);
+  T.chainAnchor = s.value("chainAnchor").toString("free") == "surface" ? "surface" : "free";
   d("penWeld", T.penWeld, 2, 80); d("penFill", T.penFill, 10, 400); d("penSmooth", T.penSmooth, 8, 800); { QString k = s.value("penBrush").toString("relax"); T.penBrush = k == "smooth" || k == "inflate" || k == "pinch" ? k : "relax"; } i("loopCuts", T.loopCuts, 1, 32); d("loopPct", T.loopPct, 0.01, 0.99); b("loopParallel", T.loopParallel);
   d("knifeWeld", T.knifeWeld, 0, 60); b("knifeThrough", T.knifeThrough); d("chainSmooth", T.chainSmooth, 0, 1); b("chainEqual", T.chainEqual);
   if (s.value("weldMode").toString() == "pair") T.weldMode = "pair";
@@ -217,7 +219,7 @@ void Viewport::saveModelPrefs() const {
     {"bevOffset", T.bevOffset}, {"bevBevel", T.bevBevel}, {"bevSeg", T.bevSeg}, {"bevTop", T.bevTop}, {"bevBottom", T.bevBottom}, {"bevSmart", T.bevSmart}, {"bevProp", T.bevProp},
     {"bevSelSides", T.bevSelSides}, {"bevSelTop", T.bevSelTop}, {"bevSelBottom", T.bevSelBottom},
     {"insOffset", T.insOffset}, {"insDepth", T.insDepth}, {"insSeg", T.insSeg}, {"insGroups", T.insGroups}, {"insScale", T.insScale}, {"insCircleR", T.insCircleR}, {"insCircleN", T.insCircleN}, {"insCircleHole", T.insCircleHole},
-    {"nBrushVal", T.nBrushVal}, {"brSeg", T.brSeg}, {"brTension", T.brTension}, {"brSpin", T.brSpin}, {"brReverse", T.brReverse}, {"brKeep", T.brKeep}, {"fillMode", T.fillMode}, {"fillSub", T.fillSub}, {"fillFlow", T.fillFlow}, {"optWeld", T.optWeld}, {"mirAxis", T.mirAxis}, {"mirCount", T.mirCount}, {"mirType", T.mirType}, {"mirReplace", T.mirReplace}, {"mirLocal", T.mirLocal}, {"fixSplit", T.fixSplit}, {"fixWeld", T.fixWeld}, {"fixDoubles", T.fixDoubles}, {"fixManifold", T.fixManifold}, {"fixOrient", T.fixOrient}, {"optMidSide", T.optMidSide}, {"optMode", T.optMode}, {"mirNormals", T.mirNormals}, {"normLen", T.normLen}, {"normOp", T.normOp}, {"normShow", T.normShow}, {"normSmooth", T.normSmooth}, {"normMode", T.normMode}, {"normNose", T.normNose}, {"normHardBorder", T.normHardBorder}}).toJson(QJsonDocument::Compact));
+    {"nBrushVal", T.nBrushVal}, {"brSeg", T.brSeg}, {"brTension", T.brTension}, {"brSpin", T.brSpin}, {"brReverse", T.brReverse}, {"brKeep", T.brKeep}, {"fillMode", T.fillMode}, {"fillSub", T.fillSub}, {"fillFlow", T.fillFlow}, {"optWeld", T.optWeld}, {"chainAnchor", T.chainAnchor}, {"subdLevels", T.subdLevels}, {"subdSmooth", T.subdSmooth}, {"mirAxis", T.mirAxis}, {"mirCount", T.mirCount}, {"mirType", T.mirType}, {"mirReplace", T.mirReplace}, {"mirLocal", T.mirLocal}, {"fixSplit", T.fixSplit}, {"fixWeld", T.fixWeld}, {"fixDoubles", T.fixDoubles}, {"fixManifold", T.fixManifold}, {"fixOrient", T.fixOrient}, {"optMidSide", T.optMidSide}, {"optMode", T.optMode}, {"mirNormals", T.mirNormals}, {"normLen", T.normLen}, {"normOp", T.normOp}, {"normShow", T.normShow}, {"normSmooth", T.normSmooth}, {"normMode", T.normMode}, {"normNose", T.normNose}, {"normHardBorder", T.normHardBorder}}).toJson(QJsonDocument::Compact));
 }
 
 // ---------- helpers ----------
@@ -240,9 +242,12 @@ Vec3 Viewport::ttFreePoint(const QPointF& mp, int m) const {
     for (auto& [id, it] : scene_->items) if (id != m && it.type == ItemType::IMesh && it.poly && it.raw.value("tref").toBool() && scene_->isVisible(it)) others.push_back(id);   // (the references among them)
     { const Ray R = ray(mp); const SideGuard sg = sideGuard(m); double bt = 1e300;
       for (int id : others) if (auto b = bvhOf(id, true)) if (auto t = soloHit(*b, R.o, R.d); t && *t < bt) bt = *t;   // (first: what is seen of a reference on its own)
-      if (bt < 1e300) return R.o + R.d * bt;
+      // (the built mesh in front of the reference: the point goes on it — never through it onto what lies behind)
+      double ownT = 1e300; if (m >= 0) if (auto o = tPick(mp, {m})) ownT = (o->point - R.o).dot(R.d);
+      const auto inFront = [&](double t) { return ownT < t - std::max(1e-6, t * 0.005); };
+      if (bt < 1e300 && !inFront(bt)) return R.o + R.d * bt;
       for (int id : others) if (auto b = bvhOf(id, true)) if (auto h = frontHit(*b, R.o, R.d, 1e12, sg); h && h->first < bt) bt = h->first;   // (only a side turned to the camera — never the back of a reference)
-      if (bt < 1e300) return R.o + R.d * bt;
+      if (bt < 1e300 && !inFront(bt)) return R.o + R.d * bt;
       // (the surface under the pointer the back of a reference, or its inside — the side the built mesh does not lie on: no
       // point there — the press refused)
       if (const auto seen = pickSurface(mp); seen && seen->itemId != m && (seen->normal.dot(R.d) >= 0 || !sg.ok(seen->point, seen->normal))) fpRefused_ = true; } }
@@ -343,11 +348,13 @@ void symAddFaces(MeshEd& E, int nf0) {
 // undo step (commitIt: else only shown — a live drag)
 QString Viewport::ttDone(int m, const MeshEd& E_, const PolyMesh& src, const QString& msg, char selKey, const std::vector<int>& sel, const std::vector<std::pair<int, int>>& selE, bool commitIt) {
   // (the polygons a building tool made: into the polygroup picked in the list — else a neighbour's, as MeshEd gives them)
-  MeshEd Eg; const bool regroup = (tool_ == "tpen" || tool_ == "tpatch" || tool_ == "tfill" || tool_ == "tbridge") && tgSel.id == m && tgSel.gi >= 0 && tgSel.gi < int(src.groupNames.size()) && int(E_.f.size()) > src.faceCount();
+  // (PolyPen: only when it built polygons (symNew) — a cut appends one half of the polygon cut, not a new polygon)
+  const bool built = tool_ != "tpen" || tt_.symNew;
+  MeshEd Eg; const bool regroup = built && (tool_ == "tpen" || tool_ == "tpatch" || tool_ == "tfill" || tool_ == "tbridge") && tgSel.id == m && tgSel.gi >= 0 && tgSel.gi < int(src.groupNames.size()) && int(E_.f.size()) > src.faceCount();
   if (regroup) { Eg = E_; for (size_t i = size_t(src.faceCount()); i < Eg.f.size(); i++) Eg.f[i].g = tgSel.gi; }
   // (none picked: a new polygon in a hidden polygroup — the first one, given to a polygon with no neighbour — goes into the
   // newest shown one instead: it would vanish as it is made)
-  else if ((tool_ == "tpen" || tool_ == "tpatch" || tool_ == "tfill" || tool_ == "tbridge") && int(E_.f.size()) > src.faceCount()) if (const Item* it = scene_->item(m)) {
+  else if (built && (tool_ == "tpen" || tool_ == "tpatch" || tool_ == "tfill" || tool_ == "tbridge") && int(E_.f.size()) > src.faceCount()) if (const Item* it = scene_->item(m)) {
     std::set<int> hid; for (const QJsonValue& x : it->raw.value("hidGroups").toArray()) hid.insert(x.toInt());
     int shown = -1; for (int g = int(src.groupNames.size()) - 1; g >= 0 && shown < 0; g--) if (!hid.count(g)) shown = g;
     if (!hid.empty() && shown >= 0) { bool any = false; for (size_t i = size_t(src.faceCount()); i < E_.f.size(); i++) if (hid.count(E_.f[i].g)) any = true;
@@ -369,7 +376,7 @@ QString Viewport::ttDone(int m, const MeshEd& E_, const PolyMesh& src, const QSt
   auto vm = [&](int v) { return size_t(v) < vmap.size() ? vmap[size_t(v)] : -1; };
   // (PolyPen with a selection there: it stays as it was — what the pen made isn't picked instead)
   const bool penKeep = selKey && tool_ == "tpen" && topoMode != "object" && tsel_.id == m && (!tsel_.f.empty() || !tsel_.e.empty() || !tsel_.v.empty());
-  if (penKeep) selKey = 0;
+  if (penKeep || (tool_ == "tpen" && selKey == 'f')) selKey = 0;   // (the polygon the pen made isn't picked: it would stand lit over the model being built)
   if (!selKey && tsel_.id == m && (!tsel_.f.empty() || !tsel_.e.empty() || !tsel_.v.empty())) if (Item* it0 = scene_->item(m)) {
     auto T0 = topo::ttopo(baseSp(*it0)); const auto& P0 = baseSp(*it0)->pos; keepKey = tKey(); const bool same = baseSp(*it0).get() == &src;
     if (keepKey == 'f') for (int f : tsel_.f) { if (f < 0 || f >= T0->nf) continue; std::vector<Q> k; std::vector<int> ki; bool ok = same;
@@ -465,6 +472,8 @@ QString Viewport::penClick(const TTPt& p, bool dbl) {
     return penNewMesh();
   }
   const Affine Mi = meshmods::meshMatrix(*scene_, *it).inverse(); const PolyMesh& B = *baseOf(*it);
+  { const int nv = int(B.pos.size()); auto out = [nv](const TTPt& q) { return q.v >= nv || q.ea >= nv || q.eb >= nv; };   // (a corner past this mesh's vertices: the chain dropped)
+    if (out(p)) return "!"; if (std::any_of(tt_.chain.begin(), tt_.chain.end(), out)) tt_.chain.clear(); }
   auto polygon = [&]() -> QString {
     MeshEd E = MeshEd::from(B); std::vector<int> vs; std::set<int> usedA;
     for (const TTPt& q : tt_.chain) { const int v = resolvePt(E, q, Mi, tt_.anchors); if (vs.empty() || vs.back() != v) vs.push_back(v); if (q.anchor >= 0) usedA.insert(q.anchor); }
@@ -476,7 +485,7 @@ QString Viewport::penClick(const TTPt& p, bool dbl) {
     tt_.symNew = true; return ttDone(m, E, B, tr("A polygon of %1 corners").arg(vs.size()), 'f', {fi});
   };
   if (tt_.chain.empty()) { tt_.chain = {p}; ttTouch(); ui::hud(tr("PolyPen: click the next corners — the first one or a double click closes; Esc drops it")); return {}; }
-  if (tt_.chain.size() >= 3 && samePt(p, tt_.chain[0])) return polygon();
+  if (tt_.chain.size() >= 3 && (samePt(p, tt_.chain[0]) || (p.v < 0 && p.ea < 0 && p.anchor < 0 && tt_.chain[0].v < 0 && tt_.chain[0].ea < 0 && tt_.chain[0].anchor < 0 && ttNearPx(ttPtW(p), ttPtW(tt_.chain[0]), 10)))) return polygon();   // (a free first corner: within 10 px)
   if (tt_.chain.size() == 1 && (p.v >= 0 || p.ea >= 0) && (tt_.chain[0].v >= 0 || tt_.chain[0].ea >= 0)) {
     const TTPt a = tt_.chain[0];
     if (samePt(a, p)) return {};
@@ -505,7 +514,7 @@ QString Viewport::penClick(const TTPt& p, bool dbl) {
         const int va = a.ea >= 0 ? resolvePt(E, a, Mi, tt_.anchors) : -1, vb = p.ea >= 0 ? resolvePt(E, p, Mi, tt_.anchors) : -1;
         std::vector<int> vs; if (va >= 0) vs.push_back(va); vs.insert(vs.end(), best.begin(), best.end()); if (vb >= 0) vs.push_back(vb);
         tt_.chain.clear(); const int fi = E.addFace(vs); faceCam(E, fi, Mi.inverse(), cam_);
-        tt_.symNew = true; return ttDone(m, E, B, tr("The gap filled: a polygon of %1 corners").arg(vs.size()), 'f', {fi});
+        tt_.symNew = true; return ttDone(m, E, B, tr("The gap filled: a polygon of %1 corners").arg(vs.size()));
       }
     }
   }
@@ -547,6 +556,7 @@ QString Viewport::penNewMesh() {
 // snap on: a world point put onto the other shown meshes where the camera sees it — along the view through it (the
 // surface under it on screen), else their nearest point
 Vec3 Viewport::ttSnapW(const Vec3& w, int m) const {
+  if (QGuiApplication::queryKeyboardModifiers() & Qt::AltModifier) return w;   // (Alt held: not laid onto the surface)
   ProfScope prof_("ttSnapW");
   std::vector<std::shared_ptr<const topo::Bvh>> tg;
   for (auto& [id, t] : scene_->items) if (id != m && t.type == ItemType::IMesh && t.poly && scene_->isVisible(t)) if (auto b = bvhOf(id, true)) tg.push_back(b);
@@ -556,6 +566,7 @@ Vec3 Viewport::ttSnapW(const Vec3& w, int m) const {
   if (bt < 1e300) return o + d * bt;
   const SideGuard sg = sideGuard(m); for (auto& b : tg) if (auto h = frontHit(*b, o, d, 1e12, sg); h && h->first < bt) bt = h->first;   // (only a side turned to the camera, the built mesh's side)
   if (bt < 1e300) return o + d * bt;
+  tg.clear(); for (auto& [id, t] : scene_->items) if (id != m && t.type == ItemType::IMesh && t.poly && scene_->isVisible(t)) if (auto b = bvhSurf(id)) tg.push_back(b);   // (the nearest point: on the outer shell, never an inner layer)
   double bd = 1e300; Vec3 best = w; for (auto& b : tg) { double dd; auto q = b->closest(w, [&](int t) { if (!facesEye(*b, t, cam_.pos, cam_.dir(), cam_.ortho())) return false; const Vec3 &a = b->P[b->idx[size_t(t) * 3]], &bb = b->P[b->idx[size_t(t) * 3 + 1]], &c = b->P[b->idx[size_t(t) * 3 + 2]]; return sg.ok((a + bb + c) * (1.0 / 3), (bb - a).cross(c - a)); }, &dd); if (q && dd < bd) { bd = dd; best = *q; } }
   return best;
 }
@@ -588,7 +599,11 @@ std::vector<Viewport::TTPt> Viewport::penFillPick(const QPointF& mp) const {
               : tt_.m >= 0 && scene_->item(tt_.m) ? tt_.m : topoMesh(); const Item* it = m >= 0 ? scene_->item(m) : nullptr;
   std::set<int> holeV; for (const TTPt& q : penFillHole(mp)) holeV.insert(q.v);   // (the pointer in a hole of the mesh: only its vertices — not the rims round about)
   if (it) { const auto W = ttWorld(m); auto T = topo::ttopo(it->base ? it->base : it->poly);
-    for (int v = 0; v < T->n; v++) { bool rim = false; for (int j = T->voff[size_t(v)]; j < T->voff[size_t(v) + 1]; j++) if (T->ef1[size_t(T->vE[size_t(j)])] < 0) rim = true;
+    const std::vector<char> hidF = meshmods::hiddenFaces(*it, *(it->base ? it->base : it->poly));   // (a hidden polygroup's vertices: not corners of the fill — nothing of it is on the screen)
+    auto allHidden = [&](int v) { if (hidF.empty()) return false; bool any = false;
+      for (int j = T->voff[size_t(v)]; j < T->voff[size_t(v) + 1]; j++) { const int e = T->vE[size_t(j)]; for (int f : {T->ef0[size_t(e)], T->ef1[size_t(e)]}) if (f >= 0) { any = true; if (size_t(f) >= hidF.size() || !hidF[size_t(f)]) return false; } }
+      return any; };
+    for (int v = 0; v < T->n; v++) { if (allHidden(v)) continue; bool rim = false; for (int j = T->voff[size_t(v)]; j < T->voff[size_t(v) + 1]; j++) if (T->ef1[size_t(T->vE[size_t(j)])] < 0) rim = true;
       if (!rim && T->voff[size_t(v) + 1] > T->voff[size_t(v)]) continue; if (!holeV.empty() && !holeV.count(v)) continue;
       ScreenPt s = P.toScreen(W[size_t(v)]); double d = std::hypot(s.x - mp.x(), s.y - mp.y()); if (s.z < 1 && d < R) { TTPt q; q.v = v; q.w = W[size_t(v)]; cs.push_back({q, s.x, s.y, d}); } } }
   std::sort(cs.begin(), cs.end(), [](const C& a, const C& b) { return a.d < b.d; });
@@ -702,7 +717,7 @@ QString Viewport::penFillHoleMake(const QPointF& mp) {
     if (n % 2) { const int fi = E.addFace({cv, rim[n - 1], rim[0]}); faceCam(E, fi, Mi.inverse(), cam_); made.push_back(fi); }
     if (ba >= 0) tt_.anchors.erase(tt_.anchors.begin() + ba);
   }
-  tt_.symNew = true; return ttDone(m, E, *baseOf(*it), tr("The hole filled: %1 polygon%2").arg(made.size()).arg(made.size() == 1 ? "" : "s"), 'f', made);
+  tt_.symNew = true; return ttDone(m, E, *baseOf(*it), tr("The hole filled: %1 polygon%2").arg(made.size()).arg(made.size() == 1 ? "" : "s"));
 }
 
 // Shift+RMB: the polygon of the points round the pointer — anchors and the rim's vertices within the fill radius,
@@ -718,7 +733,7 @@ QString Viewport::penFill(const QPointF& mp) {
   tt_.chain.clear();
   const int fi = E.addFace(vs); faceCam(E, fi, Mi.inverse(), cam_);
   std::vector<Vec3> keep; for (size_t i = 0; i < tt_.anchors.size(); i++) if (!usedA.count(int(i))) keep.push_back(tt_.anchors[i]); tt_.anchors = keep;
-  tt_.symNew = true; return ttDone(m, E, *baseOf(*it), tr("Filled: a polygon of %1 corners").arg(vs.size()), 'f', {fi});
+  tt_.symNew = true; return ttDone(m, E, *baseOf(*it), tr("Filled: a polygon of %1 corners").arg(vs.size()));
 }
 
 // Ctrl + click: a vertex — the polygons on it gone; an edge — inside: the two polygons one, on the rim: its polygon
@@ -727,34 +742,52 @@ QString Viewport::penDelete(const TTPt& p, int f) {
   const int m = tt_.m; Item* it = scene_->item(m); if (!it) return "!";
   if (p.anchor >= 0) { tt_.anchors.erase(tt_.anchors.begin() + p.anchor); ttTouch(); return tr("Anchor deleted"); }
   const PolyMesh& B = *baseOf(*it); MeshEd E = MeshEd::from(B); std::vector<char> del(E.f.size(), 0);
-  if (p.v >= 0) {
-    // a vertex on a straight run of one edge (two neighbours — between two polygons, or on the rim): dissolved, its
-    // polygons keep their place with a corner less; else the polygons on it gone
-    const auto fs = E.facesOfVert(p.v); std::set<int> nb; bool keepsAll = !fs.empty();
-    for (int fi : fs) { const auto& F = E.f[size_t(fi)]; const int n = int(F.v.size()), k = E.corner(fi, p.v); nb.insert(F.v[size_t((k + 1) % n)]); nb.insert(F.v[size_t((k + n - 1) % n)]); if (n <= 3) keepsAll = false; }
-    if (nb.size() == 2 && keepsAll) {
-      for (int fi : fs) { auto& F = E.f[size_t(fi)]; const int k = E.corner(fi, p.v); F.v.erase(F.v.begin() + k); if (k < int(F.uv.size())) F.uv.erase(F.uv.begin() + k); if (k < int(F.n.size())) F.n.erase(F.n.begin() + k); }
-      return ttDone(m, E, B, tr("Vertex dissolved — %1 polygon%2 kept").arg(fs.size()).arg(fs.size() == 1 ? "" : "s"));
+  // (Symmetry: the same done to the mirror element — its twin vertex / edge / polygon, by the settings' first mirror; found on
+  //  the mesh as it was, before either is touched: the faces only change in place / are marked, removed together at the end)
+  struct El { int v = -1, ea = -1, eb = -1, f = -1; };
+  std::vector<El> els{{p.v, p.ea, p.eb, f}};
+  if (tset.sym && room() == "topo") { const auto pr = symFirstPairs(m, B.pos); auto tw = [&](int v) { return v >= 0 && size_t(v) < pr.size() ? pr[size_t(v)] : -1; };
+    El q;
+    if (p.v >= 0) { q.v = tw(p.v); if (q.v == p.v) q.v = -1; }
+    else if (p.ea >= 0) { q.ea = tw(p.ea); q.eb = tw(p.eb); if (q.ea < 0 || q.eb < 0 || !E.edgeExists(q.ea, q.eb) || ek(q.ea, q.eb) == ek(p.ea, p.eb)) q.ea = q.eb = -1; }
+    else if (f >= 0 && size_t(f) < E.f.size()) { std::set<int> want; bool ok = true; for (int v : E.f[size_t(f)].v) { const int w = tw(v); if (w < 0) ok = false; want.insert(w); }
+      if (ok) for (int x : E.facesOfVert(*want.begin())) if (x != f && std::set<int>(E.f[size_t(x)].v.begin(), E.f[size_t(x)].v.end()) == want) { q.f = x; break; } }
+    if (q.v >= 0 || q.ea >= 0 || q.f >= 0) els.push_back(q); }
+  int dissolved = 0, melted = 0;
+  for (const El& e : els) {
+    if (e.v >= 0) {
+      // a vertex on a straight run of one edge (two neighbours — between two polygons, or on the rim): dissolved, its
+      // polygons keep their place with a corner less; else the polygons on it gone
+      auto fs = E.facesOfVert(e.v); fs.erase(std::remove_if(fs.begin(), fs.end(), [&](int fi) { return del[size_t(fi)] != 0; }), fs.end());
+      std::set<int> nb; bool keepsAll = !fs.empty();
+      for (int fi : fs) { const auto& F = E.f[size_t(fi)]; const int n = int(F.v.size()), k = E.corner(fi, e.v); nb.insert(F.v[size_t((k + 1) % n)]); nb.insert(F.v[size_t((k + n - 1) % n)]); if (n <= 3) keepsAll = false; }
+      if (nb.size() == 2 && keepsAll) {
+        for (int fi : fs) { auto& F = E.f[size_t(fi)]; const int k = E.corner(fi, e.v); F.v.erase(F.v.begin() + k); if (k < int(F.uv.size())) F.uv.erase(F.uv.begin() + k); if (k < int(F.n.size())) F.n.erase(F.n.begin() + k); }
+        dissolved += int(fs.size()); continue;
+      }
+      for (int fi : fs) del[size_t(fi)] = 1;
     }
-    for (int fi : fs) del[size_t(fi)] = 1;
+    else if (e.ea >= 0) {
+      auto fs = E.facesOfEdge(e.ea, e.eb); fs.erase(std::remove_if(fs.begin(), fs.end(), [&](int fi) { return del[size_t(fi)] != 0; }), fs.end());
+      if (fs.size() == 2) {                                         // (the edge melted: one polygon of the two)
+        const auto A = E.f[size_t(fs[0])], Bf = E.f[size_t(fs[1])];
+        int a = e.ea, b = e.eb; { const int ka = E.corner(fs[0], a); if (A.v[size_t((ka + 1) % int(A.v.size()))] != b) std::swap(a, b); }   // (A runs a → b)
+        MeshEd::F N; N.g = A.g; N.mat = A.mat; N.sets = A.sets; N.live = A.live;
+        const int n1 = int(A.v.size()), n2 = int(Bf.v.size()); const int kb = E.corner(fs[0], b), ka2 = E.corner(fs[1], a);
+        for (int k = kb;; k = (k + 1) % n1) { N.v.push_back(A.v[size_t(k)]); if (E.hasUV) N.uv.push_back(A.uv[size_t(k)]); if (A.v[size_t(k)] == a) break; }
+        for (int k = (ka2 + 1) % n2; Bf.v[size_t(k)] != b; k = (k + 1) % n2) { N.v.push_back(Bf.v[size_t(k)]); if (E.hasUV) N.uv.push_back(Bf.uv[size_t(k)]); }
+        std::set<int> chk(N.v.begin(), N.v.end());
+        if (chk.size() == N.v.size() && N.v.size() >= 3) { E.f[size_t(fs[0])] = N; del[size_t(fs[1])] = 1; melted++; continue; }
+        del[size_t(fs[0])] = del[size_t(fs[1])] = 1;
+      } else for (int fi : fs) del[size_t(fi)] = 1;
+    } else if (e.f >= 0 && size_t(e.f) < del.size()) del[size_t(e.f)] = 1;
   }
-  else if (p.ea >= 0) {
-    auto fs = E.facesOfEdge(p.ea, p.eb);
-    if (fs.size() == 2) {                                           // (the edge melted: one polygon of the two)
-      const auto A = E.f[size_t(fs[0])], Bf = E.f[size_t(fs[1])];
-      int a = p.ea, b = p.eb; { const int ka = E.corner(fs[0], a); if (A.v[size_t((ka + 1) % int(A.v.size()))] != b) std::swap(a, b); }   // (A runs a → b)
-      MeshEd::F N; N.g = A.g; N.mat = A.mat; N.sets = A.sets; N.live = A.live;
-      const int n1 = int(A.v.size()), n2 = int(Bf.v.size()); const int kb = E.corner(fs[0], b), ka2 = E.corner(fs[1], a);
-      for (int k = kb;; k = (k + 1) % n1) { N.v.push_back(A.v[size_t(k)]); if (E.hasUV) N.uv.push_back(A.uv[size_t(k)]); if (A.v[size_t(k)] == a) break; }
-      for (int k = (ka2 + 1) % n2; Bf.v[size_t(k)] != b; k = (k + 1) % n2) { N.v.push_back(Bf.v[size_t(k)]); if (E.hasUV) N.uv.push_back(Bf.uv[size_t(k)]); }
-      std::set<int> chk(N.v.begin(), N.v.end());
-      if (chk.size() == N.v.size() && N.v.size() >= 3) { E.f[size_t(fs[0])] = N; del[size_t(fs[1])] = 1; E.removeFaces(del); return ttDone(m, E, B, tr("Edge deleted — the two polygons one")); }
-      del[size_t(fs[0])] = del[size_t(fs[1])] = 1;
-    } else for (int fi : fs) del[size_t(fi)] = 1;
-  } else if (f >= 0 && size_t(f) < del.size()) del[size_t(f)] = 1;
-  int n = 0; for (char x : del) n += x; if (!n) return "!";
-  if (n == int(E.f.size())) { ui::toast(tr("That is the whole mesh")); return "!"; }
+  int n = 0; for (char x : del) n += x; n -= melted;
+  if (!n && !melted && !dissolved) return "!";
+  if (n + melted == int(E.f.size())) { ui::toast(tr("That is the whole mesh")); return "!"; }
   E.removeFaces(del);
+  if (melted && !n && !dissolved) return ttDone(m, E, B, melted == 1 ? tr("Edge deleted — the two polygons one") : tr("Edges deleted — %1 pairs of polygons made one each").arg(melted));
+  if (dissolved && !n && !melted) return ttDone(m, E, B, tr("Vertex dissolved — %1 polygon%2 kept").arg(dissolved).arg(dissolved == 1 ? "" : "s"));
   return ttDone(m, E, B, tr("Deleted: %1 polygon%2").arg(n).arg(n == 1 ? "" : "s"));
 }
 
@@ -764,36 +797,58 @@ QString Viewport::penDeleteAnchors() { const int n = int(tt_.anchors.size()); tt
 QString Viewport::loopApply(int m, int e, double t0, bool selectNew, int cuts, bool parallel) {
   Item* it = m >= 0 ? scene_->item(m) : nullptr; if (!it) return "!";
   auto Bs = baseSp(*it); const PolyMesh& B = *Bs; auto T = topo::ttopo(Bs);
-  Ring R = ringOf(*T, e, &B.pos); if (R.el.empty()) return "!";
+  if (e < 0 || e >= T->ne) return "!";                            // (an edge number not of this mesh)
   const int ea0 = T->ea[size_t(e)], eb0 = T->eb[size_t(e)];
-  // (the hovered edge's place along the ring)
-  size_t i0 = 0; for (size_t i = 0; i < R.el.size(); i++) if (ek(R.el[i].a, R.el[i].b) == ek(ea0, eb0)) { i0 = i; if (R.el[i].a != ea0) t0 = 1 - t0; break; }
-  MeshEd E = MeshEd::from(B); const size_t ne = R.el.size();
-  const double L0 = E.pos[size_t(R.el[i0].a)].distanceTo(E.pos[size_t(R.el[i0].b)]);
-  std::vector<std::vector<int>> nv(ne); const bool nearA = ringNearA(R, t0, tt_.lpVert, tt_.lpEdge);
-  for (size_t i = 0; i < ne; i++) {
-    const int a = R.el[i].a, b = R.el[i].b; const double L = E.pos[size_t(a)].distanceTo(E.pos[size_t(b)]); std::vector<double> ts;
-    for (int k = 1; k <= cuts; k++) {
-      double t = cuts == 1 ? t0 : double(k) / (cuts + 1);
-      if (cuts == 1 && parallel && L > 0) t = nearA ? std::clamp(t0 * L0 / L, 0.02, 0.98) : std::clamp(1 - (1 - t0) * L0 / L, 0.02, 0.98);
-      ts.push_back(t);
-    }
-    for (double t : ts) nv[i].push_back(E.addVert(E.pos[size_t(a)] + (E.pos[size_t(b)] - E.pos[size_t(a)]) * t));
-    E.insertOnEdge(a, b, nv[i], ts);
+  if (tool_ == "tpen" && cuts == 1) {   // (PolyPen's Ctrl+Shift on an edge of an n-gon: a cut from that point to the corner that leaves a quad)
+    MeshEd E0 = MeshEd::from(B); int nf = -1; for (int f : E0.facesOfEdge(ea0, eb0)) if (E0.f[size_t(f)].v.size() > 4) { nf = f; break; }
+    if (nf >= 0) {
+      const int p = E0.splitEdge(ea0, eb0, std::clamp(t0, 0.02, 0.98)); const auto vs = E0.f[size_t(nf)].v; const int n = int(vs.size());
+      int k = -1; for (int i = 0; i < n; i++) if (vs[size_t(i)] == p) k = i;
+      if (k >= 0 && n >= 6) { const int w1 = vs[size_t((k + 3) % n)], w2 = vs[size_t((k - 3 + 2 * n) % n)];
+        const int w = E0.pos[size_t(p)].distanceTo(E0.pos[size_t(w1)]) <= E0.pos[size_t(p)].distanceTo(E0.pos[size_t(w2)]) ? w1 : w2;
+        if (E0.splitFace(nf, p, w) >= 0) { if (tset.sym && room() == "topo") symMirrorCut(E0, p, w);   // (Symmetry: the mirror n-gon cut too)
+          return ttDone(m, E0, B, tr("The n-gon cut: a quad split off"), selectNew ? 'e' : 0, {}, {{p, w}}); } } }
   }
-  std::vector<std::pair<int, int>> made;
-  const size_t nfc = R.closed ? ne : ne - 1;
-  for (size_t i = 0; i < nfc; i++) {
-    const size_t j = (i + 1) % ne;
-    for (int k = 0; k < cuts; k++) {
-      const int u = nv[i][size_t(k)], w = nv[j][size_t(k)];
-      int fi = -1; for (int x : E.facesOfVert(u)) if (E.corner(x, w) >= 0) { fi = x; break; }
-      if (fi >= 0 && E.splitFace(fi, u, w) >= 0) made.push_back({u, w});
+  Ring R = ringOf(*T, e, &B.pos); if (R.el.empty()) return "!";
+  // (Symmetry: the mirror ring cut too — the hovered edge's twin's ring, when it is another ring: one across the plane is its own mirror)
+  std::vector<std::pair<Ring, std::pair<int, int>>> rings{{R, {ea0, eb0}}};
+  if (tset.sym && room() == "topo") { const auto pr = symFirstPairs(m, B.pos); const int ma = size_t(ea0) < pr.size() ? pr[size_t(ea0)] : -1, mb = size_t(eb0) < pr.size() ? pr[size_t(eb0)] : -1;
+    if (ma >= 0 && mb >= 0 && ek(ma, mb) != ek(ea0, eb0)) if (const int e2 = T->edgeOf(ma, mb); e2 >= 0) {
+      Ring R2 = ringOf(*T, e2, &B.pos); std::set<std::pair<int, int>> r1; for (auto& x : R.el) r1.insert(ek(x.a, x.b));
+      bool shared = R2.el.empty(); for (auto& x : R2.el) if (r1.count(ek(x.a, x.b))) { shared = true; break; }
+      if (!shared) rings.push_back({R2, {ma, mb}}); } }
+  MeshEd E = MeshEd::from(B); std::vector<std::pair<int, int>> made; size_t nfc = 0; const double tIn = t0;
+  for (auto& [Rr, ab] : rings) {
+    double t0r = tIn;
+    // (the hovered edge's place along the ring)
+    size_t i0 = 0; for (size_t i = 0; i < Rr.el.size(); i++) if (ek(Rr.el[i].a, Rr.el[i].b) == ek(ab.first, ab.second)) { i0 = i; if (Rr.el[i].a != ab.first) t0r = 1 - t0r; break; }
+    const size_t ne = Rr.el.size();
+    const double L0 = E.pos[size_t(Rr.el[i0].a)].distanceTo(E.pos[size_t(Rr.el[i0].b)]);
+    std::vector<std::vector<int>> nv(ne); const bool nearA = ringNearA(Rr, t0r, tt_.lpVert, tt_.lpEdge);
+    for (size_t i = 0; i < ne; i++) {
+      const int a = Rr.el[i].a, b = Rr.el[i].b; const double L = E.pos[size_t(a)].distanceTo(E.pos[size_t(b)]); std::vector<double> ts;
+      for (int k = 1; k <= cuts; k++) {
+        double t = cuts == 1 ? t0r : double(k) / (cuts + 1);
+        if (cuts == 1 && parallel && L > 0) t = nearA ? std::clamp(t0r * L0 / L, 0.02, 0.98) : std::clamp(1 - (1 - t0r) * L0 / L, 0.02, 0.98);
+        ts.push_back(t);
+      }
+      for (double t : ts) nv[i].push_back(E.addVert(E.pos[size_t(a)] + (E.pos[size_t(b)] - E.pos[size_t(a)]) * t));
+      E.insertOnEdge(a, b, nv[i], ts);
+    }
+    const size_t nfr = Rr.closed ? ne : ne - 1; if (&Rr == &rings.front().first) nfc = nfr;
+    for (size_t i = 0; i < nfr; i++) {
+      const size_t j = (i + 1) % ne;
+      for (int k = 0; k < cuts; k++) {
+        const int u = nv[i][size_t(k)], w = nv[j][size_t(k)];
+        int fi = -1; for (int x : E.facesOfVert(u)) if (E.corner(x, w) >= 0) { fi = x; break; }
+        if (fi >= 0 && E.splitFace(fi, u, w) >= 0) made.push_back({u, w});
+      }
     }
   }
+  std::vector<std::vector<int>> nv; { std::set<int> seen; std::vector<int> all; for (auto& [u, w] : made) for (int x : {u, w}) if (seen.insert(x).second) all.push_back(x); nv.push_back(all); }   // (the new vertices — for Snap)
   if (tset.snap) {                                                // (Snap: the new vertices onto the references — the nearest point: the loop runs round the back too)
     std::vector<std::shared_ptr<const topo::Bvh>> tg;
-    for (auto& [id, t] : scene_->items) if (id != m && t.type == ItemType::IMesh && t.poly && scene_->isVisible(t)) if (auto b = bvhOf(id, true)) tg.push_back(b);
+    for (auto& [id, t] : scene_->items) if (id != m && t.type == ItemType::IMesh && t.poly && scene_->isVisible(t)) if (auto b = bvhSurf(id)) tg.push_back(b);
     if (!tg.empty()) { const Affine M = meshmods::meshMatrix(*scene_, *it), Mi = M.inverse();
       for (auto& L : nv) for (int v : L) { const Vec3 p = M.apply(E.pos[size_t(v)]); double bd = 1e300; Vec3 best = p;
         for (auto& b : tg) { double d; auto q = b->closest(p, nullptr, &d); if (q && d < bd) { bd = d; best = *q; } }
@@ -840,7 +895,7 @@ QString Viewport::knifeCut() {
   auto visible = [&](const Vec3& p) { if (ttools.knifeThrough) return true;
     const Vec3 o = ortho ? p - dir * far : eye; const Vec3 d = ortho ? dir : (p - eye).normalized(); const double dist = ortho ? far : (p - eye).length();
     return !seen.ray(o, d, dist - std::max(dist * 5e-3, edgeLen * 0.5)); };   // (a non-flat polygon's triangles may stand a little in front of a point on its own side: not a cover)
-  int cutsMade = 0;
+  int cutsMade = 0; std::set<int> newVs;                       // (newVs: the vertices the cut put on the edges)
   for (auto& K : tt_.kc) {
     W.clear(); S.clear(); for (auto& p : E.pos) W.push_back(M.apply(p)); for (auto& w : W) S.push_back(P.toScreen(w));   // (the vertices an earlier curve made too)
     // (the crossings: on each edge of an open polygon — its place along the path; near a corner: onto it)
@@ -902,7 +957,7 @@ QString Viewport::knifeCut() {
     // (the edges cut: their new vertices, then each polygon's cuts in the path's order — split pairwise)
     std::map<int, double> sOf(vHit.begin(), vHit.end());
     for (auto& [e, hs] : byEdge) { std::sort(hs.begin(), hs.end(), [](const Hit& x, const Hit& y) { return x.t < y.t; });
-      std::vector<int> vs; std::vector<double> ts; for (auto& h : hs) { const int v = E.addVert(E.pos[size_t(e.first)] + (E.pos[size_t(e.second)] - E.pos[size_t(e.first)]) * h.t); vs.push_back(v); ts.push_back(h.t); sOf[v] = h.s; }
+      std::vector<int> vs; std::vector<double> ts; for (auto& h : hs) { const int v = E.addVert(E.pos[size_t(e.first)] + (E.pos[size_t(e.second)] - E.pos[size_t(e.first)]) * h.t); vs.push_back(v); ts.push_back(h.t); sOf[v] = h.s; newVs.insert(v); }
       E.insertOnEdge(e.first, e.second, vs, ts); }
     if (sOf.size() < 2) continue;
     std::vector<std::pair<double, int>> order; for (auto& [v, s] : sOf) order.push_back({s, v}); std::sort(order.begin(), order.end());
@@ -913,10 +968,27 @@ QString Viewport::knifeCut() {
         if (E.splitFace(fi, u, w) >= 0) { ok.push_back(1); cutsMade++; } break; }
     }
   }
+  // (a cut vertex stands on an edge both its polygons share: where the cut did not go on through the other one — the polygon behind a
+  // silhouette, the far side left whole — that polygon got an extra corner and is an n-gon now. Such a polygon is split again: between
+  // two of the cut's vertices in it if it has two (the cut goes on through it), else from the one to the corner across — no n-gons left by the knife)
+  int tidied = 0;
+  if (cutsMade && !newVs.empty()) {
+    for (int guard = 0; guard < 100000; guard++) { bool did = false;
+      for (size_t fi = 0; fi < E.f.size() && !did; fi++) { const std::vector<int> V = E.f[fi].v; const int k = int(V.size()); if (k <= 4) continue;
+        std::vector<int> np; for (int i = 0; i < k; i++) if (newVs.count(V[size_t(i)])) np.push_back(i); if (np.empty()) continue;
+        int a = -1, b = -1;
+        if (np.size() >= 2) { int bd = -1; for (size_t x = 0; x < np.size(); x++) for (size_t y = x + 1; y < np.size(); y++) { const int d = np[y] - np[x], dd = std::min(d, k - d); if (dd >= 2 && dd > bd) { bd = dd; a = np[x]; b = np[y]; } } }
+        if (a < 0) { a = np[0]; b = (a + k / 2) % k; }
+        if (E.splitFace(int(fi), V[size_t(a)], V[size_t(b)]) >= 0) { ok.push_back(1); tidied++; did = true; } }
+      if (!did) break; }
+  }
   if (!cutsMade) { ui::toast(tr("The cut crosses no polygon of the mesh")); return "!"; }
   tt_.kUndo.clear(); tt_.kRedo.clear();
+  const auto drawn = tt_.kc;                                      // (kept: Ctrl+Z on this cut puts the curves back to be drawn right)
   tt_.kc.clear(); tt_.kcur = -1;
-  return ttDone(m, E, B, tr("Knife: %1 polygon cut%2").arg(cutsMade).arg(cutsMade == 1 ? "" : "s") + (hiddenSkipped ? tr(" · %1 crossing%2 behind the mesh left whole").arg(hiddenSkipped).arg(hiddenSkipped == 1 ? "" : "s") : QString()));
+  const QString res = ttDone(m, E, B, tr("Knife: %1 polygon cut%2").arg(cutsMade).arg(cutsMade == 1 ? "" : "s") + (hiddenSkipped ? tr(" · %1 crossing%2 behind the mesh left whole").arg(hiddenSkipped).arg(hiddenSkipped == 1 ? "" : "s") : QString()) + (tidied ? tr(" · %1 extra split%2: no n-gons left").arg(tidied).arg(tidied == 1 ? "" : "s") : QString()));
+  tt_.kcCut = drawn; tt_.kcCutIdx = histIdx_;
+  return res;
 }
 
 // ---------- Smooth EdgeChain ----------
@@ -938,19 +1010,46 @@ QString Viewport::chainCreate() {
   return tr("Curve on %1 vertices").arg(n);
 }
 
+// the curve itself smoothed (kept — unlike the Smooth slider, which only shows it smoothed): each anchor a step towards the middle of its
+// neighbours, the curve's ends stay; the chain's edges follow it. One undo step per press
+QString Viewport::chainSmoothCurve() {
+  auto& C = tt_.ec; if (C.m < 0 || C.a.size() < 3) { ui::toast(tr("Make the curve first")); return "!"; }
+  auto& A = C.a; const int n = int(A.size()); std::vector<Vec3> nA = A;
+  for (int i = 0; i < n; i++) { if (!C.closed && (i == 0 || i == n - 1)) continue; nA[size_t(i)] = A[size_t(i)] * 0.5 + (A[size_t((i + n - 1) % n)] + A[size_t((i + 1) % n)]) * 0.25; }
+  A = nA; return chainApply(true);
+}
+
+// Smooth (0…1): the curve's anchors fewer and fewer, those left sliding evenly along the curve as it was — at 1 only its two ends stay
+// (a closed curve: three). From the anchors as they were when the slider was taken; 0 brings them all back. Shown live, one undo step on release
+void Viewport::chainSimplify(double s) {
+  auto& C = tt_.ec; if (C.m < 0 || C.a.size() < 2) return;
+  if (C.simp <= 0 || C.aBase.size() < 2 || C.a != C.aSimp) C.aBase = C.a;   // (the baseline: the anchors now — unless they are what this made last)
+  s = std::clamp(s, 0.0, 1.0); C.simp = s;
+  const auto& B = C.aBase; const int n0 = int(B.size()), minN = C.closed ? 3 : 2;
+  if (s <= 0 || n0 <= minN) { C.a = B; C.aSimp = C.a; if (s <= 0) C.simp = 0; chainApply(false); return; }
+  std::vector<Vec3> L = catmull(B, C.closed, 16); const auto cum = cumLen(L);
+  const double kf = double(n0) - s * double(n0 - minN);        // (how many anchors there are to be — between whole numbers one of them is sliding into its neighbour)
+  const int cnt = std::max(minN, int(std::ceil(kf - 1e-9)));
+  std::vector<Vec3> A; const double span = C.closed ? kf : std::max(1e-9, kf - 1);
+  for (int i = 0; i < cnt; i++) { const double u = std::min(C.closed ? 0.999999 : 1.0, double(i) / span); const Vec3 p = alongLen(L, cum, u); if (!A.empty() && A.back().distanceTo(p) < 1e-9) continue; A.push_back(p); }
+  if (A.size() < size_t(minN)) A = C.closed ? std::vector<Vec3>{B[0], B[B.size() / 3], B[2 * B.size() / 3]} : std::vector<Vec3>{B.front(), B.back()};
+  C.a = A; C.aSimp = C.a; chainApply(false);
+}
+
 // the chain's vertices onto the curve (smoothed by the setting; evenly spaced when asked); commitIt — one undo step
 QString Viewport::chainApply(bool commitIt) {
   auto& C = tt_.ec; Item* it = C.m >= 0 ? scene_->item(C.m) : nullptr; if (!it || !it->base) return "!";
-  std::vector<Vec3> A = C.a;
-  for (int it2 = 0; it2 < int(std::lround(ttools.chainSmooth * 20)); it2++) {   // (the anchors smoothed: each towards its neighbours)
-    std::vector<Vec3> nA = A; const int n = int(A.size());
-    for (int i = 0; i < n; i++) { if (!C.closed && (i == 0 || i == n - 1)) continue; const Vec3& p = A[size_t((i + n - 1) % n)]; const Vec3& q = A[size_t((i + 1) % n)]; nA[size_t(i)] = A[size_t(i)] * 0.5 + (p + q) * 0.25; }
-    A = nA; }
+  const std::vector<Vec3>& A = C.a;
   auto L = catmull(A, C.closed, 16); auto cum = cumLen(L);
   std::vector<Vec3> P = it->base->pos; const size_t n = C.verts.size();
+  { // (the mesh's polygons edited since the curve was made: its vertex numbers no longer the chain — the curve dropped)
+    auto T = topo::ttopo(it->base); bool ok = C.base.size() == P.size();
+    for (size_t i = 0; i < n && ok; i++) { if (C.verts[i] < 0 || size_t(C.verts[i]) >= P.size()) ok = false;
+      else if ((i + 1 < n || C.closed) && size_t(C.verts[(i + 1) % n]) < P.size() && T->edgeOf(C.verts[i], C.verts[(i + 1) % n]) < 0) ok = false; }
+    if (!ok) { tt_.ec = {}; tt_.eca = -1; ttTouch(); emit topoState(); ui::toast(tr("The mesh has changed since the curve was made — make the curve again")); return "!"; } }
   for (size_t i = 0; i < n; i++) { const double u = ttools.chainEqual ? (C.closed ? double(i) / n : double(i) / (n - 1)) : C.u[i]; P[size_t(C.verts[i])] = alongLen(L, cum, u); }
   if (tset.snap) {                                                // (Snap: the chain's vertices onto the references — the nearest point)
-    std::vector<std::shared_ptr<const topo::Bvh>> tg; for (auto& [id, t] : scene_->items) if (id != C.m && t.type == ItemType::IMesh && t.poly && scene_->isVisible(t)) if (auto b = bvhOf(id, true)) tg.push_back(b);
+    std::vector<std::shared_ptr<const topo::Bvh>> tg; for (auto& [id, t] : scene_->items) if (id != C.m && t.type == ItemType::IMesh && t.poly && scene_->isVisible(t)) if (auto b = bvhSurf(id)) tg.push_back(b);
     if (!tg.empty()) { const Affine M = meshmods::meshMatrix(*scene_, *it), Mi = M.inverse();
       for (int v : C.verts) { const Vec3 p = M.apply(P[size_t(v)]); double bd = 1e300; Vec3 best = p; for (auto& b : tg) { double d; auto q = b->closest(p, nullptr, &d); if (q && d < bd) { bd = d; best = *q; } } P[size_t(v)] = Mi.apply(best); } }
   }
@@ -969,7 +1068,7 @@ bool Viewport::topoToolPress(QMouseEvent* e) {
   if (tool_ == "tlobe") return lobePress(e);
   if (nBrushOn()) {                                                // (the normals brush: a stroke gives the share set — Ctrl: the standard shading, Shift: smoothed)
     const int am = topoMesh(); const Item* ai = am >= 0 ? scene_->item(am) : nullptr;
-    if (!ai || topoHeavy(am)) { ui::toast(tr("Select the mesh whose normals you paint")); return true; }
+    if (!ai) { ui::toast(tr("Select the mesh whose normals you paint")); return true; }
     nBrushStart(am, shift ? 's' : ctrl ? 'r' : 'p');
     tt_.m = am; tt_.ctrl = ctrl; tt_.press = tt_.p1 = mp; tt_.moved = false; tt_.drag = 22; td_ = {}; td_.type = 20; drag_ = Drag::Topo; nAlignDab(mp, ctrl); return true; }
   int m = topoMesh();
@@ -983,21 +1082,24 @@ bool Viewport::topoToolPress(QMouseEvent* e) {
     revealFaces_.clear(); tt_.press = tt_.p1 = mp; tt_.moved = false; tt_.drag = 21; td_ = {}; td_.type = 20; drag_ = Drag::Topo; revealGather(mp); return true; }
   if (m < 0 && tool_ == "tpen" && !ctrl) {                       // (no mesh picked: the polygon drawn will be a new RetopoMesh's first)
     tt_.m = -1; tt_.press = mp; tt_.moved = false; tt_.ctrl = ctrl; tt_.shift = shift;
-    if (shift) { const Vec3 w = ttFreePoint(mp, -1); if (fpRefused_) { ui::hud(tr("Not on the back or the inside of a reference — put the point on its outer side"), 1500); return true; } tt_.anchors.push_back(w); ttTouch(); emit topoState(); return true; }
+    if (shift) { const Vec3 w = ttFreePoint(mp, -1); if (fpRefused_) { ui::hud(tr("Not on the back or the inside of a reference — put the point on its outer side"), 1500); return true; } tt_.anchors.push_back(w); penAnchorHist_ = histIdx_; ttTouch(); emit topoState(); return true; }
     fpRefused_ = false; tt_.hf = -1; tt_.pressPt = ttPickPt(mp, -1, true); tt_.pressF = -1;
     if (fpRefused_ && tt_.pressPt.anchor < 0) { ui::hud(tr("Not on the back or the inside of a reference — put the point on its outer side"), 1500); return true; }
     tt_.drag = 1; td_ = {}; td_.type = 20; drag_ = Drag::Topo; return true;
   }
+  const int hovM = m >= 0 ? m : tt_.m >= 0 && scene_->item(tt_.m) ? tt_.m : -1;   // (the mesh the Loop's hovered edge was found on — as in topoToolMove)
   if (m < 0 && tool_ != "tplane") { if (auto r = tPick(mp, topoMeshes())) { sel_ = {}; sel_.items = {r->m}; onSelChange(); m = r->m; } }
   if (m < 0) { ui::toast(tr("Select a mesh first")); return true; }
-  if (topoHeavy(m)) { ui::toast(tr("A high-poly mesh — Object mode only")); return true; }
+  // (PolyPen's half-drawn polygon holds another mesh's vertices / edges: dropped — they mean nothing on this one)
+  if (tt_.m != m && std::any_of(tt_.chain.begin(), tt_.chain.end(), [](const TTPt& p) { return p.v >= 0 || p.ea >= 0 || p.eb >= 0; })) tt_.chain.clear();
+
   tt_.m = m; tt_.press = mp; tt_.moved = false; tt_.ctrl = ctrl; tt_.shift = shift; tt_.drag = 0;
   if (tool_ == "tpen" && topoMode == "object") setTopoMode(lastEditMode_, true);   // (PolyPen from Object: the edit mode last used)
   auto startDrag = [&](int kind) { tt_.drag = kind; td_ = {}; td_.type = 20; drag_ = Drag::Topo; };
   const bool loopMode = tool_ == "tloop" || (tool_ == "tpen" && ctrl && shift);
-  if (loopMode) { if (tt_.le >= 0) loopApply(m, tt_.le, tt_.lt, false, ttools.loopCuts, ttools.loopParallel || tt_.lctrl); tt_.le = -1; tt_.loopPrev.clear(); ttTouch(); return true; }
+  if (loopMode) { if (tt_.le >= 0 && hovM == m) loopApply(m, tt_.le, tt_.lt, false, ttools.loopCuts, ttools.loopParallel || tt_.lctrl); tt_.le = -1; tt_.loopPrev.clear(); ttTouch(); return true; }
   if (tool_ == "tpen") {
-    if (shift) { const Vec3 w = ttFreePoint(mp, m); if (fpRefused_) { ui::hud(tr("Not on the back or the inside of a reference — put the point on its outer side"), 1500); return true; } tt_.anchors.push_back(w); ttTouch(); emit topoState(); ui::hud(tr("Anchor %1 — Shift+RMB between points fills a polygon").arg(tt_.anchors.size()), 1200); return true; }
+    if (shift) { const Vec3 w = ttFreePoint(mp, m); if (fpRefused_) { ui::hud(tr("Not on the back or the inside of a reference — put the point on its outer side"), 1500); return true; } tt_.anchors.push_back(w); penAnchorHist_ = histIdx_; ttTouch(); emit topoState(); ui::hud(tr("Anchor %1 — Shift+RMB between points fills a polygon").arg(tt_.anchors.size()), 1200); return true; }
     fpRefused_ = false; tt_.hf = -1; tt_.pressPt = ttPickPt(mp, m, true, ctrl); tt_.pressF = tt_.hf;
     if (fpRefused_ && tt_.pressPt.v < 0 && tt_.pressPt.ea < 0 && tt_.pressPt.anchor < 0 && !ctrl) { ui::hud(tr("Not on the back or the inside of a reference — put the point on its outer side"), 1500); return true; }   // (a new point there: refused)
     startDrag(ctrl ? 2 : 1); return true;
@@ -1113,7 +1215,7 @@ bool Viewport::topoToolMove(const QPointF& mp, Qt::KeyboardModifiers mods) {
       auto h = planeHit(ray(mp), tt_.ref, tt_.n); if (!h || !tt_.hit0) return true;
       tt_.delta = *h - *tt_.hit0;
       bool snapped = false;   // (the element snap: the vertex taken hold of onto the element under the pointer, the rest with it)
-      if (tset.esnap && tt_.drag == 1) { const std::set<int> mv(tt_.verts.begin(), tt_.verts.end()); esnapHit_ = elemSnap(mp, m, mv, tt_.ref); if (esnapHit_) { tt_.delta = *esnapHit_ - tt_.ref; snapped = true; } overlayRev_++; }
+      if (esnapOn() && tt_.drag == 1) { const std::set<int> mv(tt_.verts.begin(), tt_.verts.end()); esnapHit_ = elemSnap(mp, m, mv, tt_.ref); if (esnapHit_) { tt_.delta = *esnapHit_ - tt_.ref; snapped = true; } overlayRev_++; }
       const Vec3 l = Mi.lin(tt_.delta);
       if (tt_.drag == 1) { std::vector<Vec3> P = tt_.base; for (int v : tt_.verts) P[size_t(v)] = tt_.base[size_t(v)] + l;
         { const bool s0 = tset.snap; if (snapped) tset.snap = false; topoAfterMove(m, P, tt_.verts, tt_.base, tt_.symPairs.empty() ? nullptr : &tt_.symPairs); tset.snap = s0; } topoLive(m, P); }
@@ -1123,8 +1225,10 @@ bool Viewport::topoToolMove(const QPointF& mp, Qt::KeyboardModifiers mods) {
     if (tt_.drag == 4) { auto r = tPick(mp, {m}); if (r && tt_.kdc >= 0) { Vec3 p = r->point; if (int v = ttVertNear(m, mp, std::max(8.0, ttools.knifeWeld)); v >= 0) p = ttWorld(m)[size_t(v)]; tt_.kc[size_t(tt_.kdc)].a[size_t(tt_.kda)] = p; } ttTouch(); return true; }
     if (tt_.drag == 5 || tt_.drag == 7) { tt_.p1 = mp; overlayRev_++; requestUpdate(); return true; }
     if (tt_.drag == 6) {
+      if (tt_.eca < 0 || size_t(tt_.eca) >= tt_.ec.a.size()) return true;   // (the curve dropped mid-drag)
       auto h = planeHit(ray(mp), M.apply(tt_.ec.a[size_t(tt_.eca)]), cam_.dir()); if (!h) return true;
       Vec3 w = *h; if (tset.snap) w = ttSnapW(w, m);   // (Snap: onto the references where it is seen; off — free, in the view's plane)
+      if (ttools.chainAnchor == "surface") if (auto sr = tPick(mp, {m})) w = sr->point;   // (the option "On the mesh": the anchor laid on the mesh under the pointer)
       tt_.ec.a[size_t(tt_.eca)] = Mi.apply(w); chainApply(false); return true;
     }
     if (tt_.drag == 8) {
@@ -1139,16 +1243,18 @@ bool Viewport::topoToolMove(const QPointF& mp, Qt::KeyboardModifiers mods) {
   if (tool_ == "tpen") tt_.shiftHeld = (mods & Qt::ShiftModifier) && !(mods & Qt::ControlModifier);   // (Shift: the fill's polygon shown)
   if (m < 0 && tool_ == "tpen") { tt_.hf = -1; tt_.hov = ttPickPt(mp, -1, true); tt_.hovOn = true; ttTouch(); return true; }   // (a new RetopoMesh to come)
   if (tool_ == "treveal" || nBrushOn()) { overlayRev_++; requestUpdate(); return true; }   // (its circle follows — no mesh picked, or a high-poly one, too)
-  if (m < 0 || topoHeavy(m)) return false;
+  if (m < 0) return false;
   const bool loopMode = tool_ == "tloop" || (tool_ == "tpen" && (mods & Qt::ControlModifier) && (mods & Qt::ShiftModifier));
   if (loopMode) {
-    Item* it = scene_->item(m); auto r = tPick(mp, {m}); tt_.loopPrev.clear(); tt_.le = -1;
+    const int lm = topoMesh() >= 0 ? topoMesh() : m;   // (the mesh a click will cut: the active one — the edge found on it)
+    Item* it = scene_->item(lm); auto r = it ? tPick(mp, {lm}) : std::nullopt; tt_.loopPrev.clear(); tt_.le = -1;
     if (r && r->e >= 0) {
-      auto T = topo::ttopo(baseSp(*it)); const auto W = ttWorld(m); Projector P = projector();
+      auto T = topo::ttopo(baseSp(*it)); const auto W = ttWorld(lm); Projector P = projector();
       const int e = r->e; ScreenPt a = P.toScreen(W[size_t(T->ea[size_t(e)])]), b = P.toScreen(W[size_t(T->eb[size_t(e)])]); double t; segDistT(mp.x(), mp.y(), a.x, a.y, b.x, b.y, &t);
       tt_.lshift = mods & Qt::ShiftModifier; tt_.lctrl = (mods & Qt::ControlModifier) && tool_ == "tloop";
       if (tt_.lshift && tool_ == "tloop") { const double F[] = {0.5, 0.25, 0.75, 1.0 / 6, 2.0 / 6, 4.0 / 6, 5.0 / 6}; double bt = 0.5, bd = 1e9; for (double f : F) if (std::abs(f - t) < bd) { bd = std::abs(f - t); bt = f; } t = bt; }
-      t = std::clamp(t, 0.02, 0.98); tt_.le = e; tt_.lt = t; ttools.loopPct = t;
+      { const double sl = std::hypot(b.x - a.x, b.y - a.y), mg = sl > 0 ? std::clamp(4.0 / sl, 0.0005, 0.02) : 0.02; t = std::clamp(t, mg, 1 - mg); }   // (the end margin in pixels: on a long polygon 2% is far from the pointer)
+       tt_.le = e; tt_.lt = t; ttools.loopPct = t;
       Ring R = ringOf(*T, e, &baseOf(*it)->pos);
       { const bool inRing = std::any_of(R.el.begin(), R.el.end(), [&](const RingEl& x) { return ek(x.a, x.b) == tt_.lpEdge; });
         if ((tt_.lctrl && !tt_.lpCtrl) || ((ttools.loopParallel || tt_.lctrl) && !inRing)) { tt_.lpEdge = ek(T->ea[size_t(e)], T->eb[size_t(e)]); tt_.lpVert = t <= 0.5 ? T->ea[size_t(e)] : T->eb[size_t(e)]; }   // (Ctrl down: the side it keeps to, fixed)
@@ -1213,25 +1319,29 @@ bool Viewport::topoToolRelease(const QPointF& mp) {
         for (int k = s0; k < e0; k++) { const int x = B0.faceVerts[size_t(k)]; if (vis && size_t(x) < used.size()) used[size_t(x)] = 1; if (mv.count(x)) has = true; }
         if (has) for (int k = s0; k < e0; k++) for (int k2 = s0; k2 < e0; k2++) if (mv.count(B0.faceVerts[size_t(k)])) own[B0.faceVerts[size_t(k)]].insert(B0.faceVerts[size_t(k2)]); }
       auto seen = [&](const Vec3& p) { return ttSeen(p, m); };   // (not one behind the surface — its own or a reference's)
-      std::vector<std::pair<Vec3, Vec3>> doubt; std::set<int> doubtTo;   // (within the weld radius but not for sure — its own polygon's vertex, one behind the surface, past the narrowed radius: asked)
+      std::vector<std::pair<Vec3, Vec3>> doubt, doubtMir; std::set<int> doubtTo;   // (within the weld radius but not for sure — its own polygon's vertex, one behind the surface, past the narrowed radius: asked)
       for (int v : tt_.verts) { if (size_t(v) >= W.size()) continue; int target = -1; ScreenPt sv = P.toScreen(W[size_t(v)]); const auto& ov = own[v];
         // (the weld radius no wider than about half its shortest side on the screen: small parts — an eyelid, a nostril — not
         // welded to their own neighbours that happen to lie within it)
         double bd = ttools.penWeld; for (int w : ov) if (w != v && size_t(w) < W.size()) { const ScreenPt s = P.toScreen(W[size_t(w)]); if (s.z < 1) bd = std::min(bd, std::max(3.0, 0.45 * std::hypot(s.x - sv.x, s.y - sv.y))); }
-        for (size_t w = 0; w < W.size(); w++) { if (mv.count(int(w)) || !used[w]) continue; ScreenPt s = P.toScreen(W[w]); const double d = std::hypot(s.x - sv.x, s.y - sv.y); if (s.z < 1 && d < (ov.count(int(w)) ? std::min(bd, 4.0) : bd) && seen(W[w])) { bd = d; target = int(w); } }
+        const double far4 = ttools.penWeld * 6 * worldPerPixelAt(W[size_t(v)]);   // (near in space too: not one on the far side of the mesh lined up with it)
+        for (size_t w = 0; w < W.size(); w++) { if (mv.count(int(w)) || !used[w]) continue; ScreenPt s = P.toScreen(W[w]); const double d = std::hypot(s.x - sv.x, s.y - sv.y); if (s.z < 1 && d < (ov.count(int(w)) ? std::min(bd, 4.0) : bd) && W[w].distanceTo(W[size_t(v)]) <= far4 && seen(W[w])) { bd = d; target = int(w); } }
         if (target >= 0) { to[size_t(v)] = target; n++; continue; }
         if (sv.z >= 1) continue;
         double dd = ttools.penWeld; int maybe = -1;
         const double near3 = ttools.penWeld * 2 * worldPerPixelAt(W[size_t(v)]);   // (near in space too: not one on the far side of the mesh that only lines up with it on the screen)
         for (size_t w = 0; w < W.size(); w++) { if (mv.count(int(w)) || !used[w]) continue; const ScreenPt s = P.toScreen(W[w]); const double d = std::hypot(s.x - sv.x, s.y - sv.y); if (s.z < 1 && d < dd && (!ov.count(int(w)) || d < 8) && W[w].distanceTo(W[size_t(v)]) <= near3) { dd = d; maybe = int(w); } }   // (its own polygon.s vertex: asked only when put close onto it)
-        if (maybe >= 0 && !doubtTo.count(maybe)) { doubt.push_back({W[size_t(v)], W[size_t(maybe)]}); doubtTo.insert(maybe); } }
+        if (maybe >= 0 && !doubtTo.count(maybe)) { doubt.push_back({W[size_t(v)], W[size_t(maybe)]}); doubtTo.insert(maybe);
+          const auto& Sp = tt_.symPairs;   // (Symmetry: the twins' weld asked with it — welded together on Weld)
+          if (size_t(v) < Sp.size() && size_t(maybe) < Sp.size()) { const int pv = Sp[size_t(v)], pt = Sp[size_t(maybe)];
+            if (pv >= 0 && pt >= 0 && pv != v && pv != pt && pv != maybe && pt != v && size_t(pv) < W.size() && size_t(pt) < W.size()) doubtMir.push_back({W[size_t(pv)], W[size_t(pt)]}); } } }
       if (n && !tt_.symPairs.empty()) { const auto& Sp = tt_.symPairs; const auto t0 = to;   // (Symmetry: the mirror vertex welded onto the target's mirror too)
         for (int v : tt_.verts) { if (size_t(v) >= t0.size() || t0[size_t(v)] < 0 || size_t(v) >= Sp.size()) continue; const int pv = Sp[size_t(v)], pt = size_t(t0[size_t(v)]) < Sp.size() ? Sp[size_t(t0[size_t(v)])] : -1;
           if (pv >= 0 && pt >= 0 && pv != v && pv != pt && size_t(pv) < to.size() && to[size_t(pv)] < 0 && (size_t(pt) >= to.size() || to[size_t(pt)] != pv)) to[size_t(pv)] = pt; } }
       if (n) { MeshEd E = MeshEd::from(*baseOf(*it)); to.resize(E.pos.size(), -1); E.weld(to); const bool ok = !ttDone(m, E, *baseOf(*it), n == 1 ? tr("Welded") : tr("Welded: %1 vertices").arg(n)).isEmpty();
-        if (!doubt.empty()) { penAsk_.m = m; penAsk_.pairs = doubt; penWeldAsk(mp); }
+        if (!doubt.empty()) { penAsk_.m = m; penAsk_.pairs = doubt; penAsk_.mirror = doubtMir; penWeldAsk(mp); }
         return ok; }
-      if (!doubt.empty()) { topoWrite(m, baseSp(*it)); commit(false); emit topoState(); ttTouch(); penAsk_.m = m; penAsk_.pairs = doubt; penWeldAsk(mp); return true; }
+      if (!doubt.empty()) { topoWrite(m, baseSp(*it)); commit(false); emit topoState(); ttTouch(); penAsk_.m = m; penAsk_.pairs = doubt; penAsk_.mirror = doubtMir; penWeldAsk(mp); return true; }
     }
     topoWrite(m, baseSp(*it)); commit(false); emit topoState(); ttTouch(); return true;
   }
@@ -1247,8 +1357,9 @@ bool Viewport::topoToolRelease(const QPointF& mp) {
       std::vector<int> to(E2.pos.size(), -1); bool any = false;
       double weldCap = 1e9;   // (no wider than about half the side pulled out, on the screen: a small one not welded back onto its own neighbours)
       if (tt_.verts.size() == 2) { const ScreenPt s0 = P.toScreen(M.apply(E2.pos[size_t(tt_.verts[0])])), s1 = P.toScreen(M.apply(E2.pos[size_t(tt_.verts[1])])); weldCap = std::max(3.0, 0.45 * std::hypot(s0.x - s1.x, s0.y - s1.y)); }
-      for (int v : nv) { const ScreenPt sv = P.toScreen(M.apply(E2.pos[size_t(v)])); double bd = std::min(ttools.penWeld, weldCap); int target = -1;
-        for (int w : used) { if (skip.count(w)) continue; const ScreenPt s = P.toScreen(M.apply(E2.pos[size_t(w)])); const double d = std::hypot(s.x - sv.x, s.y - sv.y); if (s.z < 1 && sv.z < 1 && d < bd && ttSeen(M.apply(E2.pos[size_t(w)]), m)) { bd = d; target = w; } }   // (not one hidden behind a surface)
+      for (int v : nv) { const Vec3 wv = M.apply(E2.pos[size_t(v)]); const ScreenPt sv = P.toScreen(wv); double bd = std::min(ttools.penWeld, weldCap); int target = -1;
+        const double near3 = ttools.penWeld * 3 * worldPerPixelAt(wv);   // (near in space too: never one on the far side of the mesh that only lines up with it on the screen)
+        for (int w : used) { if (skip.count(w)) continue; const Vec3 ww = M.apply(E2.pos[size_t(w)]); const ScreenPt s = P.toScreen(ww); const double d = std::hypot(s.x - sv.x, s.y - sv.y); if (s.z < 1 && sv.z < 1 && d < bd && ww.distanceTo(wv) <= near3 && ttSeen(ww, m)) { bd = d; target = w; } }   // (not one hidden behind a surface)
         if (target >= 0) { to[size_t(v)] = target; any = true; } }
       if (any) E2.weld(to);
       return to; };
@@ -1293,7 +1404,9 @@ bool Viewport::topoToolRelease(const QPointF& mp) {
   if (kind == 8) {
     if (!tt_.moved) { bevelApply(m, tool_ == "tinset" ? ttools.insOffset : ttools.bevOffset, tool_ == "tinset"); }
     else { (tool_ == "tinset" ? ttools.insOffset : ttools.bevOffset) = tt_.delta.x; saveModelPrefs(); }
+    const Item* ci = scene_->item(m); const bool made = ci && baseSp(*ci) != tt_.before;                  // (nothing made — every try refused: no undo step, no edit to make again)
     tt_.before.reset();
+    if (!made) { ui::hud({}); ttTouch(); return true; }
     scene_->revision++; commit(true); emit topoState(); ui::hud({});
     tt_.lastOp = tool_ == "tinset" ? "inset" : "bevel"; tt_.lastM = m; tt_.lastAfter = baseSp(*scene_->item(m));
     return true;
@@ -1316,7 +1429,7 @@ bool Viewport::topoToolRmb(QMouseEvent* e) {
   if (tool_ == "tpen" && shift && !ctrl) { tt_.m = m; penFill(mp); return true; }   // (no mesh: the anchors make a new RetopoMesh)
   if (tool_ == "tpen" && !shift && !ctrl) {                       // (RMB held: the topology under the circle smoothed — relaxed on its own surface, snapped as any edit)
     if (m < 0) { ui::hud(tr("Select a mesh first"), 900); return true; }
-    if (topoHeavy(m)) { ui::toast(tr("A high-poly mesh — Object mode only")); return true; }
+    
     tbPress(mp, false, false, penBrushKind(), ttools.penSmooth, m);
     return true; }
   if (tool_ == "tweld" && !shift && !ctrl) { weldNow(&mp); return true; }
@@ -1371,9 +1484,7 @@ bool Viewport::topoToolRmb(QMouseEvent* e) {
     auto item = [](const QString& l, std::function<void()> f) { ui::PieItem i; i.label = l; i.act = std::move(f); return i; };
     if (tt_.ec.m < 0) s.top = {item(tr("Curve from the selected edges"), [this] { chainCreate(); })};
     else {
-      s.top = {item(tr("Smooth the curve"), [this] { auto& A = tt_.ec.a; const int n = int(A.size()); std::vector<Vec3> nA = A;
-                  for (int i = 0; i < n; i++) { if (!tt_.ec.closed && (i == 0 || i == n - 1)) continue; nA[size_t(i)] = A[size_t(i)] * 0.5 + (A[size_t((i + n - 1) % n)] + A[size_t((i + 1) % n)]) * 0.25; }
-                  A = nA; chainApply(true); }),
+      s.top = {item(tr("Smooth the curve"), [this] { chainSmoothCurve(); }),
                item(tr("Optimise the curve"), [this] { auto& A = tt_.ec.a; if (A.size() > 3) { std::vector<Vec3> o{A[0]}; for (size_t i = 1; i + 1 < A.size(); i += 2) o.push_back(A[i]); o.push_back(A.back()); A = o; } chainApply(true); }),
                item(tr("Even the edges along it"), [this] { ttools.chainEqual = true; saveModelPrefs(); chainApply(true); emit topoState(); }),
                item(tr("Recompute the handles"), [this] {   // (the anchors laid evenly along the curve as it is now: its handles — the turns at them — made anew)
@@ -1505,7 +1616,7 @@ void Viewport::topoToolDraw(TopoDraw& D) {
     std::vector<Vec3> W; W.reserve(NB.pos.size()); for (const Vec3& p : NB.pos) W.push_back(M.apply(p));   // (from the base: the shown copy may lack its hidden parts — its vertices numbered otherwise)
     std::vector<Vec3> cn; if (NB.cornerNormal.size() == NB.faceVerts.size() && !NB.cornerNormal.empty()) for (auto& n : NB.cornerNormal) cn.push_back(Vec3(n[0], n[1], n[2])); else cn = hardCornerNormals(NB);
     std::set<int> sv; if (tsel_.id == m) { auto l = tSelVerts(m); sv.insert(l.begin(), l.end()); }
-    const double len = NB.bounds().size().length() / 20 * ttools.normLen; TopoDraw::Lines l; l.c = QColor(0x4c, 0xd6, 0xf0); l.c.setAlphaF(float(std::pow(std::clamp(ttools.normOp, 0.05, 1.0), 2.2)));   // (blended in linear light: the share squared-ish, so the slider reads as it looks) l.w = 1.5f;
+    const double len = NB.bounds().size().length() / 20 * ttools.normLen; TopoDraw::Lines l; l.c = QColor(0x4c, 0xd6, 0xf0); l.c.setAlphaF(float(std::pow(std::clamp(ttools.normOp, 0.05, 1.0), 2.2)));   /* (blended in linear light: the share squared-ish, so the slider reads as it looks) */ l.w = 1.5f;
     const std::vector<char> hid = faceLocked(m); std::vector<int> faceOf(NB.faceVerts.size(), 0);   // (the hidden polygons' normals not drawn)
     for (int f = 0; f < NB.faceCount(); f++) for (int k = NB.faceStart[size_t(f)]; k < NB.faceStart[size_t(f) + 1]; k++) faceOf[size_t(k)] = f;
     for (size_t k = 0; k < NB.faceVerts.size() && l.p.size() < 12000; k++) { const int v = NB.faceVerts[k]; if (!sv.empty() && !sv.count(v)) continue; if (!hid.empty() && size_t(faceOf[k]) < hid.size() && hid[size_t(faceOf[k])]) continue; if (size_t(v) >= W.size() || k >= cn.size()) continue;
@@ -1545,7 +1656,7 @@ void Viewport::topoToolOverlay(std::vector<Overlay>& out) const {
     if (L > 1) { const double nx = -dy / L * 14, ny = dx / L * 14, cx = (tt_.p0.x() + tt_.p1.x()) / 2, cy = (tt_.p0.y() + tt_.p1.y()) / 2; out.push_back({{{cx, cy}, {cx + nx, cy + ny}}, QColor(0xff, 0xd8, 0x3a), false}); }
   }
   // (Loop with Shift: the marks along the edge)
-  if ((tool_ == "tloop") && tt_.le >= 0 && tt_.lshift) if (const Item* it = scene_->item(tt_.m >= 0 ? tt_.m : topoMesh())) {
+  if ((tool_ == "tloop") && tt_.le >= 0 && tt_.lshift) if (const Item* it = scene_->item(topoMesh() >= 0 ? topoMesh() : tt_.m)) {   // (the mesh the hover found the edge on)
     auto T = topo::ttopo(baseSp(*it)); if (tt_.le < T->ne) { const auto W = ttWorld(it->id); Projector P = projector(); ScreenPt a = P.toScreen(W[size_t(T->ea[size_t(tt_.le)])]), b = P.toScreen(W[size_t(T->eb[size_t(tt_.le)])]);
       for (double f : {0.5, 0.25, 0.75, 1.0 / 6, 2.0 / 6, 4.0 / 6, 5.0 / 6}) { const double x = a.x + (b.x - a.x) * f, y = a.y + (b.y - a.y) * f; circle(QPointF(x, y), 3, QColor(0xff, 0xd8, 0x3a)); } } }
 }
@@ -1616,6 +1727,24 @@ QString Viewport::testMirrorHalf() {
 }  // namespace hm
 
 namespace hm {
+// (checks) PolyPen with Symmetry on, on face a of the active mesh: f — Ctrl+click on it, e — Ctrl+click on its first edge,
+// v — on its first corner, loop — Ctrl+Shift's loop through its first edge; the faces before / after and the vertices with
+// no mirror twin before / after
+QString Viewport::testPenSym(const QString& what, int a, int) {
+  const int m = topoMesh(); Item* it = m >= 0 ? scene_->item(m) : nullptr; if (!it) return "no mesh";
+  setTool(what == "loop" ? "tloop" : "tpen"); tt_.m = m; tset.sym = true;
+  auto lone = [&] { const auto& P = baseOf(*scene_->item(m))->pos; const auto pr = symFirstPairs(m, P); int n = 0; for (int x : pr) n += x < 0; return n; };
+  const PolyMesh& B = *baseOf(*it); if (a < 0 || a >= B.faceCount()) return "no face";
+  const int f0 = B.faceCount(), l0 = lone(); const int s = B.faceStart[size_t(a)], v0 = B.faceVerts[size_t(s)], v1 = B.faceVerts[size_t(s + 1)];
+  QString r;
+  if (what == "f") r = penDelete(TTPt{}, a);
+  else if (what == "e" || what == "v") { TTPt p; if (what == "v") p.v = v0; else { p.ea = v0; p.eb = v1; } r = penDelete(p, -1); }
+  else if (what == "loop") { auto T = topo::ttopo(baseSp(*it)); r = loopApply(m, T->edgeOf(v0, v1), 0.5, false, 1, false); }
+  return QString("%1 → %2 faces %3 → %4, lone verts %5 → %6").arg(what).arg(r).arg(f0).arg(baseOf(*scene_->item(m))->faceCount()).arg(l0).arg(lone());
+}
+}  // namespace hm
+
+namespace hm {
 // (checks) Mirror → Replace: the polygons within r of the active mesh's vertex nearest (x, mid height, front) picked, then
 // put in place of the other side
 QString Viewport::testReplace(double x, double r) {
@@ -1651,7 +1780,7 @@ namespace hm {
 Vec3 Viewport::ttSnapMoved(const Vec3& w, int m) const {
   const Vec3 h = ttSnapW(w, m); const double dh = h.distanceTo(w); if (dh <= 0) return h;
   double bd = 1e300; Vec3 best = h;
-  for (auto& [id, t] : scene_->items) if (id != m && t.type == ItemType::IMesh && t.poly && scene_->isVisible(t)) if (auto b = bvhOf(id, true)) { double dd; if (auto q = b->closest(w, nullptr, &dd); q && dd < bd) { bd = dd; best = *q; } }
+  for (auto& [id, t] : scene_->items) if (id != m && t.type == ItemType::IMesh && t.poly && scene_->isVisible(t)) if (auto b = bvhSurf(id)) { double dd; if (auto q = b->closest(w, nullptr, &dd); q && dd < bd) { bd = dd; best = *q; } }
   return bd < 1e300 && dh > 2 * bd + 1e-9 ? best : h;
 }
 }  // namespace hm
@@ -1680,15 +1809,17 @@ void Viewport::penWeldAsk(const QPointF& at) {
   connect(no, &QPushButton::clicked, this, [this] { penAskClose(); });
   f->adjustSize(); f->move(mapToGlobal(at.toPoint() + QPoint(18, 14))); f->show(); f->raise();
   penAsk_.w = f; QPointer<QFrame> g(f);
+  connect(f, &QObject::destroyed, this, [this, f] { if (penAsk_.w == f) penAsk_.w = nullptr; });   // (closed or deleted some other way — Alt+F4, its parent gone: the pointer let go)
   QTimer::singleShot(4000, this, [this, g] { if (g && penAsk_.w == g) penAskClose(); });
 }
 void Viewport::penAskClose() { if (penAsk_.w) { QWidget* w = penAsk_.w; penAsk_.w = nullptr; w->close(); } }
 void Viewport::penAskWeld() {
-  const int m = penAsk_.m; const auto pairs = penAsk_.pairs; penAskClose(); penAsk_.pairs.clear();
+  const int m = penAsk_.m; const auto pairs = penAsk_.pairs, mirror = penAsk_.mirror; penAskClose(); penAsk_.pairs.clear(); penAsk_.mirror.clear();
   Item* it = m >= 0 ? scene_->item(m) : nullptr; if (!it || room() != "topo") return;
   const auto W = ttWorld(m); auto at = [&](const Vec3& p) { int b = -1; double bd = 1e-6; for (size_t i = 0; i < W.size(); i++) { const double d = W[i].distanceTo(p); if (d < bd) { bd = d; b = int(i); } } return b; };
   std::vector<int> to(W.size(), -1); int n = 0;
   for (auto& [s, t] : pairs) { const int a = at(s), b = at(t); if (a >= 0 && b >= 0 && a != b) { to[size_t(a)] = b; n++; } }
+  if (tset.sym) for (auto& [s, t] : mirror) { const int a = at(s), b = at(t); if (a >= 0 && b >= 0 && a != b && to[size_t(a)] < 0 && to[size_t(b)] != a) to[size_t(a)] = b; }   // (Symmetry: the twins welded too)
   if (!n) { ui::toast(tr("Nothing to weld — the vertices moved meanwhile")); return; }
   const PolyMesh& B = *baseOf(*it); MeshEd E = MeshEd::from(B); to.resize(E.pos.size(), -1); E.weld(to);
   ttDone(m, E, B, n == 1 ? tr("Welded") : tr("Welded: %1 vertices").arg(n));

@@ -6,7 +6,11 @@
 #include <QPainter>
 #include <QPainterPath>
 #include <QPalette>
+#include <QAction>
+#include <QMenu>
+#include <QPushButton>
 #include <QStyleFactory>
+#include <QToolButton>
 
 namespace hm::ui {
 
@@ -16,6 +20,14 @@ const char* QSS = R"QSS(
 QMainWindow, QWidget#app, QDialog { background: #1e1e1e; }
 QWidget[panel="true"] { background: #262626; }
 QToolTip { background: #333; color: #ddd; border: 1px solid #555; padding: 3px 5px; }
+QDockWidget { color: #d8d8dc; titlebar-close-icon: none; }
+QDockWidget::title { background: #2b2b2e; padding: 3px 6px; border-bottom: 1px solid #3a3a3a; text-align: left; }
+QDockWidget > QWidget { background: #262626; }
+QMainWindow::separator { background: #333336; width: 4px; height: 4px; }
+QMainWindow::separator:hover { background: #9466be; }
+QToolBar#barTop, QToolBar#bar2Tb { border: none; padding: 0; spacing: 0; background: #262626; }
+QTabBar::tab { background: #2b2b2e; color: #b8b8be; padding: 3px 10px; border: 1px solid #3a3a3a; }
+QTabBar::tab:selected { background: #3d2f52; color: #fff; border-color: #9466be; }
 
 QPushButton, QToolButton {
   background: #2e2e2e; color: #cfcfcf; border: 1px solid #444; border-radius: 4px; padding: 3px 8px;
@@ -94,6 +106,7 @@ void applyTheme(QApplication& app) {
 }
 
 QPixmap image(const QString& name) {
+  if (name.startsWith("file:")) return QPixmap(name.mid(5));   // (a picture made at run time — an alpha's thumbnail on a pie ring: read anew each time)
   static QHash<QString, QPixmap> cache;
   auto it = cache.find(name); if (it != cache.end()) return *it;
   QPixmap pm;
@@ -103,6 +116,23 @@ QPixmap image(const QString& name) {
 }
 
 QIcon icon(const QString& name) { return QIcon(image(name)); }
+
+QMenu* moreMenu(QAbstractButton* b) {
+  auto* m = new QMenu(b); m->setToolTipsVisible(true);
+  if (auto* pb = qobject_cast<QPushButton*>(b)) pb->setMenu(m);
+  else if (auto* tb = qobject_cast<QToolButton*>(b)) { tb->setMenu(m); tb->setPopupMode(QToolButton::InstantPopup); }
+  return m;
+}
+QAction* menuItem(QMenu* m, const QString& text, const QString& tip, QObject* ctx, std::function<void()> f, const QString& icon) {
+  QAction* a = m->addAction(text); a->setToolTip(tip); if (!icon.isEmpty()) a->setIcon(ui::icon(icon));
+  if (f) QObject::connect(a, &QAction::triggered, ctx ? ctx : static_cast<QObject*>(m), [f] { f(); });
+  return a;
+}
+QPushButton* moreButton(const QString& tip, QMenu** menu) {
+  auto* b = new QPushButton; b->setIcon(ui::icon("ic_more")); b->setIconSize(QSize(18, 18)); b->setToolTip(tip); b->setFocusPolicy(Qt::NoFocus); b->setFixedWidth(40);
+  if (menu) *menu = moreMenu(b);
+  return b;
+}
 
 QCursor badgeCursor(const QString& name) {
   static QHash<QString, QCursor> cache; if (auto it = cache.find(name); it != cache.end()) return *it;

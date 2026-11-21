@@ -24,7 +24,7 @@ class Viewport;
 class ReportWindow;
 class ConvertPanel;
 class Outliner;
-namespace ui { class DockColumn; class DockPanel; class ToolBox; }
+namespace ui { class DockColumn; class DockPanel; class ToolBox; class HairToolWin; }
 
 class MainWindow : public QMainWindow {
   Q_OBJECT
@@ -36,6 +36,7 @@ public:
   void forgetChanges() { forget_ = true; }               // (checks run from the command line: quit without asking)
   bool saveViewportShot(const QString& png);
   bool saveWindowShot(const QString& png, bool cursor = false);   // the whole window (the panels, its floating windows too; cursor: the pointer drawn in — an annotation)
+  QImage windowShot(bool cursor = false);                          // (the same picture, kept in memory — no PNG written and read back)
   void resetView();
   void setView(const QString& v);
   void selectItems(const std::set<int>& ids);
@@ -47,11 +48,16 @@ public:
   bool openProjectCopy(const QString& path, const QString& name, bool unsaved);
   bool migrateFile(const QString& path, const QString& name, bool wrap);
   void startup(bool projectGiven);
-  void importDropped(const QStringList& files, const QString& zone);
+  void importDropped(const QStringList& files, const QPoint& at = QPoint(-1, -1), bool ask = true);   // (at: where on the screen — pictures go onto the model there; ask: models through the import window — off for the checks)
+  void dropPictures(const QStringList& pics, const QPoint& at);
 
 protected:
   void closeEvent(QCloseEvent* e) override;
   void dragEnterEvent(QDragEnterEvent* e) override;
+  void dragMoveEvent(QDragMoveEvent* e) override;
+  void dropEvent(QDropEvent* e) override;
+  QByteArray exportDragItems(const std::vector<int>& ids);   // (items dragged to another HairHarpy: their file's path)
+  void importDragItems(const QString& path);                  // (items dropped from another HairHarpy into this project)
   bool eventFilter(QObject* o, QEvent* e) override;
   void resizeEvent(QResizeEvent* e) override;
   void moveEvent(QMoveEvent* e) override;
@@ -60,6 +66,7 @@ private:
   void buildUi(QVulkanInstance* vk);
   QWidget* buildTopBar();
   QWidget* buildBar2();
+  void paintImportTexture(bool quiet = false);                // (the Paint room: the model's own textures as a layer of the UV set shown — once per set)
   QWidget* buildDisplayStrip();
   void buildActions();
   void runAction(const QString& id);
@@ -72,6 +79,7 @@ private:
   void endAssign();                                      // (End over anything of the window: the keys for it)
   void openCustomPie(const QString& id);                 // (a pie of one's own, by its key)
   void openIsolatePie();                                 // H held: every hiding / isolating function on a ring
+  void openAlphaRing();                                  // the Paint room, A held: the favourite alphas on a ring (released towards one — it stands in for the brush's tip)
   void faqForHovered();                                  // ~: the FAQ at the help of the button under the pointer
   bool hDown_ = false, hPie_ = false;                    // (H: down — a tap hides, held — the ring)
   QPushButton* unhideBtn_ = nullptr;
@@ -79,13 +87,15 @@ private:
   void rebuildOutliner();
   void syncPanels();                                     // (the selection / the project changed: Settings, Convert)
   void updateTitle();
-  bool unsavedOk();                                      // unsaved changes: save / discard / cancel
+  void waitSave();                                       // (a background save still writing: waited for)
+  bool unsavedOk();                                     // unsaved changes: save / discard / cancel
   QString thumbDataUrl();                                // the File window's preview: the middle of the viewport, 240 px JPEG
   void setViewSetting(const QString& key, const QJsonValue& v);   // 👁 Display (settings.view: the project's, not an undo step)
   QString displayName() const;                           // the project's file name (one not saved yet — projName_)
   void openFiles(const QString& tab = QString());        // 📁 File
   void autosaveNow(bool manual);
   void saveRecovery();
+  bool handsBusy() const;                                   // (a button held / a stroke going on: the timed saves wait)
   void clearRecovery();
   void offerRecovery();
   void offerBrokenWalls();
@@ -97,30 +107,49 @@ private:
   void afterLoad(const QString& path);                   // (recent list, its preview)
   Scene fileScene() const;                               // (what the file keeps: the Hair room's items, the other rooms under P.rooms)
   void applyRoom(const QString& room);
+  void goRoom(const QString& room);                        // (the room switched and the window brought to it — once)
+  int roomApplies_ = 0;
   QWidget* uiScaleControl();                             // (👁 Display: the interface size — applied by a restart)                   // (the room switched: its panels, tools, the outliner's one tree)
 
   QHash<QString, std::function<void()>> actions_;
   int savedChanges_ = 0;
   bool viewDirty_ = false, forget_ = false;              // (Display changed since the save; quit without asking)
   bool dirty() const;
+  QImage paintSetPicture(const QString& set, const QRect& r);   // (the map shown, of a UV set — shown or not — as the model wears it; r: a part)
+  void paintOtherChanged(const QString& set, const QRect& r);
+  void paintImportAll();
+  qint64 paintOtherRev_ = 0;
+  void paintOthersRefresh();                 // (the Paint room: the other UV sets' paint composed for the model — every set's paint is seen at once)
+  QImage paintWireImage() const;             // (the UV polygons of the set painted — the layered PSD's Wireframe layer)
+  int changeTotal() const;                    // (every change that makes the project unsaved: the scene's commits and the Paint room's edits)
   std::function<void()> syncDisplay_;
   QString prevTool_ = "gizmo";
   int propsPin_ = -1;                                    // (📌: the item the Settings keep showing)
   QString projName_ = QStringLiteral("hair-project.hairmesh");
-  bool forcedDirty_ = false;                             // (opened as a copy with unsaved work: an autosave, a recovery copy)
+  bool startedOnce_ = false;                             // (the empty project of the program's start made: later ones reset the windows)
+  bool forcedDirty_ = false;                           // (opened as a copy with unsaved work: an autosave, a recovery copy)
   int asLastChange_ = -1, recChange_ = -1, recGen_ = 0; bool recBusy_ = false, asBusy_ = false, asyncSave_ = false, saveBusy_ = false;   // (recBusy_: the recovery copy being written in the background; recGen_ — bumped when it is cleared)
   qint64 asLast_ = 0; QString asMsg_;
   QPushButton *sendBtn_ = nullptr, *expBtn_ = nullptr, *brgBtn_ = nullptr;
   QWidget* dropOverlay_ = nullptr;
   class RefBoard* board_ = nullptr;
+  class RefCanvas* refCanvas_ = nullptr;                // (✏ a reference plane's drawing: the Paint room's brushes and layers; 📍 markers)
 
   Scene scene_;
   Viewport* viewport_ = nullptr;
   QWidget* vpBox_ = nullptr;                             // (the viewport's container)
   Outliner* outliner_ = nullptr;
   QWidget* olHead_ = nullptr;
+  // the Paint room's docks: moved to any edge, tabbed, floated by the user; the arrangement kept per room
+  std::vector<class QDockWidget*> paintDocks_; QPushButton* panelsBtn_ = nullptr; QPushButton* bakeBtn_ = nullptr; class QFrame *bakePop_ = nullptr, *bridgePop_ = nullptr;
+  void paintPop(class QFrame*& pop, QPushButton* anchor, const std::function<QWidget*()>& make);   // (a Paint panel opened from the top bar, kept while the program runs)
+  bool paintDocksOn_ = false, paintDocksMade_ = false;
+  void paintDocksDefault(); void paintDocksEnter(); void paintDocksLeave(); void paintDocksSave();
+public:
+  QDockWidget* paintDock(const QString& name) const;   // (checks)
+private:
   ui::DockColumn* dock_ = nullptr;
-  ui::ToolBox* tools_ = nullptr;
+  ui::ToolBox* tools_ = nullptr; ui::HairToolWin* htools_ = nullptr;   // (the Hair room's tools float in their own window, as the Topology room's)
   ui::DockPanel *dpTool_ = nullptr, *dpProps_ = nullptr, *dpConv_ = nullptr;
   ConvertPanel* convPanel_ = nullptr;
   ReportWindow* report_ = nullptr;
@@ -143,10 +172,13 @@ private:
   void syncUvTools();
   class TransformTable* ttab_ = nullptr;
   ui::DockPanel* dpTtab_ = nullptr;
+  // the Paint room: its session, the right column's panels, the texture canvas window
+  class PaintSession* paint_ = nullptr; std::vector<ui::DockPanel*> dpPaint_; QWidget* paintCanvas_ = nullptr; class PaintLeft* paintLeft_ = nullptr; class PaintProj* paintProj_ = nullptr; QWidget *paintTop_ = nullptr, *paintMode_ = nullptr; QPushButton* roomPaint_ = nullptr;
   QFrame* dispTopo_ = nullptr;
   QWidget* cornerBg_ = nullptr; QPushButton *roomHair_ = nullptr, *roomTopo_ = nullptr, *keysBtn_ = nullptr, *srBtn_ = nullptr, *ccBtn_ = nullptr, *wireBtn_ = nullptr;
   qint64 lastQ_ = 0; QString qFrom_;
   bool panelsPending_ = false;
+  int paintTubeId_ = -1;   // (checks: the last test tube made — pv thicktube)
 };
 
 }  // namespace hm

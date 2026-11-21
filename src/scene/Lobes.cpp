@@ -195,19 +195,6 @@ std::vector<LobeMap> maps(const TTopo& T, const std::vector<Vec3>& P, const std:
   return out;
 }
 
-// a point near the lobe → its place on the square (the nearest point of the lobe, the same blend of its triangle)
-bool toUV(const LobeMap& M, const Vec3& p, double& u, double& v, double* dist) {
-  if (!M.ok || !M.bvh) return false; double d = 0; const auto q = M.bvh->closest(p, nullptr, &d); if (!q) return false; if (dist) *dist = d;
-  double bd = 1e300; std::array<double, 3> bw{1, 0, 0}; int bt = -1; const double r = std::max(1e-9, d * 1e-3 + 1e-6);
-  M.bvh->sphere(*q, r, [&](int t) { const auto& tr = M.tri[size_t(t)]; const Vec3 &a = M.P[size_t(tr[0])], &b = M.P[size_t(tr[1])], &c = M.P[size_t(tr[2])];
-    const Vec3 e0 = b - a, e1 = c - a, w = *q - a; const double d00 = e0.dot(e0), d01 = e0.dot(e1), d11 = e1.dot(e1), d20 = w.dot(e0), d21 = w.dot(e1), den = d00 * d11 - d01 * d01; if (std::abs(den) < 1e-300) return;
-    double l1 = (d11 * d20 - d01 * d21) / den, l2 = (d00 * d21 - d01 * d20) / den, l0 = 1 - l1 - l2;
-    const double out2 = std::max(0.0, -l0) + std::max(0.0, -l1) + std::max(0.0, -l2); if (out2 >= bd) return;
-    bd = out2; l0 = std::max(0.0, l0); l1 = std::max(0.0, l1); l2 = std::max(0.0, l2); const double s = l0 + l1 + l2; bw = {l0 / s, l1 / s, l2 / s}; bt = t; });
-  if (bt < 0) return false; const auto& tr = M.tri[size_t(bt)];
-  u = M.U[size_t(tr[0])] * bw[0] + M.U[size_t(tr[1])] * bw[1] + M.U[size_t(tr[2])] * bw[2]; v = M.V[size_t(tr[0])] * bw[0] + M.V[size_t(tr[1])] * bw[1] + M.V[size_t(tr[2])] * bw[2];
-  return true;
-}
 // a place on the square → the lobe (the triangle round it there, the same blend of its corners)
 Vec3 fromUV(const LobeMap& M, double u, double v) {
   u = std::clamp(u, 0.0, 1.0); v = std::clamp(v, 0.0, 1.0);

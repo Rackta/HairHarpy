@@ -60,7 +60,7 @@ QColor rgbF(double r, double g, double b, bool linear) { if (linear) { r = toSrg
 const char* FORMATS =
     "Imported (the colour, roughness, metalness and specular are read — texture maps are not):\n"
     "• This program's presets — .hmmat\n"
-    "• Wavefront .mtl — with an OBJ from Blender, Maya, 3ds Max, Cinema 4D, Substance Painter… (Kd, Ns, Ks; Pr / Pm if there)\n"
+    "• Wavefront .mtl — with an OBJ from Maya, Blender, 3ds Max, Cinema 4D, Substance Painter… (Kd, Ns, Ks; Pr / Pm if there)\n"
     "• glTF .gltf — Blender, Substance, Sketchfab, three.js… (pbrMetallicRoughness, KHR_materials_specular)\n"
     "• Unity .mat — Standard / URP / HDRP (_Color / _BaseColor, _Metallic, _Glossiness / _Smoothness)\n"
     "• Godot .tres / .material — StandardMaterial3D (albedo_color, metallic, roughness, metallic_specular)\n"
@@ -198,8 +198,10 @@ public:
   }
   ~MatWindow() override {
     QSettings().setValue("materialWindow/size3", size());
-    if (!keep_) if (Item* it = vp_->scene()->item(id_)) { it->raw = was_; vp_->liveView(); vp_->topoDisplayChanged(); }   // (closed, not OK: as it was)
+    if (!keep_) if (Item* it = vp_->scene()->item(id_)) { putBack_(it->raw); vp_->liveView(); vp_->topoDisplayChanged(); }   // (closed, not OK: as it was)
   }
+  // (the keys this window writes put back as they were — the rest of the item, changed elsewhere meanwhile (a texture, NoPainted), stays)
+  void putBack_(QJsonObject& raw) const { for (const char* k : {"mat", "matPreset", "matOff"}) { if (was_.contains(QLatin1String(k))) raw.insert(QLatin1String(k), was_.value(QLatin1String(k))); else raw.remove(QLatin1String(k)); } }
   int id() const { return id_; }
 private:
   struct Row { QSlider* s; QDoubleSpinBox* n; double Mat::*f; };
@@ -224,7 +226,7 @@ private:
   }
   // OK: what was put back, then the new one written as one undo step
   void commit_() {
-    QJsonObject now; if (Item* it = vp_->scene()->item(id_)) { now = it->raw; it->raw = was_; } else return;
+    QJsonObject now; if (Item* it = vp_->scene()->item(id_)) { now = it->raw; putBack_(it->raw); } else return;
     const int id = id_;
     vp_->runEdit([id, now](Scene& s, Selection&, const CurveCache&) { if (Item* it = s.item(id)) it->raw = now; return QString(); }, false);
     vp_->topoDisplayChanged();
@@ -244,7 +246,7 @@ QRect viewportZone(Viewport* vp, const QSize& s) {
 }
 
 void openMaterialWindow(Viewport* vp, int id) {
-  if (g_mat && g_mat->id() != id) g_mat->close();               // (another mesh's: closed, its changes put back)
+  if (g_mat && g_mat->id() != id) { g_mat->close(); g_mat = nullptr; }   // (another mesh's: closed, its changes put back — it is deleted later, so a new window is made now)
   if (!g_mat) {
     g_mat = new MatWindow(vp, id);
     QSize s = QSettings().value("materialWindow/size3", QSize(340, 250)).toSize(); s = s.expandedTo(g_mat->minimumSize());

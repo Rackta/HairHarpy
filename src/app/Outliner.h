@@ -29,6 +29,7 @@ class SchemeView;
 
 // one tree of the outliner, drawn by itself: rows (an item, a section's head, a hint), a pair's columns side by side,
 // the boxes round an open group's content; the cells' handlers get the clicks
+inline const QString kItemsMime = QStringLiteral("application/x-hairharpy-items"), kPidMime = QStringLiteral("application/x-hairharpy-pid");   // (items dragged between two HairHarpys)
 class OutlinerView : public QWidget {
   Q_OBJECT
 public:
@@ -63,6 +64,7 @@ public:
   void addWidget(QWidget* w, int x0, int x1);  // (a scheme: a widget of its own in the list)
   void finish();
   const Row* row(int id) const;
+  int itemAt(const QPoint& local) const { const int i = rowAt(local); return i >= 0 ? rows_[size_t(i)].id : -1; }   // (the item whose row is there, −1: none)
   void editName(int id, const QString& text, std::function<void(const QString&)> done);
   void flash(int id);
 
@@ -74,6 +76,8 @@ public:
   std::function<void()> eyeEnd;
   std::function<void(int kind, const std::vector<int>& ids, int target, const QString& zone)> dropped;
   std::function<std::vector<int>(int id)> dragIds;
+  // the items dragged out to another HairHarpy: a file of their records written when that program asks for them (its path)
+  std::function<QByteArray(const std::vector<int>& ids)> exportItems;
   std::function<void()> resized;
   // 🔗 the cocoons' links: a line in the gutter on the left from a cocoon's row to the one it takes loops from (arrow
   // there); Alt + click on it — broken; Alt + drag from a cocoon's row onto another — a new one
@@ -130,6 +134,7 @@ public:
   void unparentSelection();                    // Shift+P
   bool pointerOver() const;
   std::function<void(const QPoint& global)> pieRequested;   // (the outliner's own pie: groups, merging)
+  std::function<QByteArray(const std::vector<int>& ids)> exportItems;   // (items dragged to another HairHarpy — see OutlinerView)
   void toggleCocoons();                        // ◍ in the outliner's head
   bool cocoonsFolded() const { return cocoonsFolded_; }
   int paneWidth() const;
@@ -160,6 +165,8 @@ private:
   std::vector<int> topSelected() const;
   void setWidths(int olw, int ccw, bool save);
   void startRename(int id);
+  void hairPreviewRows(OutlinerView* v, int width);          // (the Topology room: the HairPreview folder)
+  bool hairPreviewOpen_ = true;
 
   Viewport* vp_;
   Scene* sc_;
@@ -167,7 +174,7 @@ private:
   OutlinerView *sceneV_, *curvesV_;
   QWidget* ccol_;
   int olw_ = 235, ccw_ = 340;
-  bool crownsFolded_ = false, braidsFolded_ = false, cocoonsFolded_ = false, building_ = false, eyeState_ = true;
+  bool uvSetsFolded_ = false, crownsFolded_ = false, braidsFolded_ = false, cocoonsFolded_ = false, building_ = false, eyeState_ = true;
   int eyeN_ = 0;
   std::set<int> hl_, rel_;
   std::map<int, std::pair<bool, bool>> kinds_;   // (a group: holds scene things / curve things)

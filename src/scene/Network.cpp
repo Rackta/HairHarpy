@@ -130,6 +130,7 @@ void Network::deleteItem(int id) {
       if (keep.size() != hits.size()) { g.raw.insert("hits", keep); if (keep.size() < 2) kill.push_back(gid); }
     }
     for (int k : kill) deleteItem(k);
+    it = sc_.item(id); if (!it) return;                      // (a wall's deletion takes its service curves with it — this very curve too: it is not read after that)
   }
   if (it->type == ItemType::Braid) { std::vector<int> x; for (const QJsonValue& v : it->raw.value("conns").toArray()) if (sc_.item(v.toInt(-1))) x.push_back(v.toInt()); for (int k : x) deleteItem(k); it = sc_.item(id); if (!it) return; }   // (its end connectors go with it)
   if (it->type == ItemType::Tube) { std::vector<int> x; for (auto& [xid, m] : sc_.items) if (m.type == ItemType::XMod && m.raw.value("tube").toInt(-1) == id) x.push_back(xid); for (int k : x) deleteItem(k); }
@@ -820,7 +821,10 @@ void Network::recalcSilent(const std::vector<int>& cs) {
 
 // a new anchor on segment seg of curve c — and of every curve welded along that very segment
 void Network::insertOnSegment(int cid, int seg, int a) {
-  const Item* c = sc_.item(cid); int p = c->anchors[seg], q = c->anchors[seg + 1];
+  const Item* c = sc_.item(cid); if (!c) return; const int n = int(c->anchors.size()); if (seg < 0 || seg >= n || n < 2) return;
+  // (a closed curve's last segment runs from its last anchor back to the first: anchors[seg + 1] was read past the end there)
+  if (seg == n - 1) { if (c->closed) { sc_.item(cid)->anchors.push_back(a); sc_.reindex(); } return; }
+  int p = c->anchors[seg], q = c->anchors[seg + 1];
   for (const Item* hh : curves()) {
     Item* h = sc_.item(hh->id); int i = idxOf(h->anchors, p), j = idxOf(h->anchors, q);
     if (i < 0 || j < 0 || std::abs(i - j) != 1) continue;

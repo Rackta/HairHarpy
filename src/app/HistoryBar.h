@@ -19,8 +19,6 @@ public:
   void sync();                                     // (the history changed)
   void applyStyle();                               // (the Inspector changed its look / place / the step count)
   static QSize sizeFor(QWidget* host, int height); // (its width over the viewport — the Inspector's preview too)
-signals:
-  void closed();
 private:
   class Strip;
   QWidget* host_; Viewport* vp_;

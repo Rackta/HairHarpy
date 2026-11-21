@@ -30,6 +30,19 @@ QString few(const Scene& sc, const std::vector<int>& l) { QStringList n; for (si
 
 void MainWindow::openMainPie(const QPoint& global) {
   if (viewport_->openSurfCutPie(global)) return;            // (while cutting a wall: only the cut's menu)
+  if (scene_.room == "paint") {                              // (the Paint room: what is under the pointer — hidden, isolated, left out of the room)
+    Viewport* vp = viewport_; ui::PieSpec s; s.title = tr("Paint");
+    vp->setMouseAt(vp->fromGlobal(global)); const int under = vp->meshUnder(vp->fromGlobal(global)); const Item* um = under >= 0 ? scene_.item(under) : nullptr;
+    if (um) {
+      s.top.push_back(item(tr("◐ Hide the part under the pointer (H)"), [vp] { vp->pvKey("hide"); }));
+      s.top.push_back(item(tr("◑ Hide %1 (Ctrl+H)").arg(um->name), [vp] { vp->pvKey("hideObj"); }));
+      s.top.push_back(item(tr("◉ Only this part (Shift+H)"), [vp] { vp->pvKey("only"); }));
+      s.top.push_back(item(tr("◎ Only %1 (Ctrl+Shift+H)").arg(um->name), [vp] { vp->pvKey("onlyObj"); }));
+      s.bottom.push_back(item(tr("⊘ NoPainted: leave %1 out of the Paint room").arg(um->name), [vp, under] { vp->pvSetNoPaint({under}, true); }));
+    }
+    s.bottom.push_back(item(tr("👁 Show everything (Ctrl+X)"), [vp] { vp->pvKey("showAll"); }));
+    ui::Pie::open(this, global, s, true); return;
+  }
   if (scene_.room == "topo") { openTopoPie(global); return; }
   if (viewport_->tool() == "edge") {                         // (Edges: the path → curves, Mesh → curves, an empty group)
     Viewport* vp = viewport_; const Item* em = scene_.item(vp->edges.mesh); size_t n = em && em->poly ? vp->edges.list.size() : 0;
@@ -241,6 +254,35 @@ void MainWindow::openMainPie(const QPoint& global) {
     return;
   }
 
+  // ---- cocoons selected: their own menu (21.11, the author: "over the cocoons a pie menu with their own functions, not the
+  // common ones") — convert, check, their locks; the rings' look; trunk / branch; delete ----
+  { std::vector<int> ks; bool only = !S.items.empty();
+    for (int id : S.items) { const Item* it = sc.item(id); if (it && it->type == ItemType::Cocoon) ks.push_back(id); else only = false; }
+    if (only) {
+      CocoonSystem* cs = vp->hair().cocoonSystem();
+      const QString what = ks.size() == 1 ? sc.item(ks[0])->name : tr("%1 cocoons").arg(ks.size());
+      ui::PieSpec s; s.title = what;
+      s.top.push_back(item(tr("⬢ Convert to geometry (%1)").arg(what), [vp] { vp->convertSelected(); }));
+      s.top.push_back(item(tr("⛓ Check connections"), [vp] { vp->checkConnections(true); }));
+      std::vector<int> groups; if (cs) for (int k : ks) if (int g = cs->lockGroup(k); g >= 0 && idxOf(groups, g) < 0) groups.push_back(g);
+      if (!groups.empty()) s.top.push_back(item(groups.size() == 1 ? tr("◎ Select its lock (%1)").arg(sc.item(groups[0])->name) : tr("◎ Select their locks (%1)").arg(groups.size()),
+                                                [vp, groups] { vp->setSelectedItems({}); vp->setSelectedItems(groups); }));
+      // (the rings: drawn on the lock's walls or on the shell; shown or not — all of the selected as the active one is turned)
+      const Item* act = sc.item(ks.back()); const bool onLock = act->raw.value("ringMode").toString() == "lock", off = act->raw.value("ringsOff").toBool();
+      s.bottom.push_back(item(onLock ? tr("◯ Rings on the cocoon's shell") : tr("▤ Rings on the lock's walls"), [vp, ks, onLock] {
+        vp->runEdit([ks, onLock](Scene& s2, Selection&, const CurveCache&) { for (int k : ks) s2.item(k)->raw.insert("ringMode", onLock ? QJsonValue() : QJsonValue("lock")); return onLock ? tr("Rings on the cocoon's shell") : tr("Rings on the lock's walls"); }, true); }));
+      s.bottom.push_back(item(off ? tr("👁 Show the rings") : tr("◌ Hide the rings"), [vp, ks, off] {
+        vp->runEdit([ks, off](Scene& s2, Selection&, const CurveCache&) { for (int k : ks) s2.item(k)->raw.insert("ringsOff", !off); return off ? tr("Rings shown") : tr("Rings hidden"); }, true); }));
+      // (trunk / branch: the others a branch of the active one; a branch — a trunk of its own)
+      if (ks.size() >= 2) s.bottom.push_back(item(tr("⑂ Branch of %1 (the others)").arg(act->name), [this] { runAction("parent"); }));
+      bool anyBranch = false; for (int k : ks) if (const Item* x = sc.item(k); x && x->parent >= 0 && sc.item(x->parent) && sc.item(x->parent)->type == ItemType::Cocoon) anyBranch = true;
+      if (anyBranch) s.bottom.push_back(item(tr("⑃ A trunk of its own (not a branch)"), [this] { runAction("unparent"); }));
+      s.bottom.push_back(item(tr("✖ Delete %1").arg(what), [this] { runAction("del"); }, true));
+      open(s, global, true);
+      return;
+    }
+  }
+
   // ---- items / curves ----
   std::vector<ui::PieItem> bottom{item(tr("▣ Create empty group"), [vp] { vp->createEmptyGroup(); })};
   if (lk) bottom.insert(bottom.begin(), *lk);
@@ -332,11 +374,18 @@ void MainWindow::openTopoPie(const QPoint& global, bool hold) {
     if (st == "rect" || st == "lasso" || st == "cursor")
       s.inner.push_back(opt(tr("Visible only"), !vp->tset.selThrough, tr("On — only what the camera sees is picked; off — the hidden side too (everything inside)"),
                             [vp] { vp->tset.selThrough = !vp->tset.selThrough; }));
+    if (st == "fill") for (auto [k, lb] : {std::pair<const char*, const char*>{"normal", "Fill: normal"}, {"shell", "Fill: UV shell"}, {"hard", "Fill: hard edges"}, {"crease", "Fill: creases"}, {"group", "Fill: polygroup island"}}) {
+      ui::PieItem it; it.label = tr(lb); it.cur = QString(k) == "normal" ? vp->tset.fillMode == "normal" : vp->fillHas(k); it.keep = true; const QString key = k; it.act = [vp, key] { vp->setFillMode(key); }; s.inner.push_back(it); }
     if (st == "loop" || st == "ring") {
       s.inner.push_back(opt(tr("Stop before selected"), vp->tset.loopStopSel, tr("The walk ends before an element already picked"), [vp] { vp->tset.loopStopSel = !vp->tset.loopStopSel; }));
       s.inner.push_back(opt(tr("Stop before n-gon"), vp->tset.loopStopNgon, tr("The walk ends before a polygon of more than four sides"), [vp] { vp->tset.loopStopNgon = !vp->tset.loopStopNgon; }));
       s.inner.push_back(opt(tr("Stop before tris"), vp->tset.loopStopTri, tr("The walk ends before a triangle"), [vp] { vp->tset.loopStopTri = !vp->tset.loopStopTri; }));
+      s.inner.push_back(opt(tr("Stop before seam"), vp->tset.loopStopSeam, tr("The walk ends before a UV seam"), [vp] { vp->tset.loopStopSeam = !vp->tset.loopStopSeam; }));
+      s.inner.push_back(opt(tr("Stop before crease"), vp->tset.loopStopCrease, tr("The walk ends before a crease"), [vp] { vp->tset.loopStopCrease = !vp->tset.loopStopCrease; }));
     }
+    if (vp->topoMode == "object") {                            // (the selected objects: the NoPainted label)
+      std::vector<int> ids; bool all = true; for (int id : vp->selection().items) if (const Item* it = vp->scene()->item(id); it && it->type == ItemType::IMesh) { ids.push_back(id); all &= it->raw.value("noPaint").toBool(); }
+      if (!ids.empty()) { ui::PieItem it; it.label = (all ? "☑ " : "☐ ") + tr("NoPainted"); it.tip = tr("The selected objects are left out of the Paint room: not shown there, not in its lists"); it.cur = all; it.keep = true; it.act = [vp, ids, all] { vp->pvSetNoPaint(ids, !all); }; s.inner.push_back(it); } }
     if (vp->tset.soft) {
       const QString tip = tr("Soft Selection (B): Object only — only what is joined to the selection moves, the parts near it don't; Radius — everything of the mesh within the radius");
       s.inner.push_back(opt(tr("Soft: object only"), vp->tset.softMode == "surface", tip, [vp] { vp->tset.softMode = "surface"; }));
@@ -379,6 +428,9 @@ void MainWindow::openTopoOpsPie(const QPoint& global, bool hold) {
 void MainWindow::openOutlinerPie(const QPoint& global) {
   Viewport* vp = viewport_; ui::PieSpec s; s.title = tr("Outliner");
   if (!vp->selection().items.empty()) s.top.push_back(item(tr("▣ Group the selected (Alt+G)"), [this] { outliner_->groupSelection(); }));
+  { // (NoPainted: the selected objects — folders with what is in them — left out of the Paint room; all of them labelled already: taken off)
+    std::vector<int> ids; bool all = true; for (int id : vp->selection().items) if (const Item* it = scene_.item(id); it && (it->type == ItemType::IMesh || it->type == ItemType::Group)) { ids.push_back(id); all &= it->raw.value("noPaint").toBool(); }
+    if (!ids.empty()) s.bottom.push_back(item(all ? tr("⊘ Take the NoPainted label off") : tr("⊘ NoPainted: not shown in the Paint room"), [vp, ids, all] { vp->pvSetNoPaint(ids, !all); })); }
   s.top.push_back(item(tr("▣ Create empty group"), [vp] { vp->createEmptyGroup(); }));
   if (auto c = vp->selectionCentre()) s.top.push_back(item(tr("⊕ Empty group at the selection"), [vp, p = *c] { vp->createEmptyGroup(&p); }));
   const auto ms = vp->mergeableMeshes();
@@ -386,11 +438,18 @@ void MainWindow::openOutlinerPie(const QPoint& global) {
     // (the pivot of the merged mesh: chosen in the next menu)
     ui::PieSpec q; q.title = tr("Where does the gizmo go?");
     Box3 b; for (int id : ms) if (const Item* it = scene_.item(id); it && it->poly) b.unite(it->poly->bounds());
-    q.top.push_back(item(tr("⊙ World origin (0, 0, 0)"), [vp, ms] { vp->mergeMeshes(ms, Vec3()); }));
-    q.top.push_back(item(tr("◈ Centre of the geometry"), [vp, ms, c = b.center()] { vp->mergeMeshes(ms, c); }));
+    // (the pointer on an item: where the gizmo would stand shown in the viewport — a cross over everything, along the axes it would have)
+    const double L = std::max(1e-3, b.size().length() * 0.06);
+    auto show = [vp, L](const Vec3& p, const Quat& ax) { return [vp, L, p, ax](bool on) {
+      if (!on) { vp->setPieViz({}, {}); return; }
+      std::vector<std::vector<Vec3>> c; for (const Vec3& d : {Vec3(1, 0, 0), Vec3(0, 1, 0), Vec3(0, 0, 1)}) { const Vec3 v = ax.rotate(d) * L; c.push_back({p - v, p + v}); }
+      vp->setPieViz({}, c); }; };
+    ui::PieItem w0 = item(tr("⊙ World origin (0, 0, 0)"), [vp, ms] { vp->setPieViz({}, {}); vp->mergeMeshes(ms, Vec3()); }); w0.hot = show(Vec3(), Quat{});
+    ui::PieItem c0 = item(tr("◈ Centre of the geometry"), [vp, ms, c = b.center()] { vp->setPieViz({}, {}); vp->mergeMeshes(ms, c); }); c0.hot = show(b.center(), Quat{});
+    q.top.push_back(w0); q.top.push_back(c0);
     for (int id : ms) { const Item* it = scene_.item(id); const Vec3 p = meshmods::meshMatrix(scene_, *it).apply(vp->meshPivotLocal(id));
       const Quat ax = (vp->meshOwnQ(id) * vp->meshGizmoQ(id)).normalized();   // (its gizmo's axes too — not only its point)
-      q.bottom.push_back(item(tr("✥ Pivot of %1").arg(it->name), [vp, ms, p, ax] { vp->mergeMeshes(ms, p, ax); })); }
+      ui::PieItem pi = item(tr("✥ Pivot of %1").arg(it->name), [vp, ms, p, ax] { vp->setPieViz({}, {}); vp->mergeMeshes(ms, p, ax); }); pi.hot = show(p, ax); q.bottom.push_back(pi); }
     ui::Pie::open(this, QCursor::pos(), q, false); }));
   else s.bottom.push_back(item(tr("⧉ Merge — pick two meshes or more"), [] { ui::toast(QObject::tr("Pick two meshes or more in the outliner (Ctrl / Shift + click) to merge them")); }));
   ui::Pie::open(this, global, s, true);

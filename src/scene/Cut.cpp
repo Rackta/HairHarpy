@@ -32,7 +32,10 @@ std::vector<std::array<int, 2>> splitAtAnchor(Scene& sc, const CurveCache& cc, S
   for (Item* c0 : cut) {
     int cid = c0->id; Item* c = sc.item(cid);
     std::vector<int> A = c->anchors; int i = idxOf(A, J), n = int(A.size());
-    auto ci = cc.find(cid); const std::vector<double>* L = ci != cc.end() && !ci->second.arc.empty() ? &ci->second.arc : nullptr;
+    // (the cached samples only while they fit the curve's anchors — an anchor just put in for the cut: sampled anew)
+    auto ci = cc.find(cid); CurveSampling now; const std::vector<double>* L = nullptr;
+    if (ci != cc.end() && !ci->second.arc.empty() && !ci->second.seg.empty() && ci->second.seg.back() == n - 2) L = &ci->second.arc;
+    else { now = sampleCurveFull(sc, *c); if (!now.arc.empty()) L = &now.arc; }
     double tot = L ? (L->back() ? L->back() : 1) : 1;
     double cf = L ? std::clamp((*L)[std::min<size_t>(size_t(i) * 24, L->size() - 1)] / tot, 1e-6, 1 - 1e-6) : double(i) / (n - 1);
     std::vector<int> p1(A.begin(), A.begin() + i + 1), p2(A.begin() + i, A.end()); bool firstKeeps = p1.size() >= p2.size();

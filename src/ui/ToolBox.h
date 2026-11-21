@@ -4,9 +4,10 @@
 #pragma once
 #include <QFrame>
 #include <QHash>
+#include <QPoint>
 #include <QString>
 
-class QPushButton;
+class QPushButton; class QSplitter; class QScrollArea;
 
 namespace hm::ui {
 
@@ -22,6 +23,7 @@ public:
   // the tools of the tool ring, in its order: { id, label, icon }
   struct Tool { QString id, label, icon; };
   static const std::vector<Tool>& ringTools();
+  QWidget* rows() const { return rows_; }              // (the tool rows: the Hair room puts them in a floating window — HairToolWin)
 signals:
   void toolPicked(const QString& tool);
   void cocoonClicked();
@@ -33,8 +35,26 @@ signals:
   void support();
 private:
   QHash<QString, QPushButton*> btns_;
+  QWidget* rows_ = nullptr;
   QPushButton* cocoon_ = nullptr;
   QPushButton* snap_ = nullptr; QPushButton *sym_ = nullptr, *symSet_ = nullptr;
+};
+
+// The Hair room's tools in a floating window of their own, as the Topology room's: the tools on the left, the tool's
+// options on the right (the line between them dragged); drag its bar, its corner — its size; its place, size, split kept.
+class HairToolWin : public QFrame {
+  Q_OBJECT
+public:
+  HairToolWin(QWidget* window, QWidget* rows);
+  void place(QWidget* vpBox);                           // (its kept place, else the viewport's top left)
+  void setOptions(QWidget* w);                          // (the tool in use's options; nullptr — none: a note)
+protected:
+  bool eventFilter(QObject* o, QEvent* e) override;
+  void resizeEvent(QResizeEvent* e) override;
+private:
+  void save() const;
+  QWidget* bar_ = nullptr; QPoint grab_; bool drag_ = false;
+  QSplitter* split_ = nullptr; QScrollArea* sa_ = nullptr;
 };
 
 }  // namespace hm::ui

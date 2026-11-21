@@ -14,6 +14,7 @@
 #include <QRegularExpression>
 #include <QHash>
 #include <QApplication>
+#include <QCheckBox>
 #include <QPushButton>
 #include <QSlider>
 #include <QVBoxLayout>
@@ -129,11 +130,6 @@ QWidget* ownPanel(Viewport* vp, Scene* sc);
 // menu below it; the tool isn't switched
 QWidget* buildToolPanel(Viewport* vp, Scene* sc) {
   if (vp->tool() == "guide") return buildShellPanel(vp, sc);
-  bool ccSel = false;
-  for (int id : vp->selection().items) if (const Item* it = sc->item(id)) {
-    const Item* p = it->parent >= 0 ? sc->item(it->parent) : nullptr;
-    if (it->type == ItemType::Cocoon || ((it->type == ItemType::Tip || it->type == ItemType::Even || it->type == ItemType::PInf || it->type == ItemType::Guide) && p && p->type == ItemType::Cocoon)) ccSel = true;
-  }
   QWidget* own = ownPanel(vp, sc);
   // 📌 a pinned modifier menu stays with every tool (that tool's menu goes below it)
   if (vp->tool() != "modifier" && QSettings().value("pinMod").toBool()) {
@@ -142,11 +138,7 @@ QWidget* buildToolPanel(Viewport* vp, Scene* sc) {
     if (own) { auto* f = new QFrame; f->setFixedHeight(1); f->setStyleSheet("background:#4a4a4a;margin:10px 0 8px"); v->addWidget(f); v->addWidget(own); }
     own = w;
   }
-  if (!ccSel) return own;
-  auto* w = new QWidget; auto* v = new QVBoxLayout(w); v->setContentsMargins(0, 0, 0, 0); v->setSpacing(0);
-  v->addWidget(buildShellPanel(vp, sc));
-  if (own) { auto* f = new QFrame; f->setFixedHeight(1); f->setStyleSheet("background:#4a4a4a;margin:10px 0 8px"); v->addWidget(f); v->addWidget(own); }
-  return w;
+  return own;   // (a selected cocoon no longer brings the Shell modifiers panel into every tool: it is the Shell modifiers tool's own)
 }
 
 namespace {
@@ -178,7 +170,8 @@ QWidget* ownPanel(Viewport* vp, Scene* sc) {
     v->addWidget(h4(QObject::tr("✂ Scissors")));
     v->addWidget(modes({{"curve", QObject::tr("Curve"), QObject::tr("Cut curves: drag a line across them")},
                         {"surface", QObject::tr("NURBS surface"), QObject::tr("Cut a NURBS wall in two along a curve placed on it anchor by anchor — from one of its curves to the other, or from its top / bottom edge (or anywhere on it): an end not brought to an edge is carried there")},
-                        {"ends", QObject::tr("Split ends"), QObject::tr("Click a curve: from there to its tip it splits into two branches (a Y curve). Ctrl+RMB drag — how far the ends spread")}},
+                        {"ends", QObject::tr("Split ends"), QObject::tr("Click a curve: from there to its tip it splits into two branches (a Y curve). Ctrl+RMB drag — how far the ends spread")},
+                        {"branches", QObject::tr("Branches"), QObject::tr("Click a lock that forks: each of its branches goes into a group of its own (the shared trunk stays), so each can get a cocoon with its own loops")}},
                        vp->cutMode, [vp, sc](const QString& k) {
                          vp->cutMode = k; if (k != "surface") vp->cancelSurfCut();
                          std::vector<int> w; for (int id : vp->selection().items) if (const Item* x = sc->item(id); x && x->type == ItemType::Surface) w.push_back(id);
@@ -190,6 +183,8 @@ QWidget* ownPanel(Viewport* vp, Scene* sc) {
       QObject::connect(r, &SliderRow::changed, vp, [vp](double x) { vp->splitR = x; vp->requestUpdate(); });
       v->addWidget(r);
       v->addWidget(muted(QObject::tr("Click a curve where its end should split: from there to the tip it becomes a Y curve — the curve and a new branch sharing its trunk; their ends spread apart (the preview shows both). A wall on one side stays with the curve, a wall on the other side goes over to the new branch; a tip shared with other curves splits too — each keeps the tip of its side. Ctrl+RMB drag — the spread (circle radius). Click near an anchor — the split starts there.")));
+    } else if (vp->cutMode == "branches") {
+      v->addWidget(muted(QObject::tr("Click a curve or a wall of a lock that forks into branches. The branch most strands go to stays in the lock's group; every other branch — the curves only its strands run along and the walls between them — goes into a group of its own right after it (Name_a, Name_b…). The trunk the branches share stays. A cocoon made of the whole lock keeps only its main branch; make a cocoon of each new group: its loops then go round that branch too. One step to undo.")));
     } else if (vp->cutMode == "surface") {
       v->addWidget(muted(vp->surfCutting() ? QObject::tr("Cutting the selected wall.") : QObject::tr("Click the NURBS wall to cut.")));
       v->addWidget(muted(QObject::tr("Click one of the wall's curves where the cut starts — on an anchor, or a new anchor goes in there keeping the curve's shape. Click on the wall to add anchors (they stick to it), click its other curve to end. Then: drag the anchors (the ends slide along the curves), RMB on the cut — insert an anchor, double click — delete one. The cut stays on the wall; anchors it needs to follow a bent wall are added. Enter (or Shift+RMB → Cut) — cut: the wall splits in two along a new curve. While cutting, the Shift+RMB menu holds only the cut. Backspace — undo the last anchor while placing, Esc — cancel.")));
@@ -238,6 +233,43 @@ QWidget* ownPanel(Viewport* vp, Scene* sc) {
     auto* mb = new QPushButton(mm >= 0 ? QObject::tr("◆ Convert %1").arg(sc->item(mm)->name) : QObject::tr("◆ Convert (select a mesh)")); mb->setProperty("primary", true); mb->setEnabled(mm >= 0);
     QObject::connect(mb, &QPushButton::clicked, vp, [vp, mm] { vp->meshToCurves(mm); });
     v->addWidget(mb);
+  } else if (t == "lockfix") {
+    { static bool llLoaded = false; if (!llLoaded) { llLoaded = true; QSettings st; vp->llOpt.mode = locklines::Mode(std::clamp(st.value("ll/mode", 0).toInt(), 0, 2)); vp->llOpt.contrast = st.value("ll/contrast", 0.5).toDouble(); vp->llOpt.spur = st.value("ll/spur", 0.02).toDouble(); vp->llOpt.stitch = st.value("ll/stitch", 0.008).toDouble(); vp->llCocoon = st.value("ll/cocoon", false).toBool(); vp->llBulge = st.value("ll/bulge", true).toBool(); vp->llOpt.swapEnds = false; } }
+    v->addWidget(h4(QObject::tr("◈ Lock lines")));
+    v->addWidget(muted(QObject::tr("Generates the lock's curves from a mesh: the lines marked on it are found, thinned to their middle, the lock's ends are worked out and the lines meeting there sewn together. Select the lock's mesh (an imported one) and press Generate.")));
+    auto save = [vp] { QSettings st; st.setValue("ll/mode", int(vp->llOpt.mode)); st.setValue("ll/contrast", vp->llOpt.contrast); st.setValue("ll/spur", vp->llOpt.spur); st.setValue("ll/stitch", vp->llOpt.stitch); st.setValue("ll/cocoon", vp->llCocoon); st.setValue("ll/bulge", vp->llBulge); };   // (the ends' swap: not kept — each start begins unswapped)
+    const QString cur = vp->llOpt.mode == locklines::Mode::Polypaint ? "poly" : vp->llOpt.mode == locklines::Mode::HardEdges ? "hard" : "crease";
+    v->addWidget(modes({{"poly", QObject::tr("Polypaint"), QObject::tr("The contrast lines painted on the mesh (vertex colours): the dark lines on a light lock, or the light ones on a dark")},
+                        {"hard", QObject::tr("Hard edges"), QObject::tr("The edges the mesh keeps hard (the smoothing broken there)")},
+                        {"crease", QObject::tr("Creases"), QObject::tr("The edges creased for subdivision")}},
+                       cur, [vp, save](const QString& k) { vp->llOpt.mode = k == "poly" ? locklines::Mode::Polypaint : k == "hard" ? locklines::Mode::HardEdges : locklines::Mode::Creases; save(); emit vp->brushChanged(); }));
+    if (vp->llOpt.mode == locklines::Mode::Polypaint) {
+      auto* r1 = new SliderRow(QObject::tr("Contrast"), 0.1, 0.9, 0.01, vp->llOpt.contrast, [](double x) { return QString("%1%").arg(int(std::lround(x * 100))); });
+      r1->setTip(QObject::tr("How far a vertex's brightness must lie from the mesh's usual colour to count as a line. Lower — thicker lines (and ones that merge), higher — only the darkest core"));
+      QObject::connect(r1, &SliderRow::changed, vp, [vp](double x) { vp->llOpt.contrast = x; }); QObject::connect(r1, &SliderRow::released, vp, [save](double) { save(); });
+      v->addWidget(r1);
+    }
+    auto* r2 = new SliderRow(QObject::tr("Cut short branches"), 0, 0.1, 0.002, vp->llOpt.spur, [](double x) { return QString("%1%").arg(x * 100, 0, 'f', 1); });
+    r2->setTip(QObject::tr("Side branches that end free next to a junction and are shorter than this (a share of the lock's length) are cut off: the blots and the rough ends of the paint"));
+    QObject::connect(r2, &SliderRow::changed, vp, [vp](double x) { vp->llOpt.spur = x; }); QObject::connect(r2, &SliderRow::released, vp, [save](double) { save(); });
+    auto* r3 = new SliderRow(QObject::tr("Join ends within"), 0, 0.08, 0.001, vp->llOpt.stitch, [](double x) { return QString("%1%").arg(x * 100, 0, 'f', 1); });
+    r3->setTip(QObject::tr("Line ends and junctions nearer to each other than this (a share of the lock's length) are one point: a gap in the paint closed. The lines meeting at the lock's tip are sewn anyway"));
+    QObject::connect(r3, &SliderRow::changed, vp, [vp](double x) { vp->llOpt.stitch = x; }); QObject::connect(r3, &SliderRow::released, vp, [save](double) { save(); });
+    v->addWidget(r2); v->addWidget(r3);
+    auto* sw = new QCheckBox(QObject::tr("Swap root and tip")); sw->setChecked(vp->llOpt.swapEnds);
+    sw->setToolTip(QObject::tr("The root is taken as the end where the lines start apart, the tip — where they come together. If it is guessed wrong, swap them"));
+    QObject::connect(sw, &QCheckBox::toggled, vp, [vp, save](bool on) { vp->llOpt.swapEnds = on; save(); });
+    auto* cc = new QCheckBox(QObject::tr("◍ Create a cocoon")); cc->setChecked(vp->llCocoon);
+    cc->setToolTip(QObject::tr("Also make a live cocoon of the lock from the curves made"));
+    QObject::connect(cc, &QCheckBox::toggled, vp, [vp, save](bool on) { vp->llCocoon = on; save(); });
+    auto* bg = new QCheckBox(QObject::tr("Bulge — walls follow the mesh (up to 3)")); bg->setChecked(vp->llBulge);
+    bg->setToolTip(QObject::tr("The curves are optimized and joined by walls (along the paths through the forks). On — each wall's Bulge (up to 3), its profile along the wall and its Width segments are fitted so it lies on the mesh; off — flat walls"));
+    QObject::connect(bg, &QCheckBox::toggled, vp, [vp, save](bool on) { vp->llBulge = on; save(); });
+    v->addWidget(sw); v->addWidget(bg); v->addWidget(cc);
+    int mm = vp->convertibleMesh();
+    auto* gb = new QPushButton(mm >= 0 ? QObject::tr("◈ Generate from %1").arg(sc->item(mm)->name) : QObject::tr("◈ Generate (select a mesh)")); gb->setProperty("primary", true); gb->setEnabled(mm >= 0);
+    QObject::connect(gb, &QPushButton::clicked, vp, [vp, mm] { vp->lockLinesRun(mm); });
+    v->addWidget(gb);
   } else if (t == "lockex") {
     v->addWidget(muted(QObject::tr("Click a flat lock (curves joined by walls in a row); Shift — add one more. Then drag:\nLMB ←→ — extrude away from the head / toward it (the tip stays welded), ↑↓ — the back's segments (curves in its middle, standing out: one — a pentagon across)\nRMB ←→ — the thickness narrowing at the root, ↑↓ — narrowing toward the tip\nAnother tool or another object — the extrusion is done.")));
     const lockex::Params P = vp->lockExParams();

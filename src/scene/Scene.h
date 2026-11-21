@@ -5,6 +5,8 @@
 #include "scene/Refs.h"
 #include "core/Math.h"
 #include <QJsonObject>
+#include <QImage>
+#include <QRect>
 #include <QString>
 #include <algorithm>
 #include <array>
@@ -88,7 +90,7 @@ struct PolyMesh {
   Box3 bounds() const { Box3 b; for (auto& p : pos) b.expand(p); return b; }
 };
 
-enum class ItemType { Group, Curve, Surface, Guide, Mesh, IMesh, Tube, XMod, Crown, Cap, Skin, Tip, Shell, Even, PInf, Cocoon, Head, Braid, Unknown };
+enum class ItemType { Group, Curve, Surface, Guide, Mesh, IMesh, Tube, XMod, Crown, Cap, Skin, Tip, Shell, Even, PInf, Cocoon, Head, Braid, Spiral, Unknown };
 ItemType itemTypeFromString(const QString& s);
 QString itemTypeName(ItemType t);    // 'Group', 'Curve', ... as the outliner shows them
 QString itemTypeIcon(ItemType t);
@@ -126,9 +128,32 @@ struct Item {
   // mesh ('mesh': converted geometry) / imesh ('imesh', 'head': an imported file)
   std::shared_ptr<PolyMesh> poly;
   std::shared_ptr<PolyMesh> base;          // an imported mesh: the file's geometry (poly — as shown, its modifiers applied)
+  // an imported mesh inside a Subdivision group (raw "subdiv"): the smooth surface made of poly (the cage — what is picked
+  // and edited); null — none. subdGrid: its own wire shown; subdDone: the levels made (fewer than asked — over the face cap)
+  std::shared_ptr<PolyMesh> subd; bool subdGrid = false; int subdDone = 0;
   bool headTag = false;
 
   QJsonObject raw;                       // the record as read (unknown fields kept for saving)
+};
+
+// What changed in a picture, by tiles of 64 texels: a stroke projected over several locks touches islands spread over the whole
+// texture — their bounding box is nearly all of it, the tiles are only what was painted. Runs: the tiles as rectangles (a row's
+// runs of marked tiles, joined with the same run of the rows under it)
+struct TileMask {
+  static constexpr int T = 64; int w = 0, h = 0, tw = 0, th = 0; std::vector<uint8_t> t;
+  void reset(int W, int H) { w = W; h = H; tw = (W + T - 1) / T; th = (H + T - 1) / T; t.assign(size_t(tw) * th, 0); }
+  bool empty() const { for (uint8_t x : t) if (x) return false; return true; }
+  void clear() { std::fill(t.begin(), t.end(), uint8_t(0)); }
+  void mark(const QRect& r) { if (tw <= 0) return; const QRect c = r.intersected(QRect(0, 0, w, h)); if (c.isEmpty()) return;
+    for (int y = c.top() / T; y <= c.bottom() / T; y++) for (int x = c.left() / T; x <= c.right() / T; x++) t[size_t(y) * tw + x] = 1; }
+  void add(const TileMask& o) { if (o.tw != tw || o.th != th) return; for (size_t i = 0; i < t.size(); i++) t[i] |= o.t[i]; }
+  std::vector<QRect> runs() const { std::vector<QRect> out; std::vector<QRect> open;
+    for (int y = 0; y < th; y++) { std::vector<QRect> row; for (int x = 0; x < tw;) { if (!t[size_t(y) * tw + x]) { x++; continue; } int e = x; while (e < tw && t[size_t(y) * tw + e]) e++; row.push_back(QRect(x, y, e - x, 1)); x = e; }
+      std::vector<QRect> next; for (QRect r : row) { bool joined = false; for (QRect& o : open) if (o.left() == r.left() && o.width() == r.width() && o.bottom() == y - 1) { o.setBottom(y); next.push_back(o); o = QRect(); joined = true; break; } if (!joined) next.push_back(r); }
+      for (const QRect& o : open) if (!o.isNull()) out.push_back(o); open = next; }
+    for (const QRect& o : open) if (!o.isNull()) out.push_back(o);
+    for (QRect& r : out) r = QRect(r.x() * T, r.y() * T, r.width() * T, r.height() * T).intersected(QRect(0, 0, w, h));
+    return out; }
 };
 
 struct CameraState { QString view = "persp"; Vec3 pos{0, 0, 5}; Quat quat; double zoom = 1; Vec3 pivot; bool valid = false; };
@@ -153,6 +178,10 @@ public:
   const std::vector<int>& childrenOf(int parentId) const;
 
   bool isVisible(const Item& it) const;   // the item and every group above it shown (and kept by an isolation)
+
+  bool isVisibleBase(const Item& it) const;   // (without the Paint room's own hiding)
+
+  bool noPaint(const Item& it) const;         // (the NoPainted label: on it or on a folder it is in)
   // isolation (Ctrl+H — the selection, Shift+H — and the head, Ctrl+Shift+H / Solo — the working group); runtime only
   struct Isolation { std::set<int> keep; bool head = false; int group = -1; bool solo = false; };
   std::optional<Isolation> iso;
@@ -171,12 +200,27 @@ public:
   int nextId = 1, nextOrder = 0;
   // the references (Refs.h): the planes (in the undo history), the board (its items as the file keeps them)
   std::vector<RefPlane> refPlanes; QJsonObject refBoard; int nextRefId = 1;
+  // the Paint room's map shown on the meshes: the picture (as the texture canvas shows it), its version, the UV set it is painted
+  // in ("" — the project's single texture: every polygon) — not in the file, not in the undo history
+  // (others: the UV sets painted before, not the one shown now — each one's picture as it was left, with its revision: the paint of
+  // every set is seen on the model at once)
+  // (flat: the map painted, its own copy — not shared with the canvas, so a stroke's next step does not copy 64 MB of a 4K picture;
+  // full: the picture is new as a whole — the renderer uploads all of it; else dirty: the part changed since the renderer last took it)
+  struct PaintView { QImage flat; qint64 rev = 0; QString set; bool on = false; bool full = true; TileMask dirty; std::map<QString, std::pair<QImage, qint64>> others;
+    std::map<QString, TileMask> othersDirty; std::set<QString> othersFull; } paintView;   // (the other sets: the tiles changed since the renderer took them; full — the picture anew)
+  std::map<int, RefSketch> refSketches; int nextCanvasId = 1;   // (the canvases, by their ids — RefPlane::canvas: not in the undo history)
+  std::vector<RefMarker> refMarkers; int nextMarkerId = 1; bool refMarkersShown = true; qint64 refMarkRev = 0;
   Item& addItem(ItemType type, int parent, const QString& name);   // (appended to the parent's children)
   Anchor& addAnchor(const Vec3& p);
   void removeFromParent(int id);
 };
 
 // a curve of the network (new logic): not a service, ring, connector, closed or flat-lock curve
+// a mesh Convert made (or an older file's converted mesh, not a preview): an ordinary mesh from now on — the Topology
+// room, the Inspector, UV and Paint take it as any other; its geometry and polygroups kept as an edited mesh's (a packed
+// source); what it was made of (fromCocoon, srcSurfs) stays in its record
+void plainMesh(Item& it);
+
 inline bool segNet(const Item& h) { return !(h.junc || h.hasPath() || h.ring >= 0 || !h.conn.isEmpty() || h.closed || h.hasRib); }
 
 }  // namespace hm

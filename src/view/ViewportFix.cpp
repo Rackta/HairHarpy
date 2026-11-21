@@ -33,7 +33,8 @@ std::map<std::pair<int, int>, std::vector<int>> edgeFaces(const MeshEd& E) {
 }  // namespace
 
 QString Viewport::tFixMesh() {
-  const int m = topoMesh(); Item* it = m >= 0 ? scene_->item(m) : nullptr; if (!it || topoHeavy(m)) { ui::toast(tr("Select a mesh to fix")); return "!"; }
+  if (!eachBusy_ && uvMulti()) return tEachMesh([&] { return tFixMesh(); }, true);   // (several meshes picked: done on each — on its own picks, or on the whole of it)
+  const int m = topoMesh(); Item* it = m >= 0 ? scene_->item(m) : nullptr; if (!it) { ui::toast(tr("Select a mesh to fix")); return "!"; }
   const PolyMesh& B = *baseOf(*it); MeshEd E = MeshEd::from(B); if (E.f.empty()) { ui::toast(tr("The mesh has no polygons")); return "!"; }
   double el = 0; int ne = 0; for (auto& F : E.f) for (size_t k = 0; k < F.v.size(); k++) { el += E.pos[size_t(F.v[k])].distanceTo(E.pos[size_t(F.v[(k + 1) % F.v.size()])]); ne++; }
   el = ne ? el / ne : 1;
@@ -126,11 +127,12 @@ QString Viewport::tFixMesh() {
   { const std::set<int> gone(out.begin(), out.end()); std::vector<char> del(E.f.size(), 0); for (size_t f = 0; f < E.f.size(); f++) del[f] = gone.count(part[f]) > 0; E.removeFaces(del); }
   did << tr("%1 part%2 cut apart made mesh%3 of %4 own").arg(others.size()).arg(others.size() == 1 ? "" : "s").arg(others.size() == 1 ? "" : "es").arg(others.size() == 1 ? "its" : "their");
   const QString msg = tr("FixMesh: ") + did.join(", ");
+  const int h0 = histIdx_;                                   // (the fix and the meshes cut apart: one step to undo)
   ttDone(m, E, B, {});
   int k = 1; std::vector<int> made;
   for (const PolyMesh& d : others) { const int id = topoNewMesh(scene_->item(parent) ? parent : -1, QString("%1 · %2").arg(name).arg(++k), d); if (id < 0) continue; made.push_back(id);
     if (Item* ni = scene_->item(id)) for (const char* key : {"look", "smoothN", "twire", "mat", "matPreset", "matOff", "unlit", "pgView"}) if (look.contains(key)) ni->raw.insert(key, look.value(key)); }
-  scene_->revision++; emit sceneEdited(); commit(true); emit topoState(); ui::toast(msg);
+  scene_->revision++; emit sceneEdited(); commit(true); histMerge(h0); emit topoState(); ui::toast(msg);
   return msg;
 }
 

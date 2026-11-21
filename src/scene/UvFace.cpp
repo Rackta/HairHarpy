@@ -87,7 +87,7 @@ FeatureTies featureTies(const std::vector<Feature>& fs, const std::vector<int>& 
     const bool aShort = A.size() <= B.size(); const auto &S = aShort ? A : B, &Lg = aShort ? B : A; const auto &ts = aShort ? ta : tb, &tl = aShort ? tb : ta;
     size_t from = 0;
     for (size_t i = 0; i < S.size(); i++) {
-      size_t j = from; if (S.size() != Lg.size()) { double bd = 1e300; for (size_t k = from; k + (S.size() - i) <= Lg.size(); k++) { const double d = std::abs(tl[k] - ts[i]); if (d < bd) { bd = d; j = k; } } } else j = i;
+      size_t j = from; if (Lg.size() == S.size() + 2) j = i + 1; else if (S.size() != Lg.size()) { double bd = 1e300; for (size_t k = from; k + (S.size() - i) <= Lg.size(); k++) { const double d = std::abs(tl[k] - ts[i]); if (d < bd) { bd = d; j = k; } } } else j = i;
       if (j >= Lg.size()) break; from = j + 1;
       const int up = aShort ? S[i] : Lg[j], lo = aShort ? Lg[j] : S[i];
       if (up != lo) R.pairs.push_back({lo, up, f.closed ? 1 : 0});
@@ -110,5 +110,14 @@ std::vector<char> innerRims(int n, const std::vector<std::array<int, 3>>& tris, 
   size_t outer = 0; for (size_t i = 1; i < Ls.size(); i++) if (L(Ls[i]) > L(Ls[outer])) outer = i;
   for (size_t i = 0; i < Ls.size(); i++) if (i != outer) for (int v : Ls[i]) if (v >= 0 && v < n) in[size_t(v)] = 1;
   return in;
+}
+}  // namespace hm::uv
+
+namespace hm::uv {
+// every closed loop of the edges as a feature of its own (both eyes selected together, the lips with them)
+std::vector<Feature> featuresFromEdges(const PolyMesh& m, const topo::TTopo& T, const std::vector<int>& edges) {
+  std::vector<Feature> out; std::vector<std::array<int, 2>> E; for (int e : edges) if (e >= 0 && e < T.ne) E.push_back({T.ea[size_t(e)], T.eb[size_t(e)]});
+  for (auto& L : loops(E)) if (auto f = split(m, L)) out.push_back(*f);
+  return out;
 }
 }  // namespace hm::uv

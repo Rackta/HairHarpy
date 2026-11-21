@@ -225,7 +225,7 @@ public:
     auto* cl = new QPushButton("✕"); cl->setToolTip(QObject::tr("Close (Esc)")); QObject::connect(cl, &QPushButton::clicked, this, &QDialog::close);
     hh->addWidget(search_, 1); hh->addWidget(cl); v->addWidget(head);
     auto* main = new QHBoxLayout; main->setSpacing(0); v->addLayout(main, 1);
-    auto* navScroll = new QScrollArea; navScroll->setFixedWidth(210); navScroll->setWidgetResizable(true); navScroll->setStyleSheet("QScrollArea{border:none;border-right:1px solid #3a3a3a;background:#262626}");
+    auto* navScroll = new QScrollArea; navScroll->setFixedWidth(210); navScroll->setWidgetResizable(true); navScroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff); navScroll->setStyleSheet("QScrollArea{border:none;border-right:1px solid #3a3a3a;background:#262626}");
     nav_ = new QWidget; navL_ = new QVBoxLayout(nav_); navL_->setContentsMargins(0, 6, 0, 6); navL_->setSpacing(0); navScroll->setWidget(nav_); main->addWidget(navScroll);
     stack_ = new QStackedWidget; main->addWidget(stack_, 1);
     body_ = new QTextBrowser; body_->setOpenLinks(false); body_->setOpenExternalLinks(false); body_->document()->setDefaultStyleSheet(CSS);
@@ -247,7 +247,7 @@ public:
     room_ = room; auto L = faqList(room); if (L.empty()) return;
     static QHash<QString, QString> secOf; sec_ = secOf.value(room, L[0]->id); secOfPtr_ = &secOf;
     if (sec_ != "ach" && std::none_of(L.begin(), L.end(), [&](const Sec* s) { return s->id == sec_; })) sec_ = L[0]->id;
-    search_->setPlaceholderText(room == "hair" ? QObject::tr("Search help — e.g. \"camera\", \"how to change view\", \"weld curves\", \"export\"…") : QObject::tr("Search the Topology room's help — e.g. \"camera\", \"rooms\", \"references\"…"));
+    search_->setPlaceholderText(room == "hair" ? QObject::tr("Search help — e.g. \"camera\", \"how to change view\", \"weld curves\", \"export\"…") : room == "paint" ? QObject::tr("Search the Paint room's help — e.g. \"through\", \"line\", \"controls\", \"isolate\"…") : QObject::tr("Search the Topology room's help — e.g. \"camera\", \"rooms\", \"references\"…"));
     show_(); show(); raise(); activateWindow(); search_->setFocus(); search_->selectAll();
   }
 protected:
@@ -273,11 +273,11 @@ private:
     QLayoutItem* it; while ((it = navL_->takeAt(0))) { if (it->widget()) { it->widget()->hide(); it->widget()->deleteLater(); } delete it; }
     QString q = search_->text().trimmed(); auto res = q.isEmpty() ? std::vector<Hit>{} : faqSearch(q, room_);
     QSet<QString> hits; for (auto& h : res) hits.insert(h.a->id);
-    auto* rl = new QLabel(room_ == "hair" ? QObject::tr("✂ Hair room") : QObject::tr("⬢ Topology room")); rl->setStyleSheet("color:#7fd4ff;font-size:11px;padding:2px 12px 6px 12px;border-bottom:1px solid #3a3a3a");
+    auto* rl = new QLabel(room_ == "hair" ? QObject::tr("✂ Hair room") : room_ == "paint" ? QObject::tr("🖌 Paint room") : QObject::tr("⬢ Topology room")); rl->setStyleSheet("color:#7fd4ff;font-size:11px;padding:2px 12px 6px 12px;border-bottom:1px solid #3a3a3a");
     rl->setToolTip(QObject::tr("The help of the room you are in — the other room has its own (switch rooms next to ⌨ Hotkeys)")); navL_->addWidget(rl);
     auto item = [&](const QString& text, bool on, const QString& extraCss, std::function<void()> click) {
       class It : public QLabel { public: std::function<void()> fn; using QLabel::QLabel; protected: void mousePressEvent(QMouseEvent*) override { if (fn) fn(); } };
-      auto* l = new It(text); l->fn = click; l->setCursor(Qt::PointingHandCursor);
+      auto* l = new It(text); l->fn = click; l->setCursor(Qt::PointingHandCursor); l->setWordWrap(true);   // (a long title goes onto a second line — the list never scrolls sideways)
       l->setStyleSheet(QString("QLabel{padding:5px 12px;color:%1;background:%2;%3} QLabel:hover{background:#2f2f2f;color:#fff}").arg(on ? "#fff" : "#bbb", on ? "#33415e" : "transparent", extraCss));
       navL_->addWidget(l);
     };
@@ -436,8 +436,8 @@ void openFaqAt(QWidget* parent, const QString& room, const QString& what) {
   if (!g_faq) g_faq = new FaqWindow(parent);
   g_faq->open(room);
   // (the name first — the part before the tip; failing that the tip's words)
-  QString name = what.section(" | ", 0, 0).section(QRegularExpression("\s[—(:]"), 0, 0).remove(QRegularExpression("[^\w\s+/-]")).trimmed();
-  if (name.isEmpty()) name = what.section(" | ", 1).section(QRegularExpression("\s[—(:]"), 0, 0).trimmed();
+  QString name = what.section(" | ", 0, 0).section(QRegularExpression("\\s[—(:]"), 0, 0).remove(QRegularExpression("[^\\w\\s+/-]", QRegularExpression::UseUnicodePropertiesOption)).trimmed();
+  if (name.isEmpty()) name = what.section(" | ", 1).section(QRegularExpression("\\s[—(:]"), 0, 0).trimmed();
   g_faq->goTo(name, what.section(" | ", 1));
 }
 
@@ -539,12 +539,12 @@ void startChimera(QWidget* toolbox, QWidget* activeTool) {
       timer->stop(); hideAll();
       int i = where >= 0 ? where : (rnd() < 0.5 ? 0 : 1);
       if (where < 0 && !seen(i) && seen(1 - i)) i = 1 - i;
-      QWidget* h = hosts[i]; if (!h) { later(false); return; }
+      QWidget* h = hosts[i]; if (!h || !seen(i)) { later(false); return; }   // (neither host shown — the Paint room: the next visit later)
       QPushButton* b = btn[i]; int s = i ? 64 : 46;
       QPoint end(h->width() - s - (i ? 14 : 6), h->height() - s), start(end.x(), h->height());
       b->move(start); b->show(); b->raise();
       auto* a = new QPropertyAnimation(b, "pos", b); a->setDuration(600); a->setStartValue(start); a->setEndValue(end); a->setEasingCurve(QEasingCurve::OutBack); a->start(QAbstractAnimation::DeleteWhenStopped);
-      QTimer::singleShot(30000, b, [this, b] { if (b->isVisible()) { b->hide(); later(false); } });
+      QTimer::singleShot(30000, b, [this, b] { b->hide(); if (!timer->isActive()) later(false); });   // (her host hidden meanwhile: the visits go on too)
     }
   };
   auto* c = new Chim; c->setParent(toolbox); c->hosts[0] = toolbox; c->hosts[1] = activeTool;

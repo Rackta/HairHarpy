@@ -7,6 +7,7 @@
 #include "scene/Braid.h"
 #include "ui/Pie.h"
 #include "view/Viewport.h"
+#include <QMenu>
 #include <QCheckBox>
 #include <QComboBox>
 #include <QGridLayout>

@@ -3,6 +3,7 @@
 #include <QApplication>
 #include <QFile>
 #include <QFileInfo>
+#include <QImageReader>
 #include <QMessageBox>
 #include <QPalette>
 #include <QSettings>
@@ -11,6 +12,10 @@
 #include <QTimer>
 #include <QVulkanInstance>
 #include <set>
+#ifdef Q_OS_WIN
+#define NOMINMAX
+#include <windows.h>
+#endif
 
 
 // the program was "Stylized HairMesh Creator" before 2.0: its settings (recent projects, folders, preferences) carried over
@@ -39,6 +44,9 @@ int main(int argc, char** argv) {
   // (checks run from the command line — --shot — keep their settings apart: recent projects, autosave, folders)
   QApplication::setApplicationName(app.arguments().contains("--shot") ? "HairHarpyCheck" : "HairHarpy");
   hm::ui::applyTheme(app);
+  // (Qt refuses a picture over 256 MB once decoded — an 8K map at 16 bits a channel is 512 MB, and it would come up as a texture
+  // "that could not be read": the limit lifted to what such sets need)
+  QImageReader::setAllocationLimit(4096);
 
   QVulkanInstance inst;
 #ifndef NDEBUG
@@ -53,7 +61,15 @@ int main(int argc, char** argv) {
 
   hm::MainWindow w(&inst);
   w.resize(1500, 900);
+  // (a check — --shot — never takes the user's focus: it is shown without being activated and put under the other windows.
+  // A check run while the author painted in 3D-Coat came to the front and took the keyboard for 4 s — recording 20261116-190407,
+  // 63:22. Under the other windows it still draws: Vulkan presents to a covered window, the shot reads the frame itself.)
+  const bool checkRun = app.arguments().contains("--shot");
+  if (checkRun) w.setAttribute(Qt::WA_ShowWithoutActivating);
   w.show();
+#ifdef Q_OS_WIN
+  if (checkRun) SetWindowPos(HWND(w.winId()), HWND_BOTTOM, 0, 0, 0, 0, SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE);
+#endif
   // a project given on the command line (a double-click on a .hairmesh file);
   // --shot <png>: render it, save the viewport's frame and quit (checks / regression pictures); --fit: the default
   // framing of the whole model instead of the project's camera

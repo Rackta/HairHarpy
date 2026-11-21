@@ -9,6 +9,7 @@
 #include "app/MeshPanels.h"
 #include "scene/TopoEdit.h"
 #include "scene/MeshMods.h"
+#include "scene/Subdiv.h"
 #include "scene/WallTools.h"
 #include "app/ShellPanels.h"
 #include "scene/Cocoons.h"
@@ -18,6 +19,7 @@
 #include "scene/Symmetry.h"
 #include "scene/Walls.h"
 #include "ui/Pie.h"
+#include "ui/Theme.h"
 #include "view/Viewport.h"
 #include <QCheckBox>
 #include <QColorDialog>
@@ -104,6 +106,8 @@ QWidget* buildPropsPanel(Viewport* vp, Scene* sc, int pinned) {
   v->addWidget(h4(QString("%1 %2").arg(itemTypeIcon(it->type), it->name)));
   const int iid = it->id;
 
+  if (coll::isGroup(*it)) { collGroupProps(v, vp, sc, iid); return finish(); }   // (Head Collision: its own settings)
+  if (it->type == ItemType::IMesh && it->headTag) { collObjProps(v, vp, sc, iid); return finish(); }   // (an object of it: plain — no material, textures, polygroups)
   if (it->type == ItemType::Group) {
     if (!svc(*it)) {                                          // (the service groups have no marker colour)
       auto* cb = button(""); cb->setFixedSize(46, 20);
@@ -118,11 +122,34 @@ QWidget* buildPropsPanel(Viewport* vp, Scene* sc, int pinned) {
       v->addWidget(row(QObject::tr("Marker colour"), cr)); v->addWidget(rc, 0, Qt::AlignLeft);
     }
     v->addWidget(muted(QObject::tr("Items inside: %1").arg(it->children.size())));
+    // (every modifier group: its point and axes put on a child object's own gizmo — what is in it stays where it is)
+    // (used once in a while: an item of the modifier's "more" menu, beside Apply — which stays a button)
+    auto childAxes = [&](QMenu* into) {
+      std::vector<int> kids; std::function<void(int)> walk = [&](int pid) { for (int c : sc->item(pid)->children) if (const Item* x = sc->item(c)) { if (x->type == ItemType::IMesh && x->poly) kids.push_back(c); walk(c); } }; walk(iid);
+      QAction* tg = ui::menuItem(into, QObject::tr("⌖ To a child's local axes"), QObject::tr("The group's point and axes put on the gizmo of an object inside it (its pivot and axes — Align / Alt + drag set them); the meshes stay where they are"), nullptr, nullptr);
+      tg->setEnabled(!kids.empty());
+      auto put = [vp, iid](int kid) { const Affine G = vp->meshFrame(kid); vp->runEdit([iid, G](Scene& s, Selection&, const CurveCache&) {
+        Item* g = s.item(iid); if (!g) return QString("!");
+        auto qj = [](const QJsonValue& x) { const QJsonArray a = x.toArray(); return a.size() == 4 ? Quat{a[0].toDouble(), a[1].toDouble(), a[2].toDouble(), a[3].toDouble()}.normalized() : Quat{}; };
+        Quat P; for (const Item* p = s.item(g->parent); p; p = s.item(p->parent)) P = (qj(p->raw.value("q")) * P).normalized();
+        const Quat W = Quat::lookRotation(-G.lin({0, 0, 1}).normalized(), G.lin({0, 1, 0}).normalized()), q = (P.conj() * W).normalized();
+        g->raw.insert("gpivot", QJsonArray{G.t.x, G.t.y, G.t.z}); g->raw.insert("q", QJsonArray{q.x, q.y, q.z, q.w});
+        return QObject::tr("Group: on the child's local axes"); }); };
+      QObject::connect(tg, &QAction::triggered, vp, [vp, sc, kids, put] {
+        if (kids.size() == 1) { put(kids[0]); return; }
+        QMenu menu; for (int k : kids) if (const Item* x = sc->item(k)) QObject::connect(menu.addAction(x->name), &QAction::triggered, vp, [put, k] { put(k); });
+        menu.exec(QCursor::pos()); }); };
+    // (a modifier group's last row: Apply — the button; beside it the "more" menu: the child's axes, the modifier removed)
+    auto applyRow = [&](QPushButton* ap, const QString& moreTip, QMenu** mm) { auto* rw = new QWidget; auto* rh = new QHBoxLayout(rw); rh->setContentsMargins(0, 0, 0, 0); rh->setSpacing(4);
+      rh->addWidget(ap); rh->addWidget(ui::moreButton(moreTip, mm)); rh->addStretch(1); v->addWidget(rw); };
     if (sc->room == "topo" && it->raw.value("vsym").isObject()) {   // ---- a virtual symmetry: its kind, its axes and sides, the seam, Apply ----
       const QJsonObject vs = it->raw.value("vsym").toObject(); const QString type = vs.value("type").toString("mirror");
       auto setVs = [vp, iid](std::function<void(QJsonObject&)> fn) { vp->runEdit([iid, fn](Scene& s, Selection&, const CurveCache&) { Item* g = s.item(iid); if (!g) return QString("!");
         QJsonObject o = g->raw.value("vsym").toObject(); fn(o); g->raw.insert("vsym", o); return QObject::tr("Symmetry changed"); }, false); };
       v->addWidget(h4(QObject::tr("⧉ Symmetry")));
+      { auto* on = check(QObject::tr("Symmetry on"), !vs.value("off").toBool(), QObject::tr("Off — the copies are not shown (and the group's meshes can be worked on as they are); the settings stay"));
+        QObject::connect(on, &QCheckBox::toggled, vp, [setVs](bool x) { setVs([x](QJsonObject& o) { if (x) o.remove("off"); else o.insert("off", true); }); });
+        v->addWidget(on); }
       auto* ty = new QComboBox; for (auto [k, l] : std::vector<std::pair<QString, QString>>{{"mirror", QObject::tr("Mirror")}, {"radial", QObject::tr("Radial")}, {"radialMirror", QObject::tr("Radial mirror")}, {"radialHalf", QObject::tr("Radial half")}}) ty->addItem(l, k);
       ty->setCurrentIndex(std::max(0, ty->findData(type)));
       QObject::connect(ty, &QComboBox::activated, vp, [ty, setVs](int) { const QString k = ty->currentData().toString(); setVs([k](QJsonObject& o) { o.insert("type", k); }); });
@@ -151,6 +178,9 @@ QWidget* buildPropsPanel(Viewport* vp, Scene* sc, int pinned) {
         wd->setToolTip(QObject::tr("How near a plane a point is put onto it (and the polygons a hair over it kept)"));
         QObject::connect(wd, &QDoubleSpinBox::editingFinished, vp, [wd, setVs] { const double x = wd->value(); setVs([x](QJsonObject& o) { o.insert("weldDist", x); }); });
         v->addWidget(wc); v->addWidget(row(QObject::tr("Distance"), wd));
+        auto* sn = check(QObject::tr("Curves stick to the axis"), !vs.value("snapOff").toBool(), QObject::tr("PatchTool: a curve's point drawn near a mirror plane (12 px) is put onto it"));
+        QObject::connect(sn, &QCheckBox::toggled, vp, [setVs](bool x) { setVs([x](QJsonObject& o) { if (x) o.remove("snapOff"); else o.insert("snapOff", true); }); });
+        v->addWidget(sn);
       } else {
         auto* ac = new QComboBox; for (int a = 0; a < 3; a++) ac->addItem(QString("XYZ")[a], a); ac->setCurrentIndex(ax0);
         QObject::connect(ac, &QComboBox::activated, vp, [ac, setVs](int) { const int a = ac->currentData().toInt(); setVs([a](QJsonObject& o) { o.insert("axis", a); }); });
@@ -160,33 +190,78 @@ QWidget* buildPropsPanel(Viewport* vp, Scene* sc, int pinned) {
         v->addWidget(row(QObject::tr("Copies"), cn));
       }
       v->addWidget(muted(QObject::tr("About the group's point and axes (Transform; inside an object — its gizmo)")));
-      // (the group's point and axes put on a child object's own gizmo — what is in it stays where it is)
-      { std::vector<int> kids; std::function<void(int)> walk = [&](int pid) { for (int c : sc->item(pid)->children) if (const Item* x = sc->item(c)) { if (x->type == ItemType::IMesh && x->poly) kids.push_back(c); walk(c); } }; walk(iid);
-        auto* tg = button(QObject::tr("⌖ To a child's local axes"), QObject::tr("The group's point and axes put on the gizmo of an object inside it (its pivot and axes — Align / Alt + drag set them); the meshes stay where they are"));
-        tg->setEnabled(!kids.empty());
-        auto put = [vp, iid](int kid) { const Affine G = vp->meshFrame(kid); vp->runEdit([iid, G](Scene& s, Selection&, const CurveCache&) {
-          Item* g = s.item(iid); if (!g) return QString("!");
-          auto qj = [](const QJsonValue& x) { const QJsonArray a = x.toArray(); return a.size() == 4 ? Quat{a[0].toDouble(), a[1].toDouble(), a[2].toDouble(), a[3].toDouble()}.normalized() : Quat{}; };
-          Quat P; for (const Item* p = s.item(g->parent); p; p = s.item(p->parent)) P = (qj(p->raw.value("q")) * P).normalized();
-          const Quat W = Quat::lookRotation(-G.lin({0, 0, 1}).normalized(), G.lin({0, 1, 0}).normalized()), q = (P.conj() * W).normalized();
-          g->raw.insert("gpivot", QJsonArray{G.t.x, G.t.y, G.t.z}); g->raw.insert("q", QJsonArray{q.x, q.y, q.z, q.w});
-          return QObject::tr("Symmetry: on the child's local axes"); }); };
-        QObject::connect(tg, &QPushButton::clicked, vp, [vp, sc, kids, put] {
-          if (kids.size() == 1) { put(kids[0]); return; }
-          QMenu menu; for (int k : kids) if (const Item* x = sc->item(k)) QObject::connect(menu.addAction(x->name), &QAction::triggered, vp, [put, k] { put(k); });
-          menu.exec(QCursor::pos()); });
-        v->addWidget(tg, 0, Qt::AlignLeft); }
-      auto* ap = button(QObject::tr("✔ Apply to the object"), QObject::tr("The copies become the meshes' own geometry — the seam welded, the other sides' polygons out; the group stays, its symmetry gone"), true);
+      auto* ap = button(QObject::tr("✔ Apply to the object"), QObject::tr("The copies become the meshes' own geometry — the seam welded, the other sides' polygons out; the group goes, its meshes take its place"), true);
       QObject::connect(ap, &QPushButton::clicked, vp, [vp, iid] { QTimer::singleShot(0, vp, [vp, iid] { vp->vsymApply(iid); }); });
-      auto* rm = button(QObject::tr("✕ Remove the symmetry"), QObject::tr("Only the original kept — the preview gone"));
-      QObject::connect(rm, &QPushButton::clicked, vp, [vp, iid] { vp->runEdit([iid](Scene& s, Selection&, const CurveCache&) { s.item(iid)->raw.remove("vsym"); return QObject::tr("Virtual symmetry removed"); }); });
-      v->addWidget(ap, 0, Qt::AlignLeft); v->addWidget(rm, 0, Qt::AlignLeft);
+      QMenu* mm = nullptr; applyRow(ap, QObject::tr("More: the group's point and axes put on a child's, the symmetry removed"), &mm);
+      childAxes(mm);
+      ui::menuItem(mm, QObject::tr("✕ Remove the symmetry"), QObject::tr("Only the original kept — the preview gone"), vp, [vp, iid] { vp->runEdit([iid](Scene& s, Selection&, const CurveCache&) { s.item(iid)->raw.remove("vsym"); return QObject::tr("Virtual symmetry removed"); }); });
+    }
+    if (sc->room == "topo" && it->raw.value("subdiv").isObject()) {   // ---- a Subdivision: the level, the grid, the open borders, the UVs, Apply ----
+      const QJsonObject sd = it->raw.value("subdiv").toObject(); const int level = std::clamp(sd.value("level").toInt(1), 0, 6);
+      auto setSd = [vp, iid](std::function<void(QJsonObject&)> fn) { vp->runEdit([iid, fn](Scene& s, Selection&, const CurveCache&) { Item* g = s.item(iid); if (!g) return QString("!");
+        QJsonObject o = g->raw.value("subdiv").toObject(); fn(o); g->raw.insert("subdiv", o); return QObject::tr("Subdivision changed"); }, false); };
+      v->addWidget(h4(QObject::tr("◈ Subdivision")));
+      { auto* on = check(QObject::tr("Subdivision on"), !sd.value("off").toBool(), QObject::tr("Off — the meshes are shown as they are; the settings stay"));
+        QObject::connect(on, &QCheckBox::toggled, vp, [setSd](bool x) { setSd([x](QJsonObject& o) { if (x) o.remove("off"); else o.insert("off", true); }); });
+        v->addWidget(on); }
+      { auto* lv = new SliderRow(QObject::tr("Level"), 0, 6, 1, level, [](double x) { return QString::number(int(std::lround(x))); });
+        lv->setTip(QObject::tr("How many times the surface is subdivided and smoothed: each level — four times the quads (0 — as it is). The cage (the polygons you pick and edit) does not change"));
+        QObject::connect(lv, &SliderRow::released, vp, [setSd, level](double x) { const int n = int(std::lround(x)); if (n != level) setSd([n](QJsonObject& o) { o.insert("level", n); }); });
+        v->addWidget(lv); }
+      { auto* gr = check(QObject::tr("Show the subdivision grid"), sd.value("grid").toBool(false), QObject::tr("The wire of the subdivided surface drawn over it (the cage's own wire is the Display's Wire)"));
+        QObject::connect(gr, &QCheckBox::toggled, vp, [setSd](bool x) { setSd([x](QJsonObject& o) { o.insert("grid", x); }); });
+        v->addWidget(gr); }
+      { auto* bo = check(QObject::tr("Smooth open borders"), sd.value("smoothOpen").toBool(true), QObject::tr("The open edges of the geometry (a hem, a sleeve's cut, a hole's rim) are rounded like the rest — the rim shrinks a little. Off — the rim stays exactly where it is, only the inside is smoothed"));
+        QObject::connect(bo, &QCheckBox::toggled, vp, [setSd](bool x) { setSd([x](QJsonObject& o) { o.insert("smoothOpen", x); }); });
+        v->addWidget(bo); }
+      { auto* uc = new QComboBox; uc->addItem(QObject::tr("Smooth"), "smooth"); uc->addItem(QObject::tr("Keep borders"), "keep"); uc->setCurrentIndex(sd.value("uv").toString("smooth") == "keep" ? 1 : 0);
+        QObject::connect(uc, &QComboBox::activated, vp, [uc, setSd](int) { const QString k = uc->currentData().toString(); setSd([k](QJsonObject& o) { o.insert("uv", k); }); });
+        v->addWidget(row(QObject::tr("UV"), uc, QObject::tr("The UVs are subdivided with the surface (the UV Sets too) — as a surface of their own, the island borders its rim. Smooth — the islands' outline is rounded as the mesh's; Keep borders — the outline stays, the inside is smoothed (the islands keep their shape and place)"))); }
+      { long long now = 0, after = 0; std::function<void(int)> walk = [&](int pid) { for (int c : sc->item(pid)->children) if (const Item* x = sc->item(c)) { if (x->type == ItemType::IMesh && x->poly) { now += x->poly->faceCount(); after += subdiv::facesAfter(*x->poly, level); } walk(c); } }; walk(iid);
+        if (level > 0) v->addWidget(muted(QObject::tr("Polygons: %1 → %2").arg(now).arg(after) + (after > 2500000 ? QObject::tr(" — over the limit: the last levels are not made") : QString()))); }
+      { int kept = 0; std::function<void(int)> walk = [&](int pid) { for (int c : sc->item(pid)->children) if (const Item* x = sc->item(c)) { if (x->type == ItemType::IMesh) kept = std::max(kept, int(x->raw.value("subdDetail").toArray().size())); walk(c); } }; walk(iid);
+        auto* rc = button(QObject::tr("⇲ Reconstruct"), QObject::tr("For a high-poly model put into this group: it is taken one level down — each mesh becomes the mesh it is the subdivision of (triangles and quads of the original; n-gons are never restored), and what that mesh's subdivision lacks of the model is kept as the detail of level 1 (the older details move up a level; the level above goes up by one, so the shape on screen stays). Again and again, until there is nothing left to reconstruct"));
+        QObject::connect(rc, &QPushButton::clicked, vp, [vp, iid] { QTimer::singleShot(0, vp, [vp, iid] { vp->subdivReconstruct(iid); }); });
+        v->addWidget(rc, 0, Qt::AlignLeft);
+        v->addWidget(muted(kept > 0 ? QObject::tr("Detail kept in %1 level%2 (level 1 — the newest) — shown while the Level reaches it; edit the cage, the detail follows").arg(kept).arg(kept == 1 ? "" : "s")
+                                    : QObject::tr("Reconstruct takes a high-poly model back to the lower mesh it was subdivided from — its detail stays as level 1"))); }
+      v->addWidget(muted(QObject::tr("Open borders, creases and UV seams are kept; a crease (edge weight ≥ 0.5) stays sharp. Symmetry, if any, goes first, then the subdivision")));
+      v->addWidget(muted(QObject::tr("The group's point and axes (its gizmo)")));
+      auto* ap = button(QObject::tr("✔ Apply to the object"), QObject::tr("The meshes take the subdivided geometry as their own (UVs, UV Sets, seams, creases carried); the group goes"), true);
+      QObject::connect(ap, &QPushButton::clicked, vp, [vp, iid] { QTimer::singleShot(0, vp, [vp, iid] { vp->subdivApply(iid); }); });
+      QMenu* mm = nullptr; applyRow(ap, QObject::tr("More: the group's point and axes put on a child's, the subdivision removed"), &mm);
+      childAxes(mm);
+      ui::menuItem(mm, QObject::tr("✕ Remove the subdivision"), QObject::tr("Only the cage kept — the smooth surface gone"), vp, [vp, iid] { vp->runEdit([iid](Scene& s, Selection&, const CurveCache&) { s.item(iid)->raw.remove("subdiv"); return QObject::tr("Subdivision removed"); }); });
     }
     if (sc->room == "topo") {   // (the Topology room: no curves' settings)
       v->addWidget(muted(QObject::tr("A group of meshes — drag meshes into it in the outliner")));
       auto* ic = check(QObject::tr("Skip in the Inspector"), it->raw.value("inspOff").toBool(), QObject::tr("The Inspector checks nothing inside this group (high-poly sources, references) — no markers over them"));
       QObject::connect(ic, &QCheckBox::toggled, vp, [vp, iid](bool x) { vp->runEdit([iid, x](Scene& s, Selection&, const CurveCache&) { Item* g = s.item(iid); if (x) g->raw.insert("inspOff", true); else g->raw.remove("inspOff"); return QString(); }, false); vp->inspChanged(); });
       v->addWidget(ic);
+      // the group's point (its gizmo stands there while it alone is picked): to the middle of what is inside it, or onto the pivot of
+      // one of the objects inside — nothing in the group moves
+      { std::vector<int> kids; std::function<void(int)> walk = [&](int pid) { for (int c : sc->item(pid)->children) if (const Item* x = sc->item(c)) { if (x->type == ItemType::IMesh && x->poly) kids.push_back(c); walk(c); } }; walk(iid);
+        v->addWidget(muted(QObject::tr("The group's own point (its gizmo)")));
+        auto* tm = button(QObject::tr("⌖ Pivot to the centre of the content"), QObject::tr("The group's point to the middle of the meshes inside it (the average of their vertices); the meshes stay where they are"));
+        tm->setEnabled(!kids.empty());
+        QObject::connect(tm, &QPushButton::clicked, vp, [vp, sc, kids, iid] {
+          Vec3 sum; double n = 0; for (int k : kids) if (const Item* x = sc->item(k); x && x->poly) for (const Vec3& p : x->poly->pos) { sum += p; n += 1; }
+          if (n <= 0) return; const Vec3 c = sum * (1.0 / n);
+          vp->runEdit([iid, c](Scene& s, Selection&, const CurveCache&) { Item* g = s.item(iid); if (!g) return QString("!"); g->raw.insert("gpivot", QJsonArray{c.x, c.y, c.z}); return QObject::tr("Group pivot: the centre of the content"); }); });
+        auto* tk = button(QObject::tr("⌖ Pivot to a child's pivot"), QObject::tr("The group's point and axes onto the pivot of an object inside it (the pivot and axes of its gizmo); the meshes stay where they are"));
+        tk->setEnabled(!kids.empty());
+        auto put = [vp, iid](int kid) { const Affine G = vp->meshFrame(kid); vp->runEdit([iid, G](Scene& s, Selection&, const CurveCache&) {
+          Item* g = s.item(iid); if (!g) return QString("!");
+          auto qj = [](const QJsonValue& x) { const QJsonArray a = x.toArray(); return a.size() == 4 ? Quat{a[0].toDouble(), a[1].toDouble(), a[2].toDouble(), a[3].toDouble()}.normalized() : Quat{}; };
+          Quat P; for (const Item* p = s.item(g->parent); p; p = s.item(p->parent)) P = (qj(p->raw.value("q")) * P).normalized();
+          const Quat W = Quat::lookRotation(-G.lin({0, 0, 1}).normalized(), G.lin({0, 1, 0}).normalized()), q = (P.conj() * W).normalized();
+          g->raw.insert("gpivot", QJsonArray{G.t.x, G.t.y, G.t.z}); g->raw.insert("q", QJsonArray{q.x, q.y, q.z, q.w});
+          return QObject::tr("Group pivot: on the child's pivot"); }); };
+        QObject::connect(tk, &QPushButton::clicked, vp, [vp, sc, kids, put] {
+          if (kids.size() == 1) { put(kids[0]); return; }
+          QMenu menu; for (int k : kids) if (const Item* x = sc->item(k)) QObject::connect(menu.addAction(x->name), &QAction::triggered, vp, [put, k] { put(k); });
+          menu.exec(QCursor::pos()); });
+        v->addWidget(tm, 0, Qt::AlignLeft); v->addWidget(tk, 0, Qt::AlignLeft); }
       return finish(); }
     if (!svc(*it)) {
       auto* gs = new QComboBox; gs->addItem(QObject::tr("Auto"), "auto"); gs->addItem(QObject::tr("Show"), "show"); gs->addItem(QObject::tr("Hide"), "hide");
@@ -240,14 +315,14 @@ QWidget* buildPropsPanel(Viewport* vp, Scene* sc, int pinned) {
       for (int k = 0; k < 3; k++) { auto* sp = new QDoubleSpinBox; sp->setRange(-1e6, 1e6); sp->setDecimals(2); sp->setButtonSymbols(QAbstractSpinBox::NoButtons); sp->setMinimumWidth(40); sp->setSingleStep(0.1); sp->setPrefix(QString("XYZ"[k]) + " ");
         sp->setValue(k == 0 ? gp.x : k == 1 ? gp.y : gp.z); sp->setKeyboardTracking(false); sp->setToolTip(QObject::tr("The group's point — changed, everything inside moves with it")); ps[size_t(k)] = sp; ph->addWidget(sp, 1); }
       for (auto* sp : ps) QObject::connect(sp, &QDoubleSpinBox::valueChanged, vp, [vp, iid, ps](double) { vp->setGroupPoint(iid, Vec3(ps[0]->value(), ps[1]->value(), ps[2]->value()), true); });
+      // (to the head's centre — set once in a while: the "more" menu at the end of the point's row)
+      const Vec3 hc = vp->camera().sceneCenter; QMenu* pm = nullptr;
+      ph->addWidget(ui::moreButton(QObject::tr("More: the group, or only its point, moved to the head's centre"), &pm));
+      ui::menuItem(pm, QObject::tr("✥ Move to the head's centre"), QObject::tr("The group with everything inside moved so that its point is at the head's centre (%1, %2, %3)").arg(hc.x, 0, 'f', 2).arg(hc.y, 0, 'f', 2).arg(hc.z, 0, 'f', 2), vp,
+                   [vp, iid] { vp->setGroupPoint(iid, vp->camera().sceneCenter, true); ui::toast(QObject::tr("The group moved to the head's centre")); });
+      ui::menuItem(pm, QObject::tr("⌖ Point only"), QObject::tr("Only the group's point goes to the head's centre — what is inside stays where it is (a symmetric group inside then mirrors across the head's centre)"), vp,
+                   [vp, iid] { vp->setGroupPoint(iid, vp->camera().sceneCenter, false); ui::toast(QObject::tr("The group's point is at the head's centre — the contents stayed")); });
       v->addWidget(pr);
-      const Vec3 hc = vp->camera().sceneCenter;
-      auto* hb = new QWidget; auto* hh = new QHBoxLayout(hb); hh->setContentsMargins(0, 0, 0, 0); hh->setSpacing(4);
-      auto* mv = button(QObject::tr("✥ Move to the head's centre"), QObject::tr("The group with everything inside moved so that its point is at the head's centre (%1, %2, %3)").arg(hc.x, 0, 'f', 2).arg(hc.y, 0, 'f', 2).arg(hc.z, 0, 'f', 2));
-      QObject::connect(mv, &QPushButton::clicked, vp, [vp, iid] { vp->setGroupPoint(iid, vp->camera().sceneCenter, true); ui::toast(QObject::tr("The group moved to the head's centre")); });
-      auto* pt = button(QObject::tr("⌖ Point only"), QObject::tr("Only the group's point goes to the head's centre — what is inside stays where it is (a symmetric group inside then mirrors across the head's centre)"));
-      QObject::connect(pt, &QPushButton::clicked, vp, [vp, iid] { vp->setGroupPoint(iid, vp->camera().sceneCenter, false); ui::toast(QObject::tr("The group's point is at the head's centre — the contents stayed")); });
-      hh->addWidget(mv); hh->addWidget(pt); hh->addStretch(1); v->addWidget(hb);
     }
     // symmetry: everything inside gets a live mirrored copy
     if (!svc(*it)) {
@@ -309,20 +384,17 @@ QWidget* buildPropsPanel(Viewport* vp, Scene* sc, int pinned) {
   } else if (it->type == ItemType::Curve) {
     std::vector<int> list; if (pinned < 0) for (int x : S.items) if (const Item* c = sc->item(x); c && c->type == ItemType::Curve) list.push_back(x);
     if (list.empty()) list = {iid};
-    v->addWidget(muted(QObject::tr("Anchors: %1. RMB on the line inserts an anchor.").arg(it->anchors.size())));
+    // (the curve's commands — used once in a while: the "more" menu at the end of its first row)
+    QMenu* cm = nullptr;
+    { auto* br = new QWidget; auto* bh = new QHBoxLayout(br); bh->setContentsMargins(0, 0, 0, 0); bh->setSpacing(4);
+      bh->addWidget(muted(QObject::tr("Anchors: %1. RMB on the line inserts an anchor.").arg(it->anchors.size())), 1);
+      bh->addWidget(ui::moreButton(QObject::tr("More: all the anchors recalculated, the direction reversed"), &cm), 0, Qt::AlignTop); v->addWidget(br); }
+    ui::menuItem(cm, QObject::tr("↺ Recalculate all anchors"), QObject::tr("Reset frozen handles and smoothness of every anchor of the selected curve(s) — back to clean automatic arcs"), vp, [vp, sc, list] { vp->recalcAnchors(edit::anchorsOf(*sc, list)); });
+    ui::menuItem(cm, QObject::tr("⇄ Reverse direction"), QObject::tr("Swap the start (root) and the end (tip) of the selected curve(s). The diamond anchor marks the start (root); modifiers sweep from there"), vp, [vp, list] { vp->reverseCurves(list); });
     if (it->hasPath()) {
       QStringList r; for (auto& p : it->path) if (const Item* c = sc->item(p[0])) r << c->name;
       v->addWidget(text(QObject::tr("Route: ") + r.join(" → ")));
-      auto* cr = button(QObject::tr("⤳ Change the route…"), QObject::tr("Another way through the forks for this service curve — the part where it went along the wrong branch is replaced; its walls follow (Shift+RMB with it selected — the same)"));
-      QObject::connect(cr, &QPushButton::clicked, vp, [] { ui::toast(QObject::tr("The route pie comes with the selection extras of this rewrite")); });
-      v->addWidget(cr, 0, Qt::AlignLeft);
     }
-    auto* br = new QWidget; auto* bh = new QHBoxLayout(br); bh->setContentsMargins(0, 4, 0, 4); bh->setSpacing(4);
-    auto* rc = button(QObject::tr("↺ Recalculate all anchors"), QObject::tr("Reset frozen handles and smoothness of every anchor of the selected curve(s) — back to clean automatic arcs"));
-    auto* rv = button(QObject::tr("⇄ Reverse direction"), QObject::tr("Swap the start (root) and the end (tip) of the selected curve(s). The diamond anchor marks the start (root); modifiers sweep from there"));
-    QObject::connect(rc, &QPushButton::clicked, vp, [vp, sc, list] { vp->recalcAnchors(edit::anchorsOf(*sc, list)); });
-    QObject::connect(rv, &QPushButton::clicked, vp, [vp, list] { vp->reverseCurves(list); });
-    bh->addWidget(rc); bh->addWidget(rv); bh->addStretch(1); v->addWidget(br);
     auto anchorsOfList = [sc, list] { return edit::anchorsOf(*sc, list); };
     auto* rr = new SliderRow(QObject::tr("Roundness"), 0, 1, 0.01, it->round, pct);
     rr->setTip(QObject::tr("0 — smooth spline (with 3 anchors a parabola); 1 — every bend follows the circular arc through its anchors. Applies to all selected curves"));
@@ -381,7 +453,7 @@ QWidget* buildPropsPanel(Viewport* vp, Scene* sc, int pinned) {
     if (segs > 1) { auto* sb = button(QObject::tr("✂ Segments → curves%1").arg(selW.size() > 1 ? QObject::tr(" (%1 surfaces)").arg(selW.size()) : QString()), QObject::tr("Every segment line (with the bulge) becomes a curve; the surface is replaced by flat one-segment walls between them"));
       std::vector<int> list = selW.size() > 1 ? selW : std::vector<int>{iid};
       QObject::connect(sb, &QPushButton::clicked, vp, [vp, list] { const auto* W = &vp->hair().walls; vp->runEdit([list, W](Scene& s, Selection& sl, const CurveCache& c) { return walltools::segmentsToCurves(s, c, *W, sl, list); }, true); }); v->addWidget(sb, 0, Qt::AlignLeft); }
-    auto* bu = new SliderRow(QObject::tr("Bulge"), -1, 1, 0.01, bulge, [](double x) { return QString::number(x, 'f', 2); }); bu->setReset(0); bu->setTip(QObject::tr("Double-click — 0 (flat, no volume)"));
+    auto* bu = new SliderRow(QObject::tr("Bulge"), -3, 3, 0.01, bulge, [](double x) { return QString::number(x, 'f', 2); }); bu->setReset(0); bu->setTip(QObject::tr("Double-click — 0 (flat, no volume)"));
     QObject::connect(bu, &SliderRow::changed, vp, [sc, iid, live](double x) { setP(*sc, iid, "bulge", x); live(); });
     QObject::connect(bu, &SliderRow::released, vp, [vp](double) { vp->commitLive(); });
     v->addWidget(bu);
@@ -412,7 +484,7 @@ QWidget* buildPropsPanel(Viewport* vp, Scene* sc, int pinned) {
       QObject::connect(s2, &SliderRow::changed, vp, [sc, iid, live](double x) { setP(*sc, iid, "b2segs", int(x) + 1); live(); });
       QObject::connect(s2, &SliderRow::released, vp, [vp](double) { vp->commitLive(); });
       v->addWidget(s2);
-      auto* b2b = new SliderRow(QObject::tr("Bulge"), -1, 1, 0.01, p.value("b2bulge").toDouble(), [](double x) { return QString::number(x, 'f', 2); }); b2b->setReset(0);
+      auto* b2b = new SliderRow(QObject::tr("Bulge"), -3, 3, 0.01, p.value("b2bulge").toDouble(), [](double x) { return QString::number(x, 'f', 2); }); b2b->setReset(0);
       QObject::connect(b2b, &SliderRow::changed, vp, [sc, iid, live](double x) { setP(*sc, iid, "b2bulge", x); live(); });
       QObject::connect(b2b, &SliderRow::released, vp, [vp](double) { vp->commitLive(); });
       v->addWidget(b2b);
@@ -428,11 +500,6 @@ QWidget* buildPropsPanel(Viewport* vp, Scene* sc, int pinned) {
     if (it->type == ItemType::Mesh) v->addWidget(muted(QObject::tr("%1Vertices: %2, quads: %3, tris: %4").arg(it->raw.value("pending").toBool() ? QObject::tr("Awaiting confirmation. ") : QString()).arg(nv).arg(q).arg(t)));
     else {
       v->addWidget(muted(QObject::tr("Imported mesh: %1 vertices, %2 polygons. The file itself stays as it was — changes are modifiers.").arg(nv).arg(q + t)));
-      auto* hc = check(QObject::tr("☺ Head"), it->headTag, QObject::tr("The head mark: every mesh marked so is the Head in the Hair room (one object there — not listed in Meshes); off — an ordinary mesh"));
-      QString nm = it->name;
-      QObject::connect(hc, &QCheckBox::toggled, vp, [vp, iid, nm](bool x) { vp->runEdit([iid, x, nm](Scene& s, Selection&, const CurveCache&) { Item* m = s.item(iid); m->headTag = x; m->raw.insert("headTag", x);
-        return x ? QObject::tr("☺ %1 — a part of the Head").arg(nm) : QObject::tr("%1 — no longer the head").arg(nm); }, false); vp->refreshSceneBox(); vp->sceneChanged(false); });
-      v->addWidget(hc);
     }
     // the display only: flat faces by default; an export is smooth either way
     std::vector<int> ms; for (int x : S.items) if (const Item* o = sc->item(x); o && o->type == it->type) ms.push_back(x);
@@ -454,9 +521,9 @@ QWidget* buildPropsPanel(Viewport* vp, Scene* sc, int pinned) {
         return fixed ? QObject::tr("Clean geometry: %1 mesh%2 made manifold (%3 changes)").arg(fixed).arg(fixed == 1 ? "" : "es").arg(changes) : QObject::tr("Clean geometry: nothing to clean — already manifold"); }); });
       v->addWidget(cb); }
     if (it->type == ItemType::IMesh) imeshExtras(v, vp, sc, iid);   // (polygroups, Thickness & mask, its modifiers)
-    if (!it->raw.value("pending").toBool() && !meshmods::heavy(*it)) { auto* mc = button(QObject::tr("〰 Mesh → curves & surfaces"), QObject::tr("Curves along the mesh's locks and walls between them"));
+    if (!it->raw.value("pending").toBool()) { auto* mc = button(QObject::tr("〰 Mesh → curves & surfaces"), QObject::tr("Curves along the mesh's locks and walls between them"));
       QObject::connect(mc, &QPushButton::clicked, vp, [vp, iid] { vp->meshToCurves(iid); }); v->addWidget(mc, 0, Qt::AlignLeft); }
-  } else if (it->type == ItemType::Tip || it->type == ItemType::PInf || it->type == ItemType::Even || it->type == ItemType::Guide) {
+  } else if (it->type == ItemType::Tip || it->type == ItemType::PInf || it->type == ItemType::Spiral || it->type == ItemType::Even || it->type == ItemType::Guide) {
     shellModProps(v, vp, sc, iid);
   } else if (it->type == ItemType::Crown) {
     crownProps(v, vp, sc, iid);

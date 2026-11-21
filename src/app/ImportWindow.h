@@ -7,6 +7,8 @@
 #pragma once
 #include <QStringList>
 
+class QIcon;
+
 namespace hm {
 
 class Viewport;
@@ -16,5 +18,7 @@ void openImportWindow(Viewport* vp, Scene* sc, const QStringList& files = {}, bo
 void importWindowShot(Viewport* vp, Scene* sc, const QStringList& files, const QString& png);   // (the test harness)
 // the import / export windows' look (shared)
 const char* ioWindowStyle();
+// a primitive's drawn picture (the import window's row, the collision objects' shape tiles)
+QIcon primitiveIcon(const QString& type);
 
 }  // namespace hm

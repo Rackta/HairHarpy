@@ -1,14 +1,19 @@
-﻿// The Topology room in the viewport (the HTML version's rooms + "Topology room: modes, Cursor, polygroups"): the room
+// The Topology room in the viewport (the HTML version's rooms + "Topology room: modes, Cursor, polygroups"): the room
 // switch (each room a scene of its own, Meshes shared), the modes, the Cursor — LMB one element, Shift add, Ctrl
 // deselect (a drag — a box), double click the loop (a polygon inside a closed frame of selected ones — everything
 // inside), Ctrl+Shift the shortest path (Object mode: the polygroup under the cursor), a drag on empty space a box; a
 // drag on an element moves the selection across the screen; the gizmo on the selection; what is drawn over the active
 // mesh. Snap (the other meshes' surface, their masks) and Symmetry (the mesh's own X = 0) after every move.
+#include <chrono>
+#include <thread>
+#include <atomic>
 #include "io/ProjectIO.h"
 #include "scene/MeshMods.h"
+#include "scene/OuterShell.h"
 #include "scene/Uv.h"
 #include "ui/Pie.h"
 #include "view/Viewport.h"
+#include <QGuiApplication>
 #include <QDateTime>
 #include <QElapsedTimer>
 #include <QCoreApplication>
@@ -44,15 +49,49 @@ std::set<int> Viewport::sharedIds(const std::map<int, Item>& items) const {
   return ids;
 }
 
+// the Hair room's hair, shown in the Topology room as the HairPreview folder: its items and anchors are in the scene there
+// (so that the hair builds, hides, moves and is brushed as in its room) and go back to Hair's own when the room is left
+void Viewport::hairPreviewFlush(RoomState& cur) {
+  auto h = rooms_.find("hair");
+  if (h != rooms_.end() && h->second.valid && h->first != room()) {
+    for (int id : hpvItems_) if (const Item* it = scene_->item(id)) h->second.items[id] = *it;
+    for (int id : hpvAnchors_) if (const Anchor* a = scene_->anchor(id)) h->second.anchors[id] = *a;
+  }
+  auto strip = [&](std::map<int, Item>& items, std::map<int, Anchor>& anchors, std::vector<int>& roots) {
+    for (int id : hpvItems_) items.erase(id); for (int id : hpvAnchors_) anchors.erase(id);
+    roots.erase(std::remove_if(roots.begin(), roots.end(), [&](int r) { return hpvItems_.count(r) > 0; }), roots.end()); };
+  strip(cur.items, cur.anchors, cur.roots);
+  for (int id : hpvItems_) cur.sel.items.erase(std::remove(cur.sel.items.begin(), cur.sel.items.end(), id), cur.sel.items.end());
+  cur.sel.anchors.erase(std::remove_if(cur.sel.anchors.begin(), cur.sel.anchors.end(), [&](int a) { return hpvAnchors_.count(a) > 0; }), cur.sel.anchors.end());
+  for (Snapshot& s : cur.hist) { strip(s.items, s.anchors, s.roots);
+    for (int id : hpvItems_) s.sel.items.erase(std::remove(s.sel.items.begin(), s.sel.items.end(), id), s.sel.items.end());
+    s.sel.anchors.erase(std::remove_if(s.sel.anchors.begin(), s.sel.anchors.end(), [&](int a) { return hpvAnchors_.count(a) > 0; }), s.sel.anchors.end()); }
+  hpvItems_.clear(); hpvAnchors_.clear(); hairSig_ = 0;
+}
+
+void Viewport::hairPreviewAdd(std::map<int, Item>& items, std::map<int, Anchor>& anchors, std::vector<int>& roots) {
+  hpvItems_.clear(); hpvAnchors_.clear(); hairSig_ = 0;
+  auto h = rooms_.find("hair"); if (h == rooms_.end() || !h->second.valid) return;
+  const RoomState& H = h->second; const std::set<int> msh = sharedIds(H.items);
+  auto inColl = [&](const Item& x) { for (const Item* p = &x; p;) { if (coll::isGroup(*p)) return true; auto f = H.items.find(p->parent); p = f == H.items.end() ? nullptr : &f->second; } return false; };
+  for (auto& [id, it] : H.items) {
+    if (msh.count(id) || it.type == ItemType::IMesh || it.type == ItemType::Mesh || it.type == ItemType::Head || inColl(it)) continue;   // (Head Collision stays in the Hair room)
+    if (items.emplace(id, it).second) hpvItems_.insert(id);
+  }
+  for (auto& [id, a] : H.anchors) if (anchors.emplace(id, a).second) hpvAnchors_.insert(id);
+  for (int r : H.roots) if (hpvItems_.count(r)) roots.push_back(r);
+}
+
 void Viewport::switchRoom(const QString& name) {
-  if (name == room() || (name != "hair" && name != "topo")) return;
+  if (name == room() || (name != "hair" && name != "topo" && name != "paint")) return;
   if (drawing_ >= 0) finishDrawing();
   if (ui::Pie::current()) ui::Pie::closeCurrent();
   if (scut_) cancelSurfCut();
-  drag_ = Drag::None; td_ = {}; tgz_ = {};
+  drag_ = Drag::None; td_ = {}; tgz_ = {}; tgzX_.clear();
   RoomState& cur = rooms_[room()];
   cur.valid = true; cur.items = scene_->items; cur.anchors = scene_->anchors; cur.roots = scene_->roots;
   cur.hist = history_; cur.idx = histIdx_; cur.sel = sel_; cur.tool = tool_; cur.counters = scene_->fileRaw.value("counters");
+  if (room() == "topo") hairPreviewFlush(cur);               // (the hair shown there goes back to the Hair room — as it was moved, hidden, brushed)
   const std::set<int> sh = sharedIds(scene_->items); int sg = -1;
   for (int id : sh) if (const Item* it = scene_->item(id); it && it->type == ItemType::Group && it->raw.value("meshesGroup").toBool()) sg = id;
   RoomState T = rooms_[name];
@@ -62,34 +101,41 @@ void Viewport::switchRoom(const QString& name) {
   for (int id : sh) if (const Item* it = scene_->item(id)) items.emplace(id, *it);
   std::vector<int> roots; if (sg >= 0 && std::find(scene_->roots.begin(), scene_->roots.end(), sg) != scene_->roots.end()) roots.push_back(sg);
   for (int r : T.roots) if (!mine.count(r) && !sh.count(r) && items.count(r)) roots.push_back(r);
-  scene_->items = std::move(items); scene_->anchors = T.anchors; scene_->roots = roots; scene_->room = name;
+  std::map<int, Anchor> anchors = T.anchors;
+  if (name == "topo") {                                      // (the Hair room's hair: in the scene, as the HairPreview folder; the room's undo steps hold it as it is now)
+    hairPreviewAdd(items, anchors, roots);
+    for (Snapshot& s : T.hist) { for (int id : hpvItems_) s.items[id] = items.at(id); for (int id : hpvAnchors_) s.anchors[id] = anchors.at(id);
+      for (int r : roots) if (hpvItems_.count(r) && std::find(s.roots.begin(), s.roots.end(), r) == s.roots.end()) s.roots.push_back(r); }
+  }
+  scene_->items = std::move(items); scene_->anchors = std::move(anchors); scene_->roots = roots; scene_->room = name; meshmods::paintVis = name == "paint"; pvRev_++;
   if (T.counters.isObject()) scene_->fileRaw.insert("counters", T.counters); else if (name != "hair") scene_->fileRaw.insert("counters", QJsonObject());
   if (scene_->iso) scene_->iso.reset();                      // (an isolation starts over in the other room)
-  tgIso_.reset(); tcIso_.reset(); tsel_ = {}; tgPick = {}; tgSel = {}; tgList = {}; thov_ = {}; tgHover_ = {};
+  tgIso_.reset(); tcIso_.reset(); tsel_ = {}; selVC_ = {}; tgPick = {}; tgSel = {}; tgList = {}; thov_ = {}; tgHover_ = {};   // (selVC_: keyed by tsel_.ver, which starts over here)
   sel_ = {}; for (int id : T.sel.items) if (scene_->item(id)) sel_.items.push_back(id);
   for (int a : T.sel.anchors) if (scene_->anchor(a)) sel_.anchors.push_back(a);
   scene_->reindex(); scene_->revision++;
   history_ = T.hist; histIdx_ = T.idx;
   if (histIdx_ < 0 || history_.empty()) { history_ = {snapshot()}; histIdx_ = 0; history_[0].label = tr("Project opened"); history_[0].weak = false; }   // (a room's first visit: its starting point)
-  if (name == "topo") topoMode = "object";
+  if (name != "hair") topoMode = "object";
   if (name == "hair") { uvParked_.clear(); for (int i = 0; i < 4; i++) if (paneCamera(i).view == "uv") { uvParked_.push_back(i); setPaneView(i, "persp"); } }
   else { for (int i : uvParked_) if (!uvPaneShown()) setPaneView(i, "uv"); uvParked_.clear(); }   // (one UV Editor at most)
   QString tool = T.valid ? T.tool : QString("cursor");
-  if (name == "topo" && tool != "cursor" && tool != "move" && tool != "rotate" && tool != "gizmo" && tool != "tmask") tool = "cursor";
-  if (name == "hair" && tool == "tmask") tool = "cursor";
+  if (name != "hair" && tool != "cursor" && tool != "move" && tool != "rotate" && tool != "gizmo" && (name == "paint" || tool != "tmask")) tool = "cursor";
+  if (name != "topo" && tool == "tmask") tool = "cursor";
+  if (name == "paint") tool = "cursor";                      // (the Paint room: the brush is its tool — the meshes are not moved there)
   tool_.clear(); setTool(tool);
-  meshSig_.clear(); pickCache_.clear(); bvhCache_.clear();
+  meshSig_.clear(); pickCache_.clear(); bvhCache_.clear(); for (auto& [k, s] : shellCache_) if (s.state) s.state->store(2); shellCache_.clear();
   reloadHair(); staticRev_++; topoRev_++;
   emit sceneEdited(); onSelChange();
   emit roomChanged(name);
-  ui::toast(name == "topo" ? tr("Topology room") : tr("Hair room"));
+  ui::toast(name == "topo" ? tr("Topology room") : name == "paint" ? tr("Paint room") : tr("Hair room"));
 }
 
 void Viewport::loadRooms() {
-  rooms_.clear(); scene_->room = "hair"; tsel_ = {}; tgPick = {}; tgSel = {}; tgList = {}; tgIso_.reset(); tcIso_.reset();
+  rooms_.clear(); hpvItems_.clear(); hpvAnchors_.clear(); hairSig_ = 0; scene_->room = "hair"; tsel_ = {}; selVC_ = {}; tgPick = {}; tgSel = {}; tgList = {}; tgIso_.reset(); tcIso_.reset();
   const QJsonObject R = scene_->fileRaw.value("rooms").toObject();
   for (auto it = R.begin(); it != R.end(); ++it) {
-    if (it.key() == "hair" || it.key() != "topo") continue;
+    if (it.key() != "topo" && it.key() != "paint") continue;
     QJsonObject d = it.value().toObject(); RoomState S; S.valid = true; LoadResult res; int order = scene_->nextOrder;
     for (const QJsonValue& v : d.value("items").toArray()) { Item x = itemFromJson(v.toObject(), scene_->path, res); x.order = order++; S.items.emplace(x.id, std::move(x)); }
     for (const QJsonValue& v : d.value("anchors").toArray()) { Anchor a = anchorFromJson(v.toObject()); S.anchors.emplace(a.id, a); }
@@ -104,12 +150,13 @@ void Viewport::loadRooms() {
 // P.rooms: the room shown now from the scene, the others from what they keep (their Meshes left out — kept with Hair)
 QJsonObject Viewport::roomsJson() const {
   QJsonObject out;
-  for (const QString name : {QString("topo")}) {
+  for (const QString name : {QString("topo"), QString("paint")}) {
     Scene tmp; tmp.fileRaw = scene_->fileRaw; tmp.path = scene_->path;
     if (name == room()) { tmp.items = scene_->items; tmp.anchors = scene_->anchors; tmp.roots = scene_->roots; }
     else { auto f = rooms_.find(name); if (f == rooms_.end() || !f->second.valid) continue;
       tmp.items = f->second.items; tmp.anchors = f->second.anchors; tmp.roots = f->second.roots; tmp.fileRaw.insert("counters", f->second.counters); }
     std::set<int> sh = sharedIds(tmp.items);
+    if (name == room()) { for (int id : hpvItems_) sh.insert(id); for (int id : hpvAnchors_) tmp.anchors.erase(id); }   // (the Hair room's hair shown here is kept with Hair)
     for (int id : sh) tmp.items.erase(id);
     tmp.roots.erase(std::remove_if(tmp.roots.begin(), tmp.roots.end(), [&](int r) { return sh.count(r) > 0; }), tmp.roots.end());
     out.insert(name, roomRecord(tmp));
@@ -126,7 +173,11 @@ void Viewport::hairItemsFor(Scene& out) const {
   std::map<int, Item> items; for (auto& [id, it] : H.items) if (!mine.count(id) && !sh.count(id)) items.emplace(id, it);
   for (int id : sh) items.emplace(id, *scene_->item(id));
   std::vector<int> roots; if (sg >= 0) roots.push_back(sg); for (int r : H.roots) if (!mine.count(r) && !sh.count(r) && items.count(r)) roots.push_back(r);
-  out.items = std::move(items); out.anchors = H.anchors; out.roots = roots;
+  out.anchors = H.anchors;
+  if (room() == "topo") {                                    // (the hair shown there, as it is moved / hidden / brushed now)
+    for (int id : hpvItems_) if (const Item* it = scene_->item(id)) items[id] = *it;
+    for (int id : hpvAnchors_) if (const Anchor* a = scene_->anchor(id)) out.anchors[id] = *a; }
+  out.items = std::move(items); out.roots = roots;
   if (H.counters.isObject()) out.fileRaw.insert("counters", H.counters);
 }
 
@@ -141,12 +192,12 @@ int Viewport::topoMesh() const {
   for (auto it = sel_.items.rbegin(); it != sel_.items.rend(); ++it) if (const Item* m = scene_->item(*it); m && m->type == ItemType::IMesh) return m->poly && scene_->isVisible(*m) ? *it : -1;
   return -1;
 }
-bool Viewport::topoHeavy(int m) const { const Item* it = scene_->item(m); return it && meshmods::heavy(*it); }
 
 void Viewport::setTopoMode(const QString& k0, bool quiet) {
   if (drag_ == Drag::Topo) return;
   QString k = k0;
-  if (k != "object" && topoHeavy(topoMesh())) { if (!quiet) ui::toast(tr("A high-poly mesh (over 300 000 triangles) is not edited — Object mode only")); k = "object"; }
+  
+  if (k != topoMode) tselX_.clear();                            // (the other meshes' picks are of the old mode)
   topoMode = k; thov_ = {}; if (k != "object") lastEditMode_ = k;
   if (k != "object" && topoMesh() < 0 && !quiet) ui::toast(tr("Select a mesh first — its %1 are picked then").arg(k == "poly" ? tr("polygons") : k == "edge" ? tr("edges") : tr("vertices")));
   updateGizmo(); staticRev_++; topoRev_++; emit topoState(); requestUpdate();
@@ -155,14 +206,65 @@ void Viewport::setTopoMode(const QString& k0, bool quiet) {
 void Viewport::tselApply(int m, const std::vector<int>& list, const QString& op, char key, bool sym) {
   ProfScope prof_("tselApply");
   if (!key) key = tKey();
-  if (tsel_.id != m) { int ver = tsel_.ver + 1; tsel_ = {}; tsel_.id = m; tsel_.ver = ver; if (const Item* it = scene_->item(m)) tsel_.B = baseOf(*it); }
+  if (tsel_.id != m) tselActivate(m);
   std::set<int>& s = key == 'f' ? tsel_.f : key == 'e' ? tsel_.e : tsel_.v;
-  std::vector<int> mir; if (sym && tset.sym && room() == "topo" && !list.empty()) mir = tSymList(m, list, key);   // (Symmetry: the mirrored ones too)
+  std::vector<int> mir; if (sym && tset.sym && !uvPicking_ && room() == "topo" && !list.empty()) mir = tSymList(m, list, key);   // (Symmetry: the mirrored ones too)
   if (op == "set") { s.clear(); s.insert(list.begin(), list.end()); s.insert(mir.begin(), mir.end()); }
   else for (const std::vector<int>* L : std::initializer_list<const std::vector<int>*>{&list, &mir}) { auto h = s.end(); for (int x : *L) { if (op == "add") h = std::next(s.insert(h, x)); else s.erase(x); } }   // (hinted: a polygroup's sorted list goes in at once)
+  if (!uvPicking_) tsel_.eSide.clear();                        // (a pick outside the UV Editor: the sides noted there no longer hold)
   tsel_.ver++; topoRev_++; updateGizmo(); emit topoState(); requestUpdate(); tselNote();
 }
-void Viewport::tselClear() { tsel_.f.clear(); tsel_.e.clear(); tsel_.v.clear(); tsel_.last = -1; tsel_.ver++; topoRev_++; updateGizmo(); emit topoState(); requestUpdate(); tselNote(); }
+// the selection of mesh m made the active one; the previous active one is kept aside while both are still selected (several meshes edited at once)
+void Viewport::tselActivate(int m) {
+  if (tsel_.id == m) return;
+  const int ver = tsel_.ver + 1;
+  if (tsel_.id >= 0 && sel_.hasItem(tsel_.id) && sel_.hasItem(m) && (!tsel_.f.empty() || !tsel_.e.empty() || !tsel_.v.empty())) tselX_[tsel_.id] = tsel_;
+  TSel n; n.id = m; if (auto f = tselX_.find(m); f != tselX_.end()) { n = f->second; tselX_.erase(f); }
+  if (const Item* it = scene_->item(m)) { const PolyMesh* B = baseOf(*it); if (n.B && B && n.B != B && (n.B->pos.size() != B->pos.size() || n.B->faceCount() != B->faceCount())) { n.f.clear(); n.e.clear(); n.v.clear(); n.eSide.clear(); n.last = -1; } n.B = B; }
+  n.ver = ver; tsel_ = n;
+}
+void Viewport::tselPrune() {
+  for (auto it = tselX_.begin(); it != tselX_.end();) { if (!sel_.hasItem(it->first) || !scene_->item(it->first) || (it->second.f.empty() && it->second.e.empty() && it->second.v.empty())) it = tselX_.erase(it); else ++it; }
+}
+std::vector<int> Viewport::tselTargets() const {
+  std::vector<int> o; const int a = topoMesh(); if (a < 0) return o;
+  o.push_back(a);
+  for (int id : sel_.items) if (id != a) if (const Item* it = scene_->item(id); it && it->type == ItemType::IMesh && it->poly && scene_->isVisible(*it) && !it->raw.value("tref").toBool()) o.push_back(id);
+  return o;
+}
+QString Viewport::tEachMesh(const std::function<QString()>& op, bool every) {   // (every: the meshes with nothing picked take part too — the whole of each)
+  const auto ms = every ? tselTargets() : tselMeshes(); if (ms.size() < 2) return op();
+  std::map<int, TSel> all = tselX_; if (tsel_.id >= 0) all[tsel_.id] = tsel_;
+  const std::vector<int> order = sel_.items; QString ok, bad; int n = 0; const int h0 = histIdx_;   // (the history before: the edits on each mesh made one step after)
+  eachBusy_ = true;
+  for (int id : ms) {
+    if (every && !all.count(id)) { TSel e0; e0.id = id; all[id] = e0; }
+    auto f = all.find(id); if (f == all.end() || !scene_->item(id)) continue;
+    tselX_.clear(); tsel_ = f->second; tsel_.id = id;
+    sel_.items.erase(std::remove(sel_.items.begin(), sel_.items.end(), id), sel_.items.end()); sel_.items.push_back(id);
+    const QString r = op(); n++;
+    if (r.startsWith('!')) bad = r; else ok = r;
+    if (scene_->item(id) && tsel_.id == id && (!tsel_.f.empty() || !tsel_.e.empty() || !tsel_.v.empty())) all[id] = tsel_; else all.erase(id);
+  }
+  eachBusy_ = false; histMerge(h0);                              // (one Ctrl+Z undoes it on all of them)
+  std::vector<int> keep; for (int id : order) if (scene_->item(id)) keep.push_back(id);
+  for (int id : sel_.items) if (std::find(keep.begin(), keep.end(), id) == keep.end() && scene_->item(id)) keep.push_back(id);   // (a mesh the edit made: picked too)
+  sel_.items = keep;
+  tselX_.clear(); for (auto& [id, s] : all) if (sel_.hasItem(id)) tselX_[id] = s;
+  const int a = topoMesh(); tsel_ = {}; tsel_.id = a; selVC_ = {};   // (the version below may go back: the cached vertices dropped)
+  if (auto f = tselX_.find(a); f != tselX_.end()) { tsel_ = f->second; tselX_.erase(f); }
+  if (const Item* ai = a >= 0 ? scene_->item(a) : nullptr) tsel_.B = baseOf(*ai);
+  tsel_.ver++; topoRev_++; thov_ = {}; updateGizmo(); emit topoState();
+  if (!ok.isEmpty() && n > 1) { ui::toast(tr("%1 meshes: %2").arg(n).arg(ok)); }
+  return ok.isEmpty() ? bad : ok;
+}
+std::vector<int> Viewport::tselMeshes() const {
+  std::vector<int> o; const int a = topoMesh();
+  if (a >= 0 && tsel_.id == a && (!tsel_.f.empty() || !tsel_.e.empty() || !tsel_.v.empty())) o.push_back(a);
+  for (const auto& [id, s] : tselX_) if (id != a && sel_.hasItem(id) && (!s.f.empty() || !s.e.empty() || !s.v.empty())) o.push_back(id);
+  return o;
+}
+void Viewport::tselClear() { tselX_.clear(); tsel_.f.clear(); tsel_.e.clear(); tsel_.v.clear(); tsel_.eSide.clear(); tsel_.last = -1; tsel_.ver++; topoRev_++; updateGizmo(); emit topoState(); requestUpdate(); tselNote(); }
 // Ctrl+I: the selection turned inside out — every component of the mode not picked (the hidden left); Object — the meshes
 QString Viewport::tInvertSel() {
   if (room() != "topo") return {};
@@ -180,11 +282,14 @@ QString Viewport::tInvertSel() {
 QString Viewport::tSelectAll() {
   if (room() != "topo") return {};
   if (topoMode == "object") { sel_ = {}; sel_.items = topoMeshes(); onSelChange(); return tr("All meshes"); }
-  const int m = topoMesh(); const Item* it = m >= 0 ? scene_->item(m) : nullptr; if (!it) return "!";
-  auto T = topo::ttopo(baseSp(*it)); const std::vector<char> hid = meshmods::hiddenFaces(*it, *baseSp(*it)); const char key = tKey(); std::set<int> out;
-  for (int f = 0; f < T->nf; f++) { if (!hid.empty() && hid[size_t(f)]) continue;
-    if (key == 'f') out.insert(f); else for (int k = T->fo[size_t(f)]; k < T->fo[size_t(f) + 1]; k++) out.insert(key == 'e' ? T->ce[size_t(k)] : T->fv[size_t(k)]); }
-  tselApply(m, {out.begin(), out.end()}, "set", key); ui::hud(tr("All: %1").arg(out.size()), 900); return {};
+  const int m = topoMesh(); if (m < 0 || !scene_->item(m)) return "!";
+  size_t total = 0; const char key = tKey();
+  for (int id : tselTargets()) {                                // (every selected mesh: all of its elements — each keeps its own)
+    const Item* it = scene_->item(id); auto T = topo::ttopo(baseSp(*it)); const std::vector<char> hid = meshmods::hiddenFaces(*it, *baseSp(*it)); std::set<int> out;
+    for (int f = 0; f < T->nf; f++) { if (!hid.empty() && hid[size_t(f)]) continue;
+      if (key == 'f') out.insert(f); else for (int k = T->fo[size_t(f)]; k < T->fo[size_t(f) + 1]; k++) out.insert(key == 'e' ? T->ce[size_t(k)] : T->fv[size_t(k)]); }
+    tselApply(id, {out.begin(), out.end()}, "set", key); total += out.size(); }
+  tselActivate(m); ui::hud(tr("All: %1").arg(total), 900); return {};
 }
 
 std::vector<int> Viewport::tSelVerts(int m, char key) const {
@@ -202,7 +307,7 @@ std::vector<int> Viewport::tSelVerts(int m, char key) const {
 int Viewport::tSelectFaces(int m, const std::vector<int>& faces, const QString& op) {
   const Item* it = scene_->item(m); if (!it) return 0;
   if (sel_.items.size() != 1 || sel_.items[0] != m) { sel_ = {}; sel_.items = {m}; onSelChange(); }
-  if (topoHeavy(m)) { tselApply(m, faces, op, 'f'); return int(faces.size()); }
+  
   if (topoMode == "object") setTopoMode("poly");
   auto T = topo::ttopo(baseSp(*it)); const char key = tKey(); std::set<int> out;
   if (key == 'f') out.insert(faces.begin(), faces.end());
@@ -214,7 +319,7 @@ int Viewport::tSelectFaces(int m, const std::vector<int>& faces, const QString& 
 bool Viewport::topoDeselect() {
   if (room() != "topo") return false;
   if (topoMode != "object") { if (tsel_.f.size() + tsel_.e.size() + tsel_.v.size()) tselClear(); return true; }
-  if (!tgPick.set.empty() || (topoHeavy(topoMesh()) && !tsel_.f.empty())) { if (tsel_.id >= 0) tselApply(tsel_.id, {}, "set", 'f'); tgPick.set.clear(); topoRev_++; emit topoState(); return true; }
+  if (!tgPick.set.empty()) { if (tsel_.id >= 0) tselApply(tsel_.id, {}, "set", 'f'); tgPick.set.clear(); topoRev_++; emit topoState(); return true; }
   if (!sel_.empty()) { sel_ = {}; onSelChange(); }
   return true;
 }
@@ -223,7 +328,7 @@ bool Viewport::topoEscape() {
   if (tool_ == "tmask") { setTool("cursor"); return true; }
   bool any = false;
   if (topoMode != "object" && tsel_.f.size() + tsel_.e.size() + tsel_.v.size()) { tselClear(); any = true; }
-  if (topoMode == "object" && (!tgPick.set.empty() || (topoHeavy(topoMesh()) && !tsel_.f.empty()))) { if (tsel_.id >= 0) tselApply(tsel_.id, {}, "set", 'f'); tgPick.set.clear(); topoRev_++; emit topoState(); any = true; }
+  if (topoMode == "object" && (!tgPick.set.empty())) { if (tsel_.id >= 0) tselApply(tsel_.id, {}, "set", 'f'); tgPick.set.clear(); topoRev_++; emit topoState(); any = true; }
   return any;
 }
 
@@ -237,6 +342,8 @@ std::set<int> Viewport::smPickedGroups(int m) const {
     for (qint64 id : tgList.set) if (topo::TgNode* n = topo::tgFind(tree, id)) for (int g : topo::tgUnder(*n)) gs.insert(g);
   }
   if (gs.empty() && tgSel.id == m && tgSel.gi >= 0) gs.insert(tgSel.gi);
+  // (a pick made before a polygroup was deleted / merged / detached names a number the mesh no longer has: left out — the callers index the names with it)
+  for (auto i = gs.begin(); i != gs.end();) { if (*i < 0 || *i >= int(B->groupNames.size())) i = gs.erase(i); else ++i; }
   return gs;
 }
 
@@ -267,6 +374,12 @@ const topo::Bvh* Viewport::pickBvhOf(int m) const {
 }
 
 // the polygon under the cursor, its nearest edge and corner on the screen
+std::pair<int, int> Viewport::pickMeshFace(const QPointF& wp) const {
+  std::vector<int> list; for (auto& [id, it] : scene_->items) if (it.type == ItemType::IMesh && it.poly && scene_->isVisible(it)) list.push_back(id);
+  const auto r = tPick(wp - paneOrigin(), list); if (!r) return {-1, -1};
+  return {r->m, r->f};
+}
+
 std::optional<Viewport::TopoPick> Viewport::tPick(const QPointF& mp, const std::vector<int>& list) const {
   ProfScope prof_("tPick");
   std::vector<PickMesh> pms; std::vector<int> ids;
@@ -300,9 +413,6 @@ std::optional<Viewport::TopoPick> Viewport::tPick(const QPointF& mp, const std::
 
 // the elements of the active mesh inside the screen box that are seen — not hidden by the mesh's own polygons (a
 // polygon seen from behind counts: one-sided cards show both sides); X-ray ≥ 0.5 or Select through — all
-std::vector<int> Viewport::tBoxPick(int m, double x0, double y0, double x1, double y1, char key) const {
-  return tAreaPick(m, x0, y0, x1, y1, key, [](double, double) { return true; });
-}
 std::vector<int> Viewport::tAreaPick(int m, double x0, double y0, double x1, double y1, char key, const std::function<bool(double, double)>& in) const {
   const Item* it = scene_->item(m); if (!it || !it->poly) return {};
   auto B = baseSp(*it); auto T = topo::ttopo(B); const auto& P = it->poly->pos; const std::vector<char> hid = meshmods::hiddenFaces(*it, *B);
@@ -352,14 +462,17 @@ bool Viewport::topoPress(QMouseEvent* e) {
   }
   // the move brush: LMB a stroke (Shift — smooth, Shift+Ctrl — relax); Ctrl+RMB drag — its size
   if (tool_ == "treveal" && e->button() == Qt::RightButton && ctrl) { bd_ = {}; bd_.start = mp; bd_.r0 = brushR; bd_.h0 = brushHard; drag_ = Drag::BrushAdjust; return true; }   // (the Reveal Brush: Ctrl+RMB drag — its size, as the brushes)
-  if (tool_ == "tbrush" && e->button() == Qt::RightButton && !ctrl && !shift) { tbModePie(e->globalPosition().toPoint()); return true; }   // (RMB: the brush's modes)
+  if (tool_ == "tbrush" && e->button() == Qt::RightButton && !ctrl) {   // (RMB: the brush's own stroke, along the normals — Move: each vertex along its normal, not the screen's plane)
+    if (hairBrushSel()) { startBrush(mp, shift); return true; }
+    tbPress(mp, shift, false, -1, 0, -1, true); return true; }
   if (tool_ == "tbrush" && (e->button() == Qt::LeftButton || (e->button() == Qt::RightButton && ctrl))) {
     if (e->button() == Qt::RightButton) { bd_ = {}; bd_.start = mp; bd_.r0 = brushR; bd_.h0 = brushHard; drag_ = Drag::BrushAdjust; return true; }
+    if (hairBrushSel()) { if (ctrl) startInflate(mp, 1); else startBrush(mp, shift); return true; }   // (the HairPreview selected: the hair brush on its curves)
     tbPress(mp, shift, ctrl); return true;
   }
   if (isModelTool() && e->button() == Qt::LeftButton && topoToolPress(e)) return true;   // (the modelling tools)
   if (e->button() != Qt::LeftButton) return e->button() == Qt::RightButton && !shift;   // (RMB: nothing of the hair tools here)
-  if (tool_ != "cursor" && tool_ != "move" && tool_ != "rotate" && tool_ != "gizmo" && tool_ != "tchain" && tool_ != "tweld" && tool_ != "tshaper" && tool_ != "tslide" && tool_ != "tnormals" && tool_ != "tbridge" && tool_ != "tmirror" && tool_ != "tfixmesh" && tool_ != "toptimize") return true;
+  if (tool_ != "cursor" && tool_ != "move" && tool_ != "rotate" && tool_ != "gizmo" && tool_ != "tchain" && tool_ != "tweld" && tool_ != "tshaper" && tool_ != "tslide" && tool_ != "tnormals" && tool_ != "tbridge" && tool_ != "tmirror" && tool_ != "tfixmesh" && tool_ != "toptimize" && tool_ != "tmodgroups" && tool_ != "tsubdiv") return true;
   if ((tool_ == "move" || tool_ == "rotate" || tool_ == "gizmo") && gizmoPress(mp, ctrl && !shift)) return true;   // (the gizmo's handle takes it; Ctrl — extruded first)
   // (Scale + Ctrl, a drag anywhere off its handles: polygons inserted — the selection inset in place, then scaled evenly
   // about its middle: Ctrl+drag in — a ring of new polygons round it)
@@ -408,7 +521,8 @@ bool Viewport::topoPress(QMouseEvent* e) {
     ui::toast(tr("Click a mesh to edit it")); return true; }
   if (!r) { box(ctrl ? "remove" : shift ? "add" : "set"); if (ctrl && td_.type == 7) td_.clearAll = true; return true; }   // (Ctrl + a stroke over empty space: everything deselected)   // (Ctrl over empty space: the selection off — the brush only; Rectangle / Lasso: Ctrl takes off what they hold)
   const int m = r->m; const char key = tKey(); const int el = key == 'f' ? r->f : key == 'e' ? r->e : r->v;
-  if (tsel_.id != m) tselApply(m, {}, "set");
+  if (m != topoMesh()) { sel_.items.erase(std::remove(sel_.items.begin(), sel_.items.end(), m), sel_.items.end()); sel_.items.push_back(m); onSelChange(); }   // (another selected mesh picked from: it becomes the active one)
+  if (tsel_.id != m) tselActivate(m);
   std::set<int>& sel = key == 'f' ? tsel_.f : key == 'e' ? tsel_.e : tsel_.v;
   const qint64 now = QDateTime::currentMSecsSinceEpoch();
   const bool dbl = tclick_.id == m && tclick_.key == key && tclick_.el == el && now - tclick_.t < 400;
@@ -449,8 +563,8 @@ void Viewport::topoDouble(int m, const TopoPick& r, char key, int a, const std::
       for (int k = T->fo[size_t(f)]; k < T->fo[size_t(f) + 1]; k++) { int e = T->ce[size_t(k)], g = T->ef0[size_t(e)] == f ? T->ef1[size_t(e)] : T->ef0[size_t(e)];
         if (g >= 0 && !seen[size_t(g)] && (hid.empty() || !hid[size_t(g)])) { seen[size_t(g)] = 1; st.push_back(g); } } }
     tselApply(m, L, "add"); ui::hud(tr("Piece: %1 polygon%2").arg(L.size()).arg(L.size() == 1 ? "" : "s"), 1200);
-  } else if (key == 'e') { auto L = topo::edgeLoop(*T, r.e); tselApply(m, L, "add"); ui::hud(tr("Edge loop: %1").arg(L.size()), 1200); }
-  else { auto L = topo::edgeLoop(*T, r.e); std::set<int> vs; for (int e : L) { vs.insert(T->ea[size_t(e)]); vs.insert(T->eb[size_t(e)]); } tselApply(m, {vs.begin(), vs.end()}, "add"); ui::hud(tr("Vertex loop: %1").arg(vs.size()), 1200); }
+  } else if (r.e >= 0) {                                        // (an edge / vertex loop: the Loop tool's walk — it stops where its Stop options say: before selected, an n-gon, tris, a seam, a crease)
+    auto L = tLoopOf(m, r, QPointF(), false); tselApply(m, L, "add"); ui::hud((key == 'e' ? tr("Edge loop: %1") : tr("Vertex loop: %1")).arg(L.size()), 1200); }
   tsel_.last = key == 'f' ? r.f : key == 'e' ? r.e : r.v;
 }
 
@@ -458,7 +572,7 @@ bool Viewport::topoDblClick(QMouseEvent*) { return room() == "topo"; }   // (the
 
 void Viewport::topoHover(const QPointF& mp, Qt::KeyboardModifiers mods) {
   if (tool_ == "tbrush") { overlayRev_++; requestUpdate(); return; }   // (the brush: its circles drawn with the overlay at the pointer)
-  const bool over = (tool_ == "cursor" || tool_ == "move" || tool_ == "rotate" || tool_ == "gizmo" || tool_ == "tchain" || tool_ == "tweld" || tool_ == "tshaper" || tool_ == "tslide" || tool_ == "tnormals" || tool_ == "tbridge" || tool_ == "tmirror" || tool_ == "tfixmesh" || tool_ == "toptimize") && !ui::Pie::current();
+  const bool over = (tool_ == "cursor" || tool_ == "move" || tool_ == "rotate" || tool_ == "gizmo" || tool_ == "tchain" || tool_ == "tweld" || tool_ == "tshaper" || tool_ == "tslide" || tool_ == "tnormals" || tool_ == "tbridge" || tool_ == "tmirror" || tool_ == "tfixmesh" || tool_ == "toptimize" || tool_ == "tmodgroups" || tool_ == "tsubdiv") && !ui::Pie::current();
   // Object mode, Ctrl+Shift over the selected mesh: its polygroup under the cursor lights up
   if (over && topoMode == "object" && (mods & Qt::ControlModifier) && (mods & Qt::ShiftModifier)) {
     int am = topoMesh(); auto r = am >= 0 ? tPick(mp, {am}) : std::nullopt;
@@ -471,14 +585,14 @@ void Viewport::topoHover(const QPointF& mp, Qt::KeyboardModifiers mods) {
   if (over && tool_ == "cursor" && (tset.selTool == "fill" || tset.selTool == "outline" || tset.selTool == "loop" || tset.selTool == "ring" || tset.selTool == "hard")) {
     if (tset.selTool == "hard") {                                // (Hard edges: the line of hard edges nearest the pointer lit)
       THover h; h.key = 'e'; int am = topoMesh(); if (am < 0) if (auto r = tPick(mp, topoMeshes())) am = r->m;
-      const int e = am >= 0 && !topoHeavy(am) ? hardEdgeNear(am, mp) : -1; if (e >= 0) { h.m = am; h.e = e; }
+      const int e = am >= 0 ? hardEdgeNear(am, mp) : -1; if (e >= 0) { h.m = am; h.e = e; }
       if (h.m != thov_.m || h.e != thov_.e || thov_.ver != tsel_.ver) { if (h.m >= 0) h.rim = hardLine(h.m, e); h.ver = tsel_.ver; thov_ = h; topoRev_++; requestUpdate(); }
       return; }
     const bool loop = tset.selTool == "loop" || tset.selTool == "ring";
     THover h; h.inv = tset.selTool == "fill" && (mods & Qt::ControlModifier); h.key = topoMode == "object" ? 'f' : tKey();
     std::optional<TopoPick> pick = tPick(mp, tPickable());
     if (!pick && tset.selTool == "outline") { const int am = topoMesh(); if (int e = am >= 0 ? rimEdgeNear(am, mp) : -1; e >= 0) { TopoPick p; p.m = am; p.e = e; pick = p; } }
-    if (pick && !topoHeavy(pick->m)) { h.m = pick->m; h.f = pick->f; h.e = pick->e; if (loop && h.key == 'f') h.e = loopEdgeAt(h.m, h.f, mp); }
+    if (pick) { h.m = pick->m; h.f = pick->f; h.e = pick->e; if (loop && h.key == 'f') h.e = loopEdgeAt(h.m, h.f, mp); }
     if (h.m != thov_.m || h.f != thov_.f || h.e != thov_.e || thov_.ver != tsel_.ver || h.inv != thov_.inv || h.key != thov_.key) {
       if (h.m >= 0 && loop) {
         auto L = tLoopOf(h.m, *pick, mp, tset.selTool == "ring");
@@ -525,6 +639,8 @@ bool Viewport::topoMove(const QPointF& mp, Qt::KeyboardModifiers mods) {
       Item* it = scene_->item(d.m); d.verts = tSelVerts(d.m); d.base = baseOf(*it)->pos; d.uv0 = baseOf(*it)->cornerUV;
       d.inv = meshmods::meshMatrix(*scene_, *it).inverse();
       if (tset.sym) d.pairs = symFirstPairs(d.m, d.base);
+      for (const auto& [oid, os] : tselX_) { if (oid == d.m || !sel_.hasItem(oid)) continue; Item* oi = scene_->item(oid); if (!oi) continue; TDrag::More x; x.m = oid; { auto Tn = topo::ttopo(baseSp(*oi)); if (Tn) x.verts = topo::selVerts(*Tn, tKey(), tKey() == 'f' ? os.f : tKey() == 'e' ? os.e : os.v); } if (x.verts.empty()) continue;
+        x.base = baseOf(*oi)->pos; x.inv = meshmods::meshMatrix(*scene_, *oi).inverse(); d.more.push_back(std::move(x)); }   // (the other picked meshes' vertices, from where they are)
     }
   }
   if (d.type == 1) { lasso_ = {{d.x0, d.y0}, {mp.x(), d.y0}, {mp.x(), mp.y()}, {d.x0, mp.y()}}; overlayRev_++; requestUpdate(); return true; }
@@ -537,7 +653,7 @@ bool Viewport::topoMove(const QPointF& mp, Qt::KeyboardModifiers mods) {
     if (d.clearAll) {                                           // (Ctrl, from empty space: the whole selection off, once)
       if (!d.erase) { d.erase = true;
         if (topoMode == "object") { if (!sel_.empty()) { sel_ = {}; onSelChange(); } }
-        else if (tsel_.f.size() + tsel_.e.size() + tsel_.v.size()) tselClear();
+        else if (tselAny()) tselClear();
         ui::hud(tr("Selection cleared"), 900); }
     } else {
       if (!d.erase) { d.erase = true; tPaintAt(d.last, td_.mode); }   // (the press point too, once)
@@ -558,7 +674,8 @@ bool Viewport::topoMove(const QPointF& mp, Qt::KeyboardModifiers mods) {
     // (the element snap: the picked vertex nearest the press taken hold of — it goes onto the element under the pointer,
     // the rest with it by the same offset)
     bool snapped = false;
-    if (tset.esnap) { Item* mi = scene_->item(d.m);
+    if (!esnapOn() && esnapHit_) { esnapHit_.reset(); overlayRev_++; }
+    if (esnapOn()) { Item* mi = scene_->item(d.m);
       if (mi && d.handle < 0) { const Affine M = meshmods::meshMatrix(*scene_, *mi); Projector Pj = projector(); double hb = 1e300;
         for (int v : d.verts) { const Vec3 wv = M.apply(d.base[size_t(v)]); const ScreenPt s = Pj.toScreen(wv); const double dd = std::hypot(s.x - d.x0, s.y - d.y0); if (s.z < 1 && dd < hb) { hb = dd; d.handle = v; d.handleW = wv; } } }
       if (d.handle >= 0) { const std::set<int> mv(d.verts.begin(), d.verts.end()); esnapHit_ = elemSnap(mp, d.m, mv, d.handleW); if (esnapHit_) { w = *esnapHit_ - d.handleW; snapped = true; } overlayRev_++; } }
@@ -566,6 +683,7 @@ bool Viewport::topoMove(const QPointF& mp, Qt::KeyboardModifiers mods) {
     for (int v : d.verts) P[size_t(v)] = d.base[size_t(v)] + l;
     { const bool s0 = tset.snap; if (snapped) tset.snap = false; topoAfterMove(d.m, P, d.verts, d.base, tset.sym ? &d.pairs : nullptr); tset.snap = s0; }   // (snapped to an element: not laid onto the surface on top)
     if (tset.keepUv && !d.uv0.empty()) { auto U = uvKeep(d.m, d.base, d.uv0, P); topoLive(d.m, P, &U); } else topoLive(d.m, P);
+    for (const auto& x : d.more) { Vec3 xl = x.inv.lin(w); std::vector<Vec3> Q = x.base; for (int v : x.verts) Q[size_t(v)] = x.base[size_t(v)] + xl; topoAfterMove(x.m, Q, x.verts, x.base, nullptr); topoLive(x.m, Q); }   // (the other picked meshes: the same drag)
     ui::hud(tr("Moving %1 vert%2").arg(d.verts.size()).arg(d.verts.size() == 1 ? "ex" : "ices"));
   }
   return true;
@@ -582,13 +700,14 @@ bool Viewport::topoRelease(const QPointF& mp) {
     lasso_.clear(); overlayRev_++;
     if (!d.moved) {
       if (d.onEl) { const auto& o = *d.onEl; const char key = tKey();   // (a click on an element: picked / taken off)
+        if (d.mode == "set") tselX_.clear();                       // (a plain click: the other meshes' picks off)
         if (d.mode != "remove") { tselApply(o.m, {o.el}, d.mode == "add" ? "add" : "set"); tsel_.last = o.el; return true; }
         if (o.dbl) { auto T = topo::ttopo(baseSp(*scene_->item(o.m))); std::vector<int> L = key == 'e' ? topo::edgeLoop(*T, o.e) : key == 'f' ? topo::faceLoop(*T, o.f, o.e) : std::vector<int>{o.el}; tselApply(o.m, L, "remove"); }
         else tselApply(o.m, {o.el}, "remove");
         return true; }
       if (d.mode == "set") {
         if (topoMode == "object") { if (!tgPick.set.empty()) { tgPick.set.clear(); emit topoState(); } if (!sel_.empty()) { sel_ = {}; onSelChange(); } }
-        else if (tsel_.f.size() + tsel_.e.size() + tsel_.v.size()) tselClear();
+        else if (tselAny()) tselClear();
       }
       requestUpdate(); return true;
     }
@@ -606,13 +725,15 @@ bool Viewport::topoRelease(const QPointF& mp) {
       sel_.anchors.clear(); onSelChange(); return true;
     }
     int m = topoMesh(); if (m < 0) return true;
-    auto list = tAreaPick(m, x0, y0, x1, y1, tKey(), in); tselApply(m, list, d.mode);
-    ui::hud(tr("%1 %2").arg(list.size()).arg(d.mode == "remove" ? tr("deselected") : tr("selected")), 900);
+    size_t total = 0;                                           // (every selected mesh takes part: each keeps its own picked elements)
+    for (int id : tselTargets()) { auto list = tAreaPick(id, x0, y0, x1, y1, tKey(), in); tselApply(id, list, d.mode); total += list.size(); }
+    tselActivate(m);
+    ui::hud(tr("%1 %2").arg(total).arg(d.mode == "remove" ? tr("deselected") : tr("selected")), 900);
     return true;
   }
   if (!d.moved) return true;
   if (d.type == 2) { commit(false); emit topoState(); return true; }
-  if (d.type == 3) { ui::hud({}); if (Item* it = scene_->item(d.m)) { auto B = baseSp(*it); topoWrite(d.m, B); } commit(false); emit topoState(); }
+  if (d.type == 3) { ui::hud({}); if (Item* it = scene_->item(d.m)) { auto B = baseSp(*it); topoWrite(d.m, B); } for (const auto& x : d.more) if (Item* xi = scene_->item(x.m)) topoWrite(x.m, baseSp(*xi)); commit(false); emit topoState(); }
   return true;
 }
 
@@ -623,7 +744,8 @@ void Viewport::topoAfterMove(int m, std::vector<Vec3>& P, const std::vector<int>
   std::vector<int> all = verts;                                 // (Soft Selection: those near follow their nearest picked one, weighed)
   if (tset.soft && tsel_.id == m) { const SoftW& S = softOf(m);
     for (size_t i = 0; i < S.vs.size(); i++) { const int v = S.vs[i], s = S.near[i]; P[size_t(v)] = base[size_t(v)] + (P[size_t(s)] - base[size_t(s)]) * S.w[i]; all.push_back(v); } }
-  if (tset.snap) {                                              // (each moved vertex onto the surface where it is seen — whatever was dragged)
+  if (tset.snap && !(QGuiApplication::queryKeyboardModifiers() & Qt::AltModifier)) {   // (Alt held: free — a vertex can be pushed behind a wall of the high-poly)
+                                              // (each moved vertex onto the surface where it is seen — whatever was dragged)
     // (only one that lay on it before the move: one off it — inside the mouth, in its slit, under a fold, apart from the
     // reference — keeps its place over the surface, moved with the rest: never laid onto it, the lips never sewn together)
     Affine M = meshmods::meshMatrix(*scene_, *it), Mi = M.inverse(); const PolyMesh& Bm = *baseOf(*it);
@@ -656,6 +778,50 @@ std::shared_ptr<const topo::Bvh> Viewport::bvhOf(int m, bool masked) const {
   auto b = std::make_shared<topo::Bvh>(); b->build(it->poly->pos, tris);
   c = {it->poly, tag, b};
   return b;
+}
+// the reference's outer shell for the snap's nearest-point queries (scene/OuterShell: of two skins laid over each other, or the two
+// walls of a shell with a thickness, the one seen from outside — wherever each comes out on top). Made once per geometry in a thread
+// of its own; meanwhile the whole surface is used
+bool Viewport::shellWanted(const Item& it) const { return it.poly && (it.raw.value("tref").toBool() || it.poly->faceCount() >= 20000); }
+std::shared_ptr<const topo::Bvh> Viewport::bvhSurf(int m, bool peek) const {
+  const Item* it = scene_->item(m); if (!it || !it->poly) return nullptr;
+  if (!shellWanted(*it)) return bvhOf(m, true);
+  const PickCache* pc = pickCacheOf(m); if (!pc) return bvhOf(m, true);
+  const bool useMask = !it->raw.value("smOff").toBool() && it->raw.contains("smask");
+  const QByteArray geo = pc->hid + "|" + QByteArray::number(geomStamp_.count(m) ? geomStamp_.at(m) : 0);
+  const QByteArray maskTag = useMask ? QByteArray::number(it->raw.value("smRev").toDouble(), 'f', 0) + ":" + QByteArray::number(it->raw.value("smask").toString().size()) : QByteArray("-");
+  ShellC& s = shellCache_[m];
+  if (s.poly.lock() != it->poly || s.geo != geo) {
+    if (s.state) s.state->store(2);                              // (the old job: dropped)
+    s = ShellC{}; s.poly = it->poly; s.geo = geo; s.state = std::make_shared<std::atomic<int>>(0); s.job = std::make_shared<ShellJob>();
+    std::thread([keep = it->poly, tris = pc->tris, t2f = pc->tri2f, state = s.state, job = s.job] {
+      auto whole = std::make_shared<topo::Bvh>(); whole->build(keep->pos, tris); if (state->load() == 2) return;
+      shell::Report rep; auto outer = shell::outerFaces(*whole, tris, t2f, keep->faceCount(), state.get(), &rep); if (state->load() == 2) return;
+      std::vector<uint32_t> kept; kept.reserve(tris.size()); for (size_t t = 0; t < t2f.size(); t++) if (outer[size_t(t2f[t])]) for (int j = 0; j < 3; j++) kept.push_back(tris[t * 3 + size_t(j)]);
+      auto b = std::make_shared<topo::Bvh>(); if (!kept.empty()) b->build(keep->pos, kept);
+      job->whole = whole; job->outer = std::move(outer); job->shell = kept.empty() ? nullptr : b; job->buried = rep.buried; job->lining = rep.lining; job->nf = keep->faceCount();
+      int exp = 0; state->compare_exchange_strong(exp, 1);
+    }).detach();
+  }
+  if (!s.state || s.state->load() != 1) return peek ? nullptr : bvhOf(m, true);   // (peek: only started or asked after — nothing made here)
+  if (s.job->whole) {                                             // (the whole surface's hierarchy was made there too: not made again here)
+    const QString tag = QString("-|") + QString::fromLatin1(pc->hid) + "|" + QString::number(geomStamp_.count(m) ? geomStamp_.at(m) : 0);
+    BvhC& c = bvhCache_[m * 2]; if (!(c.b && c.poly.lock() == it->poly && c.tag == tag)) c = {it->poly, tag, s.job->whole}; s.job->whole.reset(); }
+  if (!s.announced) { s.announced = true; if (s.job->buried + s.job->lining > 0) ui::toast(tr("%1: a double wall found — the snap keeps to the outer one (%2 of %3 polygons)").arg(it->name).arg(s.job->nf - s.job->buried - s.job->lining).arg(s.job->nf)); }
+  if (!useMask) return s.job->shell ? std::shared_ptr<const topo::Bvh>(s.job->shell) : bvhOf(m, true);
+  if (!s.bvh || s.maskTag != maskTag) {                           // (its snap mask: the outer polygons within it)
+    const auto a = smArr(m); std::vector<uint32_t> tris;
+    for (size_t t = 0; t < pc->tri2f.size(); t++) { const int f = pc->tri2f[t]; if (f < 0 || size_t(f) >= s.job->outer.size() || !s.job->outer[size_t(f)] || (!a.empty() && (size_t(f) >= a.size() || !a[size_t(f)]))) continue; for (int j = 0; j < 3; j++) tris.push_back(pc->tris[t * 3 + size_t(j)]); }
+    if (tris.empty()) return bvhOf(m, true);
+    auto b = std::make_shared<topo::Bvh>(); b->build(it->poly->pos, tris); s.bvh = b; s.maskTag = maskTag; }
+  return s.bvh;
+}
+// (a command that lays many vertices at once: the analysis waited for, so none of them goes on the inner wall)
+void Viewport::shellWait(int m) const {
+  const Item* it = scene_->item(m); if (!it || !shellWanted(*it)) return; bvhSurf(m);
+  auto f = shellCache_.find(m); if (f == shellCache_.end() || !f->second.state || f->second.state->load() != 0) return;
+  ui::BusyScope bz(tr("Finding the outer wall of %1").arg(it->name)); auto st = f->second.state;
+  while (st->load() == 0) std::this_thread::sleep_for(std::chrono::milliseconds(20));
 }
 // a drag: the positions shown (a copy of the base — the undo step keeps the one before)
 void Viewport::topoLive(int m, const std::vector<Vec3>& pos, const std::vector<std::array<float, 2>>* uv) {
@@ -750,19 +916,33 @@ void Viewport::topoGizmoApply(const Affine& M) {
   for (size_t i = 0; i < tgz_.verts.size(); i++) P[size_t(tgz_.verts[i])] = Mi.apply(M.apply(tgz_.w0[i]));
   topoAfterMove(tgz_.m, P, tgz_.verts, tgz_.base, tset.sym ? &tgz_.pairs : nullptr);
   if (tset.keepUv && !tgz_.uv0.empty()) { auto U = uvKeep(tgz_.m, tgz_.base, tgz_.uv0, P); topoLive(tgz_.m, P, &U); } else topoLive(tgz_.m, P);
+  for (const TgzX& x : tgzX_) {                                  // (the other picked meshes: the same turn / scale about the same pivot)
+    Item* xi = scene_->item(x.m); if (!xi) continue;
+    const Affine Mx = meshmods::meshMatrix(*scene_, *xi).inverse(); std::vector<Vec3> Q = x.base;
+    for (size_t i = 0; i < x.verts.size(); i++) Q[size_t(x.verts[i])] = Mx.apply(M.apply(x.w0[i]));
+    topoAfterMove(x.m, Q, x.verts, x.base, tset.sym ? &x.pairs : nullptr);
+    if (tset.keepUv && !x.uv0.empty()) { auto U = uvKeep(x.m, x.base, x.uv0, Q); topoLive(x.m, Q, &U); } else topoLive(x.m, Q);
+  }
 }
 
 // ---------- what is drawn ----------
-bool Viewport::topoTwoTone(int id) const { return room() == "topo" && topoMode != "object" && !tset.keepUv && id == topoMesh() && !(uvo.c3d && uv::has(*baseOf(*scene_->item(id)))); }
+bool Viewport::topoTwoTone(int id) const { return scene_->item(id) /* (no mesh — none active, the id −1: it was looked up below) */ && room() == "topo" && topoMode != "object" && !tset.keepUv && (id == topoMesh() || (sel_.hasItem(id) && scene_->item(id) && scene_->item(id)->type == ItemType::IMesh && !scene_->item(id)->raw.value("tref").toBool())) && !(uvo.c3d && uv::has(*baseOf(*scene_->item(id)))); }
 double Viewport::topoOpacity(int id) const {   // (the selected meshes' opacity — and each mesh's own, its Display: Transparency)
-  if (room() != "topo") return 1; const Item* it = scene_->item(id); const double own = it ? std::clamp(it->raw.value("meshOp").toDouble(1.0), 0.1, 1.0) : 1.0;
+  if (room() != "topo") return 1; const Item* it = scene_->item(id);
+  const double own = it ? std::clamp(it->raw.value("meshOp").toDouble(1.0), topoWire(*it) ? 0.0 : 0.1, 1.0) : 1.0;   // (with the wire on, all the way: only the wire left)
   return std::min(own, sel_.hasItem(id) ? tdisp.op : 1.0); }
 double Viewport::topoPdo(int id) const { return room() == "topo" && tdisp.pdoOn && sel_.hasItem(id) ? tdisp.pdo * 0.05 : 0; }
-bool Viewport::topoWire(const Item& it) const {   // (the mesh's wire: off until switched on — or W: every mesh that isn't a reference)
-  return (it.raw.value("twire").toBool(false) || (showWire && room() == "topo" && !it.raw.value("tref").toBool())) && !topoTwoTone(it.id); }
+bool Viewport::topoWire(const Item& it) const {   // (the mesh's wire: its own switch; not set — on for a mesh that isn't a reference once it has over 300 triangles)
+  bool on;
+  if (it.raw.contains("twire")) on = it.raw.value("twire").toBool(false);
+  else {
+    const PolyMesh* B = it.type == ItemType::IMesh ? (it.base ? it.base.get() : it.poly.get()) : nullptr;
+    on = B && !it.raw.value("tref").toBool() && B->faceCount() < 300000;   // (on for every mesh but a reference and a high-poly one — from 300 000 polygons: off until the user switches it on)
+  }
+  return (on || (showWire && room() == "topo" && !it.raw.value("tref").toBool())) && !topoTwoTone(it.id); }
 
 const Viewport::TopoDraw& Viewport::topoDraw() {
-  QByteArray sig = QByteArray::number(topoRev_) + "|" + QByteArray::number(staticRev_) + "|" + QByteArray::number(scene_->revision) + "|" + QByteArray::number(hairInspKey()) + "|" + room().toLatin1() + topoMode.toLatin1() + QByteArray::number(tool_ == "tmask") + "|" + QByteArray::number(int(tset.uv)) + QByteArray::number(uvStamp_) + "|" + QByteArray::number(tt_.rev) + tool_.toLatin1() + "|" + QByteArray::number(topoMesh()) + (tool_ == "tnormals" ? QByteArray("|c") + QByteArray::number(std::lround(cam_.pos.x * 20)) + "," + QByteArray::number(std::lround(cam_.pos.y * 20)) + "," + QByteArray::number(std::lround(cam_.pos.z * 20)) + "," + QByteArray::number(std::lround(cam_.dir().x * 200)) + QByteArray::number(std::lround(cam_.dir().y * 200)) : QByteArray());   // (Normals: only the ones facing the camera — made anew as it turns)   // (another mesh made the active one: its tools drawn anew)
+  QByteArray sig = QByteArray::number(topoRev_) + "|" + QByteArray::number(staticRev_) + "|" + QByteArray::number(scene_->revision) + "|" + QByteArray::number(hairInspKey()) + "|" + room().toLatin1() + topoMode.toLatin1() + QByteArray::number(tool_ == "tmask") + "|" + QByteArray::number(int(tset.uv)) + QByteArray::number(uvStamp_) + "|" + QByteArray::number(tt_.rev) + tool_.toLatin1() + "|" + QByteArray::number(topoMesh()) + "|" + QByteArray::number(qulonglong(sel_.items.size())) + (tool_ == "tnormals" ? QByteArray("|c") + QByteArray::number(std::lround(cam_.pos.x * 20)) + "," + QByteArray::number(std::lround(cam_.pos.y * 20)) + "," + QByteArray::number(std::lround(cam_.pos.z * 20)) + "," + QByteArray::number(std::lround(cam_.dir().x * 200)) + QByteArray::number(std::lround(cam_.dir().y * 200)) : QByteArray());   // (Normals: only the ones facing the camera — made anew as it turns)   // (another mesh made the active one: its tools drawn anew)
   if (sig == topoSig_) return topoDraw_;
   topoSig_ = sig; topoDraw_ = {};
   ProfScope prof_("topoDraw");
@@ -781,27 +961,45 @@ const Viewport::TopoDraw& Viewport::topoDraw() {
   };
   // the polygroups in their colours (a mesh's Polygroups display — both rooms)
   for (int m : topoMeshes()) {
-    const Item* gi = scene_->item(m); if (!gi->raw.value("pgView").toBool() || meshmods::heavy(*gi)) continue;
+    const Item* gi = scene_->item(m); if (!gi->raw.value("pgView").toBool()) continue;
     const PolyMesh* GB = baseOf(*gi); if (int(GB->faceGroup.size()) != GB->faceCount()) continue;
     auto GT = topo::ttopo(baseSp(*gi)); std::map<int, std::vector<int>> by; for (int f = 0; f < GB->faceCount(); f++) by[GB->faceGroup[size_t(f)]].push_back(f);
     for (auto& [g, fs] : by) { TopoDraw::Tris pr; pr.c = tgColor(g); pr.op = 0.55f; faceTris(pr, gi->poly->pos, *GT, fs); }
   }
   // the Inspector's highlights (both rooms): n-gons violet, non-planar teal, interior pieces pink (and a marker), open
   // edges yellow, non-manifold edges red
-  if (insp.any()) for (int m : topoMeshes()) {
-    const Item* ii = scene_->item(m); if (!ii->poly || meshmods::heavy(*ii)) continue;
+  // (not in the Paint room: the checks' colours and markers would lie over the texture being painted — the Paint room has its own look)
+  if (insp.any() && room() != "paint") for (int m : topoMeshes()) {
+    const Item* ii = scene_->item(m); if (!ii->poly) continue;
     // (no checks on a high-poly mesh, a reference, or anything in a group marked Skip in the Inspector)
     if (ii->raw.value("tref").toBool() || baseOf(*ii)->faceCount() > 200000) continue;
     { bool off = false; for (const Item* g = scene_->item(ii->parent); g && !off; g = scene_->item(g->parent)) off = g->raw.value("inspOff").toBool(); if (off) continue; }
     const InspC& c = inspOf(m); auto IT = topo::ttopo(baseSp(*ii)); const auto& IP = ii->poly->pos;
-    if (insp.ngons && !c.ngons.empty()) { TopoDraw::Tris pr; pr.c = QColor(0xb0, 0x5c, 0xff); pr.op = 0.5f; faceTris(pr, IP, *IT, c.ngons); }
+    if (insp.ngons && !c.ngons.empty()) { TopoDraw::Tris pr; pr.c = QColor(0xb0, 0x5c, 0xff); pr.op = 0.5f; faceTris(pr, IP, *IT, c.ngons);
+      // (their corners lit; an n-gon whose corners lie in one place — a red marker there, as the Hair room's Inspector)
+      TopoDraw::Pts cp; cp.size = 8; cp.xray = true; TopoDraw::Pts rp; rp.size = 16; rp.xray = true; const double tiny = baseSp(*ii)->bounds().size().length() * 1e-4;
+      for (int f : c.ngons) { if (f < 0 || f >= IT->nf) continue; Vec3 mn(1e300, 1e300, 1e300), mx(-1e300, -1e300, -1e300), ctr;
+        for (int j = IT->fo[size_t(f)]; j < IT->fo[size_t(f) + 1]; j++) { const Vec3& q = IP[size_t(IT->fv[size_t(j)])]; cp.p.push_back(q); cp.c.push_back(QColor(0xe0, 0xb0, 0xff));
+          mn = {std::min(mn.x, q.x), std::min(mn.y, q.y), std::min(mn.z, q.z)}; mx = {std::max(mx.x, q.x), std::max(mx.y, q.y), std::max(mx.z, q.z)}; ctr += q; }
+        if (mn.distanceTo(mx) <= tiny) { rp.p.push_back(ctr * (1.0 / std::max(1, IT->fo[size_t(f) + 1] - IT->fo[size_t(f)]))); rp.c.push_back(QColor(0xff, 0x30, 0x30)); } }
+      D.pts.push_back(std::move(cp)); if (!rp.p.empty()) D.pts.push_back(std::move(rp)); }
     if (insp.doubles && !c.doubles.empty()) { TopoDraw::Tris pr; pr.c = QColor(0xff, 0x40, 0x90); pr.op = 0.55f; faceTris(pr, IP, *IT, c.doubles); }   // (double walls: hot pink)
     if (insp.nonPlanar && !c.nonPlanar.empty()) { TopoDraw::Tris pr; pr.c = QColor(0x2e, 0xd0, 0xd0); pr.op = 0.45f; faceTris(pr, IP, *IT, c.nonPlanar); }
+    if (insp.asym && !c.asym.empty()) { TopoDraw::Tris pr; pr.c = QColor(0xff, 0x8a, 0x20); pr.op = 0.5f; faceTris(pr, IP, *IT, c.asym);   // (asymmetry: orange, its vertices lit)
+      TopoDraw::Pts pt; pt.size = 6; pt.xray = false; for (const Vec3& q : c.asymPts) { pt.p.push_back(q); pt.c.push_back(QColor(0xff, 0xb0, 0x60)); } D.pts.push_back(std::move(pt)); }
     if (insp.interior && !c.interior.empty()) { TopoDraw::Tris pr; pr.c = QColor(0xff, 0x3b, 0xa8); pr.op = 0.55f; faceTris(pr, IP, *IT, c.interior);
       TopoDraw::Pts pt; pt.size = 16; pt.xray = true; for (const Vec3& q : c.interiorPts) { pt.p.push_back(q); pt.c.push_back(QColor(0xff, 0x3b, 0xa8)); } D.pts.push_back(std::move(pt)); }
-    if (insp.open) edgeLines(QColor(0xff, 0xd2, 0x3a), 3.f, IP, *IT, c.open);
-    if (insp.nonManifold) edgeLines(QColor(0xff, 0x3a, 0x3a), 4.f, IP, *IT, c.nonMan);
-    if (insp.hard) edgeLines(QColor(0x3a, 0xc8, 0xff), 3.f, IP, *IT, c.hard);
+    // (an edge between hidden polygons only — a hidden polygroup's: not drawn)
+    const std::vector<char> hidI = meshmods::hiddenFaces(*ii, *baseOf(*ii));
+    auto shownE = [&](const std::vector<int>& es) { if (hidI.empty()) return es; std::vector<int> o; o.reserve(es.size());
+      for (int e : es) { if (e < 0 || e >= IT->ne) continue; const int a = IT->ef0[size_t(e)], b = IT->ef1[size_t(e)];
+        const bool ha = a >= 0 && size_t(a) < hidI.size() && hidI[size_t(a)], hb = b < 0 || (size_t(b) < hidI.size() && hidI[size_t(b)]); if (!(ha && hb)) o.push_back(e); }
+      return o; };
+    if (insp.open) edgeLines(QColor(0xff, 0xd2, 0x3a), 3.f, IP, *IT, shownE(c.open));
+    if (insp.nonManifold) edgeLines(QColor(0xff, 0x3a, 0x3a), 4.f, IP, *IT, shownE(c.nonMan));
+    if (insp.hard) { auto he = shownE(c.hard);                                        // (a hard edge that is a UV seam too: drawn as the seam — the red line is not hidden under the blue one)
+      if (uvMode()) { const auto sf = uv::seamFlags(*baseOf(*ii), *IT); he.erase(std::remove_if(he.begin(), he.end(), [&](int e) { return e >= 0 && size_t(e) < sf.size() && sf[size_t(e)]; }), he.end()); }
+      edgeLines(QColor(0x3a, 0xc8, 0xff), 2.f, IP, *IT, he); }
   }
   hairInspectDraw(D);                                          // (the Hair room: the Maranspector's own)
   if (room() == "hair" && tset.sym && symo.planes) hairSymPlanes(D);   // (the Hair room's Symmetry: its planes / its axis)
@@ -810,16 +1008,16 @@ const Viewport::TopoDraw& Viewport::topoDraw() {
   ghostDraw(D);                                                // (Topology Ghost: the source's polygons on the targets)
   lobeGhostDraw(D);                                            // (the Lobe Brush: the retopology of one lobe shown on the others)
   if (!revealFaces_.empty()) { const auto& Gs = ghosts(); TopoDraw::Tris rt; rt.c = QColor(0x5a, 0x9c, 0xff); rt.op = 0.45f;   // (the Reveal Brush's stroke: what it will make)
-    for (auto [gi, f] : revealFaces_) { if (size_t(gi) >= Gs.size()) continue; const Ghost& G = Gs[size_t(gi)]; const int s = G.fo[size_t(f)], e = G.fo[size_t(f) + 1];
+    for (auto [gi, f] : revealFaces_) { if (size_t(gi) >= Gs.size()) continue; const Ghost& G = Gs[size_t(gi)]; if (size_t(f) + 1 >= G.fo.size()) continue; const int s = G.fo[size_t(f)], e = G.fo[size_t(f) + 1];
       for (int k = s + 1; k + 1 < e; k++) { rt.p.push_back(G.P[size_t(G.fv[size_t(s)])]); rt.p.push_back(G.P[size_t(G.fv[size_t(k)])]); rt.p.push_back(G.P[size_t(G.fv[size_t(k + 1)])]); } }
     if (tset.sym) {                                             // (Symmetry: their mirror shown too — across the built mesh's X = 0, none: the world's)
-      Affine M, Mi; const int bm = topoMesh(); if (const Item* bi = bm >= 0 ? scene_->item(bm) : nullptr; bi && !bi->raw.value("tghost").toBool() && !topoHeavy(bm)) { M = meshmods::meshMatrix(*scene_, *bi); Mi = M.inverse(); }
+      Affine M, Mi; const int bm = topoMesh(); if (const Item* bi = bm >= 0 ? scene_->item(bm) : nullptr; bi && !bi->raw.value("tghost").toBool()) { M = meshmods::meshMatrix(*scene_, *bi); Mi = M.inverse(); }
       const size_t n0 = rt.p.size(); for (size_t i = 0; i < n0; i += 3) for (int j : {0, 2, 1}) { Vec3 l = Mi.apply(rt.p[i + size_t(j)]); l.x = -l.x; rt.p.push_back(M.apply(l)); } }
     D.tris.push_back(std::move(rt)); }
   // the object's UV stretch (in every mode): each polygon by its UV area to its 3D area against the mesh's — red squeezed,
   // blue stretched, grey as the rest
   if (uvo.s3d) for (int m : topoMeshes()) {
-    if (!uvDispShown(m)) continue; const Item* si = scene_->item(m); const PolyMesh& SB = *baseOf(*si); if (!uv::has(SB) || meshmods::heavy(*si)) continue;
+    if (!uvDispShown(m)) continue; const Item* si = scene_->item(m); const PolyMesh& SB = *baseOf(*si); if (!uv::has(SB)) continue;
     auto ST = topo::ttopo(baseSp(*si)); double au = 0, a3 = 0; std::vector<double> r(size_t(SB.faceCount()), 0);
     for (int f = 0; f < SB.faceCount(); f++) { const double x = std::abs(uv::faceArea(SB, f)), y = uv::faceArea3(SB, f); au += x; a3 += y; r[size_t(f)] = y > 0 ? x / y : 0; }
     const double k = au > 0 && a3 > 0 ? a3 / au : 1; std::map<int, std::vector<int>> bins;   // (−4 … 4: squeezed … stretched)
@@ -875,10 +1073,9 @@ const Viewport::TopoDraw& Viewport::topoDraw() {
     if (tsel_.B && (tsel_.B->pos.size() != B->pos.size() || tsel_.B->faceCount() != B->faceCount())) { tsel_.f.clear(); tsel_.e.clear(); tsel_.v.clear(); tsel_.last = -1; tsel_.ver++; }
     tsel_.B = B.get();
   }
-  const bool heavy = meshmods::heavy(*it) || meshmods::wireless(*it);   // (too many to draw every edge / vertex: the selection and the hover only)
   // Object mode: the picked polygroups' polygons (a high-poly mesh: what its actions selected) lit
   // (a high-poly mesh with its LOD ready: the polygroups lit on the LOD's triangles — not on the millions of its own)
-  std::shared_ptr<const PolyMesh> lod; if (auto px = maskProxy(am)) lod = px->mesh; else if (heavy) lod = lodOf(am);   // (the mask's proxy first)
+  std::shared_ptr<const PolyMesh> lod; if (auto px = maskProxy(am)) lod = px->mesh;   // (the mask's proxy first)
   const Affine LM = lod ? meshmods::meshMatrix(*scene_, *it) : Affine{};
   const std::set<int> hidG = hidOf(*it);                        // (a hidden polygroup: never lit)
   auto lodTris = [&](const TopoDraw::Tris& proto, const std::set<int>& gs0) {
@@ -887,7 +1084,7 @@ const Viewport::TopoDraw& Viewport::topoDraw() {
     for (size_t k = 0; k * 3 + 2 < I.size() && k < lod->faceGroup.size(); k++) if (gs.count(lod->faceGroup[k])) for (int j = 0; j < 3; j++) t.p.push_back(LM.apply(lod->pos[size_t(I[k * 3 + j])]));
     if (!t.p.empty()) D.tris.push_back(std::move(t));
   };
-  if (topoMode == "object" && tsel_.id == am && !tsel_.f.empty() && (heavy || (tgPick.id == am && !tgPick.set.empty()))) { TopoDraw::Tris pr; pr.c = Qt::white; pr.op = 0.28f;
+  if (topoMode == "object" && tsel_.id == am && !tsel_.f.empty() && (tgPick.id == am && !tgPick.set.empty())) { TopoDraw::Tris pr; pr.c = Qt::white; pr.op = 0.28f;
     if (lod && tgPick.id == am && !tgPick.set.empty()) lodTris(pr, tgPick.set); else faceTris(pr, P, Tg(), {tsel_.f.begin(), tsel_.f.end()}); }
   // the polygroup picked in the list (its colour) and — fainter — the same place on the topologically identical parts
   if (lod && tgSel.id == am && tgSel.gi >= 0 && !hidG.count(tgSel.gi)) { TopoDraw::Tris pr; pr.c = tgColor(tgSel.gi); pr.op = 0.42f; lodTris(pr, {tgSel.gi}); }
@@ -899,31 +1096,55 @@ const Viewport::TopoDraw& Viewport::topoDraw() {
   }
   if (tgHover_.id == am && tgHover_.gi >= 0 && !hidG.count(tgHover_.gi)) { TopoDraw::Tris pr; pr.c = tgColor(tgHover_.gi); pr.op = 0.35f; if (lod) lodTris(pr, {tgHover_.gi}); else faceTris(pr, P, Tg(), topo::groupFaces(*B, tgHover_.gi)); }
   // the UV mode: the seams (red) and where the UV breaks (the shells' borders, teal) on the active mesh
-  if (uvMode() && !heavy) {
+  if (uvMode() ) {
     auto sf = uv::seamFlags(*B, Tg()); std::vector<int> se, br;
-    for (int e = 0; e < Tg().ne; e++) if (sf[size_t(e)]) se.push_back(e);
+    std::set<int> hardE; for (const auto& h : B->hardEdges) if (const int he = Tg().edgeOf(h[0], h[1]); he >= 0) hardE.insert(he);   // (a seam that is a hard edge too: its own colour — red and blue mixed)
+    std::vector<int> seH; for (int e = 0; e < Tg().ne; e++) if (sf[size_t(e)]) { if (hardE.count(e)) seH.push_back(e); else se.push_back(e); }
     if (uv::has(*B)) { auto pts = uv::points(*B, Tg()); for (int e : uv::borderEdges(*B, Tg(), pts)) if (!sf[size_t(e)]) br.push_back(e); }
-    edgeLines(QColor(0x5f, 0xd3, 0xc4), 2.f, P, Tg(), br); edgeLines(QColor(0xff, 0x5a, 0x4f), 3.f, P, Tg(), se);
+    edgeLines(QColor(0x5f, 0xd3, 0xc4), 2.f, P, Tg(), br); edgeLines(QColor(0xff, 0x5a, 0x4f), 4.f, P, Tg(), se); edgeLines(QColor(0xa8, 0x2a, 0xb4), 4.f, P, Tg(), seH);
   }
   if (tset.sym && symo.planes && am >= 0) topoSymPlanes(D, am);   // (Symmetry: its planes / its axis over the active mesh)
-  if (uvMode() && !heavy && tset.sym && uvo.symTint) { const auto mx = uvMinusXFaces(); std::vector<int> fs; for (int f = 0; f < B->faceCount() && size_t(f) < mx.size(); f++) if (mx[size_t(f)]) fs.push_back(f);   // (Symmetry, the UV mode: the −X half burgundy, as in the UV Editor)
-    if (!fs.empty()) { TopoDraw::Tris pr; pr.c = QColor(0x9c, 0x1a, 0x32); pr.op = 0.5f; faceTris(pr, P, Tg(), fs); } }
-  if (uvMode() && !heavy && uvPicked.id == am && uvPicked.mat == -2 && uvPicked.set >= 0 && topo::hasUvSets(*B)) {   // (the UV Set worked in: what is not in it darkened on the model)
-    TopoDraw::Tris pr; pr.c = QColor(0x08, 0x08, 0x0c); pr.op = 0.5f; std::vector<int> fs; for (int f = 0; f < B->faceCount(); f++) if (!(size_t(f) < B->faceSets.size() && (B->faceSets[size_t(f)] >> uvPicked.set & 1u))) fs.push_back(f);
+  if (uvMode()  && tset.sym && uvo.symTint) { const auto mx = uvMinusXFaces(); std::vector<int> fs; for (int f = 0; f < B->faceCount() && size_t(f) < mx.size(); f++) if (mx[size_t(f)]) fs.push_back(f);   // (Symmetry, the UV mode: the −X half burgundy, as in the UV Editor)
+    if (!fs.empty()) { TopoDraw::Tris pr; pr.c = QColor(0x6e, 0x06, 0x1e); pr.op = 0.8f; faceTris(pr, P, Tg(), fs); } }
+  if (const int ws = uvMode() && topo::hasUvSets(*B) ? uvWorkSet(am, *B) : -2; ws >= 0) {   // (the UV Set worked in: what is not in it darkened on the model)
+    TopoDraw::Tris pr; pr.c = QColor(0x08, 0x08, 0x0c); pr.op = 0.5f; std::vector<int> fs; for (int f = 0; f < B->faceCount(); f++) if (!(size_t(f) < B->faceSets.size() && (B->faceSets[size_t(f)] >> ws & 1u))) fs.push_back(f);
     faceTris(pr, P, Tg(), fs); }
+  QString wantSet; if (uvMode()) { if (uvPicked.id >= 0 && uvPicked.set >= 0 && uvPicked.mat == -2) { const auto S0 = uvSets(uvPicked.id); if (size_t(uvPicked.set) < S0.size()) wantSet = S0[size_t(uvPicked.set)].name; } else wantSet = uvFreePicked; }
+  if (uvMode()) for (int id : topoMeshes()) {                   // (the UV mode: the polygons with no UV area — not unfolded yet — amber on the model)
+    const Item* oi = scene_->item(id); if (!oi || !oi->poly || !uvShown(id)) continue; const PolyMesh& OB = *baseOf(*oi); if (!uv::has(OB)) continue;
+    if (oi->poly->pos.size() != OB.pos.size()) continue; auto OT = topo::ttopo(baseSp(*oi)); if (!OT) continue;
+    int siw = -1; if (!wantSet.isEmpty() && topo::hasUvSets(OB)) { for (size_t s = 0; s < OB.uvSetNames.size(); s++) if (OB.uvSetNames[s] == wantSet) { siw = int(s); break; } if (siw < 0) continue; }   // (a set worked in: only its polygons)
+    std::vector<double> rt; for (int f = 0; f < OB.faceCount(); f++) { const double a = std::abs(uv::faceArea(OB, f)), a3 = uv::faceArea3(OB, f); if (a3 > 1e-12 && a > 1e-12) rt.push_back(a / a3); }
+    double med = 0; if (!rt.empty()) { std::nth_element(rt.begin(), rt.begin() + long(rt.size() / 2), rt.end()); med = rt[rt.size() / 2]; }
+    std::vector<int> fs; for (int f = 0; f < OB.faceCount(); f++) { const double a = std::abs(uv::faceArea(OB, f)), a3 = uv::faceArea3(OB, f); if (a3 > 1e-12 && (siw < 0 || (size_t(f) < OB.faceSets.size() && (OB.faceSets[size_t(f)] >> siw & 1u))) && (a < 1e-10 || (med > 0 && a / a3 < med * 1e-3))) fs.push_back(f); }
+    if (!fs.empty()) { TopoDraw::Tris pr; pr.c = QColor(0xff, 0x9a, 0x1f); pr.op = 0.55f; faceTris(pr, oi->poly->pos, *OT, fs); } }
+  if (uvMode() && uvPicked.id >= 0 && uvPicked.set >= 0 && uvPicked.mat == -2) {   // (the set worked in: the other meshes — what is not in it — darkened, as the active one)
+    const auto S0 = uvSets(uvPicked.id); const QString want = size_t(uvPicked.set) < S0.size() ? S0[size_t(uvPicked.set)].name : QString();
+    if (!want.isEmpty()) for (int id : topoMeshes()) { if (id == am) continue;
+      const Item* oi = scene_->item(id); if (!oi || !oi->poly) continue; const PolyMesh& OB = *baseOf(*oi); auto OT = topo::ttopo(baseSp(*oi));
+      int si = -1; if (topo::hasUvSets(OB)) for (size_t s = 0; s < OB.uvSetNames.size(); s++) if (OB.uvSetNames[s] == want) { si = int(s); break; }
+      std::vector<int> fs; for (int f = 0; f < OB.faceCount(); f++) if (si < 0 || !(size_t(f) < OB.faceSets.size() && (OB.faceSets[size_t(f)] >> si & 1u))) fs.push_back(f);
+      if (!fs.empty()) { TopoDraw::Tris pr; pr.c = QColor(0x08, 0x08, 0x0c); pr.op = 0.5f; faceTris(pr, oi->poly->pos, *OT, fs); } } }
   if (topoMode == "object") return D;
-  if (tsel_.id != am) { int ver = tsel_.ver + 1; tsel_ = {}; tsel_.id = am; tsel_.ver = ver; tsel_.B = B.get(); }
+  if (tsel_.id != am) { tselActivate(am); tsel_.B = B.get(); }
   const std::vector<char> hidF = meshmods::hiddenFaces(*it, *B); auto shown = [&](int f) { return hidF.empty() || !hidF[size_t(f)]; };
-  if (!heavy) { D.edgesOf = am; D.edgesC = topoMode == "edge" ? TEDGE_E : TEDGE; D.edgesW = topoMode == "edge" ? 2.f : 1.f; }   // (its own wire: the renderer's)
-  // (a huge selection — a high-poly mesh selected whole: every n-th of it drawn, a couple of hundred thousand at most)
-  auto capped = [heavy](const std::set<int>& s) { const size_t lim = heavy ? 200000 : SIZE_MAX, k = s.size() > lim ? (s.size() + lim - 1) / lim : 1; std::vector<int> o; o.reserve(std::min(s.size(), lim) + 1); size_t i = 0; for (int x : s) if (i++ % k == 0) o.push_back(x); return o; };
-  if (topoMode == "edge") edgeLines(Qt::white, 2.5f, P, Tg(), capped(tsel_.e));
-  if (topoMode == "poly") { TopoDraw::Tris pr; pr.c = Qt::white; pr.op = 0.3f; faceTris(pr, P, Tg(), capped(tsel_.f)); }
+  for (int id : sel_.items) if (id != am && topoTwoTone(id)) D.edgesMore.push_back(id);   // (the other selected meshes: edited together, shown alike)
+  { D.edgesOf = am; D.edgesC = topoMode == "edge" ? TEDGE_E : TEDGE; D.edgesW = topoMode == "edge" ? 2.f : 1.f; }   // (its own wire: the renderer's)
+  auto capped = [](const std::set<int>& s) { return std::vector<int>(s.begin(), s.end()); };
+  TSel shownS_; if (uvMode() && tset.sym && tsel_.id == am) shownS_ = uvOpSel(); const TSel& shownS = shownS_.id >= 0 ? shownS_ : tsel_;   // (Symmetry in the UV mode: the mirror of the pick shown picked too)
+  if (topoMode == "edge") edgeLines(Qt::white, 2.5f, P, Tg(), capped(shownS.e));
+  if (topoMode == "poly") { TopoDraw::Tris pr; pr.c = Qt::white; pr.op = 0.3f; faceTris(pr, P, Tg(), capped(shownS.f)); }
   if (topoMode == "vert") {
     TopoDraw::Pts pt; pt.size = 5;
-    if (!heavy) D.pointsOf = am;                                 // (all of them: kept by the renderer, patched as they move)
-    else for (int v : capped(tsel_.v)) { pt.p.push_back(P[size_t(v)]); pt.c.push_back(Qt::white); }
+    D.pointsOf = am;                                 // (all of them: kept by the renderer, patched as they move)
     if (!pt.p.empty()) D.pts.push_back(std::move(pt));
+  }
+  for (const auto& [xid, xs] : tselX_) {                       // (the other meshes picked: what is selected in each, lit)
+    const Item* xi = scene_->item(xid); if (!xi || !xi->poly || !sel_.hasItem(xid) || xid == am) continue;
+    auto XT = topo::ttopo(baseSp(*xi)); if (!XT) continue; const auto& XP = xi->poly->pos;
+    if (topoMode == "edge") edgeLines(Qt::white, 2.5f, XP, *XT, {xs.e.begin(), xs.e.end()});
+    else if (topoMode == "poly") { TopoDraw::Tris pr; pr.c = Qt::white; pr.op = 0.3f; faceTris(pr, XP, *XT, {xs.f.begin(), xs.f.end()}); }
+    else { TopoDraw::Pts pt; pt.size = 5; for (int v : xs.v) if (v >= 0 && size_t(v) < XP.size()) { pt.p.push_back(XP[size_t(v)]); pt.c.push_back(Qt::white); } if (!pt.p.empty()) D.pts.push_back(std::move(pt)); }
   }
   if (ssHover.m == am && ssHover.idx >= 0) {                  // (a selection set pointed at in the panel: cyan)
     char k = 0; auto L = tSelSetList(am, ssHover.idx, &k); const QColor cy(0x4c, 0xd6, 0xf0);
@@ -933,7 +1154,7 @@ const Viewport::TopoDraw& Viewport::topoDraw() {
   }
   if (tset.soft && tsel_.id == am) {                           // (Soft Selection: how much each vertex near the selection follows — yellow to red)
     const SoftW& S = softOf(am); TopoDraw::Pts pt; pt.size = 6;
-    const size_t stp = heavy && S.vs.size() > 200000 ? (S.vs.size() + 199999) / 200000 : 1;   // (a high-poly mesh: every n-th shown)
+    const size_t stp = 1;   // (a high-poly mesh: every n-th shown)
     for (size_t i = 0; i < S.vs.size(); i += stp) { const double w = S.w[i]; pt.p.push_back(P[size_t(S.vs[i])]); pt.c.push_back(QColor::fromRgbF(1.f, float(0.85 - 0.7 * w), float(0.2 * (1 - w)))); }
     if (!pt.p.empty()) D.pts.push_back(std::move(pt));
   }
@@ -945,4 +1166,16 @@ const Viewport::TopoDraw& Viewport::topoDraw() {
   return D;
 }
 
+}  // namespace hm
+
+namespace hm {
+// (checks) the active mesh's vertices against each double-walled reference: how many lie nearer its inner wall than its outer
+QString Viewport::testShell() {
+  const int m = topoMesh(); const Item* it = m >= 0 ? scene_->item(m) : nullptr; if (!it) return "no mesh"; QString out; const PolyMesh& B = *baseOf(*it); const Affine M = meshmods::meshMatrix(*scene_, *it);
+  for (auto& [id, x] : scene_->items) { if (id == m || x.type != ItemType::IMesh || !shellWanted(x) || !scene_->isVisible(x)) continue; shellWait(id); auto sh = bvhSurf(id), wh = bvhOf(id, false); if (!sh || !wh) continue;
+    const double tol = x.poly->bounds().size().length() * 2e-5; int inner = 0, n = 0; double sum = 0;
+    for (const Vec3& p : B.pos) { const Vec3 w = M.apply(p); double a = 0, b = 0; sh->closest(w, nullptr, &a); wh->closest(w, nullptr, &b); n++; sum += a; if (a > b + tol) inner++; }
+    out += QString("%1: %2 of %3 vertices nearer the inner wall, mean distance to the outer %4; ").arg(x.name).arg(inner).arg(n).arg(sum / std::max(1, n)); }
+  return out;
+}
 }  // namespace hm

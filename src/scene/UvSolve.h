@@ -23,7 +23,6 @@ public:
   void holdPoint(int i, const P2& q) { hold(2 * i, q[0]); hold(2 * i + 1, q[1]); }
   void tie(int d, int to, double s = 1, double o = 0);       // x_d = s · x_to + o
   bool anyHeld() const;
-  int heldPoints() const;                                    // (vertices with both u and v held)
   // resolved: per dof its unknown (−1: held) and x = s · z + o (z: the unknown, or the held value)
   struct Map { std::vector<int> var; std::vector<double> s, o, val; int unknowns = 0; };
   Map resolve() const;
@@ -52,6 +51,6 @@ double distortion(const std::vector<P2>& U, const std::vector<Vec3>& X, const st
 // SLIM on U (no triangle turned over to start with — else left as it is): iters at most, stops when the energy settles;
 // the held / tied dofs kept. U at the 3D size of X (X may be scaled first)
 struct SlimResult { bool ok = false; int iters = 0; double e0 = 0, e1 = 0; };
-SlimResult slim(std::vector<P2>& U, const std::vector<Vec3>& X, const std::vector<Tri>& tris, const Dofs& D, int iters, const std::vector<std::array<int, 2>>* soft = nullptr, double wSoft = 1e4);   // (soft: dof pairs pulled to one value — a strong pull, not a tie: the start needn't keep them)
+SlimResult slim(std::vector<P2>& U, const std::vector<Vec3>& X, const std::vector<Tri>& tris, const Dofs& D, int iters, const std::vector<std::array<int, 2>>* soft = nullptr, double wSoft = 1e4, const std::vector<double>* softOff = nullptr, const std::vector<double>* softW = nullptr);   // (softOff: per soft pair the difference it is pulled to — x_a − x_b → o; none: 0)   // (soft: dof pairs pulled to one value — a strong pull, not a tie: the start needn't keep them)
 
 }  // namespace hm::uv::solve

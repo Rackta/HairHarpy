@@ -3,6 +3,7 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QRegularExpression>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -150,6 +151,14 @@ std::vector<int> selVerts(const TTopo& T, char key, const std::set<int>& sel) {
 }
 std::vector<int> groupFaces(const PolyMesh& B, int gi) { std::vector<int> o; for (size_t f = 0; f < B.faceGroup.size(); f++) if (B.faceGroup[f] == gi) o.push_back(int(f)); return o; }
 
+QString defaultUvSetName(const PolyMesh& d) {
+  int mt = -1; bool one = true;
+  if (int(d.faceMat.size()) == d.faceCount()) { for (int f : d.faceMat) { if (mt < 0) mt = f; else if (f != mt) { one = false; break; } } }
+  else if (d.matNames.size() == 1) mt = 0;
+  if (one && mt >= 0 && size_t(mt) < d.matNames.size()) { QString n = d.matNames[size_t(mt)]; n.remove(QRegularExpression("[_ ]?[Mm]at(erial)?$")); if (!n.trimmed().isEmpty()) return n.trimmed(); }
+  return QStringLiteral("UV Set 1");
+}
+
 bool hasUvSets(const PolyMesh& d) {
   if (d.uvSetNames.empty() || int(d.faceSets.size()) != d.faceCount() || int(d.faceLive.size()) != d.faceCount() || d.setUV.size() != d.uvSetNames.size()) return false;
   for (auto& L : d.setUV) if (L.size() != d.faceVerts.size()) return false;
@@ -201,7 +210,7 @@ QByteArray packPMesh(const PolyMesh& d) {
   const bool nrm = !d.cornerNormal.empty() && d.cornerNormal.size() == d.faceVerts.size();
   QJsonObject hd{{"n", int(d.pos.size())}, {"f", nf}, {"c", int(d.faceVerts.size())}, {"groups", gs}, {"mats", ms}, {"nt", uv ? int(d.cornerUV.size()) : 0},
                                                 {"nn", nrm ? int(d.cornerNormal.size()) : 0}, {"nh", int(d.hardEdges.size())}, {"nc", int(d.creases.size())}, {"ns", int(d.seams.size())}};
-  const bool sets = uv && hasUvSets(d); if (sets) { QJsonArray us; for (auto& s : d.uvSetNames) us.append(s); hd.insert("uvsets", us); }   // (the UV Sets: after the seams)
+  const bool sets = hasUvSets(d);   /* (also with no UV yet: the polygons are in the sets, the Unfold lays them out there) */ if (sets) { QJsonArray us; for (auto& s : d.uvSetNames) us.append(s); hd.insert("uvsets", us); }   // (the UV Sets: after the seams)
   const bool vc = !d.vcol.empty() && d.vcol.size() == d.pos.size(); if (vc) hd.insert("nvc", int(d.vcol.size()));
   QByteArray b = header(0x48534d50, hd);
   b.reserve(b.size() + int(d.pos.size() * 12 + d.faceVerts.size() * 8 + size_t(nf) * 12 + 4 + (uv ? d.cornerUV.size() * 8 : 0)));
@@ -513,6 +522,31 @@ std::vector<int> symPairs(const PolyMesh& B, const std::vector<Vec3>& base) {
     pair[size_t(v)] = best;
   }
   return pair;
+}
+
+// The mirror pairs found by the connections from those found by the place (`pair`, filled in place): a vertex next to a paired one, with no pair of its
+// own, takes the one vertex next to that one's pair whose every paired neighbour is the pair of one of its own — and back. Grown till nothing more is found.
+// A side mirrored (Mirror) and then moved a little keeps its connections: its pairs are found so though the places no longer match (the sleeves 2–5 mm
+// apart, 2026-11-10). maxDist: how far from its mirror place a vertex may be to be taken (0 — any). Returns how many vertices got a pair so
+int symPairsByLinks(const TTopo& T, const std::vector<Vec3>& pos, std::vector<int>& pair, double maxDist) {
+  const int n = int(pos.size()); if (int(pair.size()) != n) return 0;
+  auto nbOf = [&](int v) { std::vector<int> o; for (int i = T.voff[size_t(v)]; i < T.voff[size_t(v) + 1]; i++) o.push_back(T.other(T.vE[size_t(i)], v)); return o; };
+  int added = 0;
+  for (int round = 0; round < 200; round++) { int now = 0;
+    for (int b = 0; b < n; b++) { if (pair[size_t(b)] >= 0) continue;
+      const auto nb = nbOf(b); std::vector<int> paired; for (int x : nb) if (pair[size_t(x)] >= 0) paired.push_back(x); if (paired.empty()) continue;
+      // (candidates: unpaired neighbours of the pair of a paired neighbour, not b itself)
+      std::set<int> cand; for (int x : nbOf(pair[size_t(paired[0])])) if (x != b && pair[size_t(x)] < 0) cand.insert(x);
+      int found = -1, nfound = 0;
+      for (int c : cand) { const auto nc = nbOf(c); if (nc.size() != nb.size()) continue;
+        bool ok = true; for (int x : paired) if (std::find(nc.begin(), nc.end(), pair[size_t(x)]) == nc.end()) { ok = false; break; }
+        if (ok) for (int y : nc) if (pair[size_t(y)] >= 0 && std::find(nb.begin(), nb.end(), pair[size_t(y)]) == nb.end()) { ok = false; break; }   // (back: its paired neighbours mirror mine too)
+        if (ok && maxDist > 0 && pos[size_t(c)].distanceTo(Vec3(-pos[size_t(b)].x, pos[size_t(b)].y, pos[size_t(b)].z)) > maxDist) ok = false;
+        if (ok) { found = c; nfound++; } }
+      if (nfound != 1) continue;
+      pair[size_t(b)] = found; pair[size_t(found)] = b; now += 2; }
+    added += now; if (!now) break; }
+  return added;
 }
 
 // ---- decimation: quadric-error edge collapses (the "fast quadric mesh simplification" scheme, S. Forstmann, MIT) ----

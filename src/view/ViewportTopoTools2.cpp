@@ -465,6 +465,8 @@ QString Viewport::bridgeUneven(int m, MeshEd& E, const PolyMesh& B, std::vector<
 QString Viewport::modelReapply() {
   const QString op = tt_.lastOp; const int m = tt_.lastM; Item* it = m >= 0 ? scene_->item(m) : nullptr;
   if (op.isEmpty() || !it || baseSp(*it) != tt_.lastAfter) return "!";
+  // (the edit's own step the last one: a step after it that kept the mesh — a selection change — means one undo would not take the edit back)
+  if (histIdx_ >= 1 && size_t(histIdx_) < history_.size()) { const auto& prev = history_[size_t(histIdx_ - 1)].items; if (auto f = prev.find(m); f != prev.end() && baseSp(f->second) == tt_.lastAfter) return "!"; }
   const QString want = op == "loop" ? "tloop" : op == "plane" ? "tplane" : op == "bevel" ? "tbevel" : op == "inset" || op == "circles" ? "tinset" : op == "bridge" ? "tbridge" : op == "fill" ? "tfill" : op == "nsmooth" ? "tnormals" : QString();
   if (want != tool_ && !(op == "loop" && tool_ == "tpen")) return "!";
   const QJsonObject a = tt_.lastArgs;

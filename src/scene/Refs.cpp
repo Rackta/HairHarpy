@@ -1,6 +1,7 @@
 #include "scene/Refs.h"
 #include "scene/Scene.h"
 #include "view/Camera.h"
+#include "paint/PaintDoc.h"
 #include <QObject>
 #include <algorithm>
 #include <cmath>
@@ -43,7 +44,7 @@ namespace refs {
 
 const char* VIEWS[6] = {"front", "back", "left", "right", "top", "ortho"};
 QString viewLabel(const QString& v) {
-  return v == "front" ? QObject::tr("Front") : v == "back" ? QObject::tr("Back") : v == "left" ? QObject::tr("Left") : v == "right" ? QObject::tr("Right") : v == "top" ? QObject::tr("Top") : QObject::tr("Orthographic");
+  return v == "front" ? QObject::tr("Front") : v == "back" ? QObject::tr("Back") : v == "left" ? QObject::tr("Right") : v == "right" ? QObject::tr("Left") : v == "top" ? QObject::tr("Top") : QObject::tr("Orthographic");
 }
 QString opposite(const QString& v) { return v == "front" ? "back" : v == "back" ? "front" : v == "left" ? "right" : v == "right" ? "left" : QString(); }
 
@@ -117,11 +118,36 @@ RefPlane copyTo(const RefPlane& src0, const QString& view, const Scene& sc, cons
   M4 rel = m4Mul(m4Inverse(defFrame(src.view, src.onlyView, sc, cam)), src.matrix());
   if (opposite(src.view) == view) rel = m4Mul(m4Compose({}, Quat{}, {-1, 1, 1}), rel);
   RefPlane t; t.id = newId; t.view = view; t.name = name; t.opacity = src.opacity; t.over = src.over; t.piv[0] = src.piv[0]; t.piv[1] = src.piv[1];
-  t.img = src.img; t.aspect = src.aspect; t.lock = QJsonValue(QJsonValue::Null);
+  t.img = src.img; t.aspect = src.aspect; t.canvas = src.canvas; t.sheet = src.sheet; t.lock = QJsonValue(QJsonValue::Null);
   m4Decompose(m4Mul(defFrame(view, t.onlyView, sc, cam), rel), t.pos, t.quat, t.scl);
   capture(t, cam);
   return t;
 }
+
+int newCanvas(Scene& sc, int W, int H, const QString& name) {
+  paint::Document d(W, H); d.addPaint(paint::Channel::Color, QObject::tr("Sketch"));
+  const int id = sc.nextCanvasId++; RefSketch& s = sc.refSketches[id]; s.data = d.packJson(); s.flat = d.compose(paint::Channel::Color); s.rev = 1; s.name = name; return id;
+}
+int copyCanvas(Scene& sc, int id) {
+  auto f = sc.refSketches.find(id); if (f == sc.refSketches.end()) return -1;
+  RefSketch c = f->second; c.rev = 1; c.name = QObject::tr("%1 copy").arg(c.name);
+  const int nid = sc.nextCanvasId++; sc.refSketches[nid] = std::move(c); return nid;
+}
+int canvasUsers(const Scene& sc, int id) { int n = 0; for (const RefPlane& r : sc.refPlanes) if (r.canvas == id) n++; return n; }
+
+void placeSheet(RefPlane& rp, const Scene& sc, const Camera& cam, int W, int H) {
+  rp.aspect = double(W) / std::max(1, H); place(rp, sc, cam); apply(rp, cam);
+  const double k = cam.worldPerPixel(); rp.scl = {W * k, H * k, 1};
+  const Vec3 d = cam.pos - rp.pos, r = cam.right(), u = cam.upVec(); rp.pos += r * d.dot(r) + u * d.dot(u);
+  capture(rp, cam);
+}
+
+QColor markerColor(int n) {
+  static const QColor C[8] = {QColor(255, 82, 82), QColor(64, 196, 255), QColor(255, 214, 0), QColor(105, 240, 120), QColor(224, 64, 251), QColor(255, 145, 0), QColor(0, 230, 200), QColor(255, 255, 255)};
+  return C[((n % 8) + 8) % 8];
+}
+QJsonObject markerJson(const RefMarker& m) { return QJsonObject{{"pos", QJsonArray{m.pos.x, m.pos.y, m.pos.z}}, {"color", m.color.name()}}; }
+RefMarker markerFromJson(const QJsonObject& o, int id) { RefMarker m; m.id = id; m.pos = vec(o.value("pos")); m.color = QColor(o.value("color").toString("#ff5252")); return m; }
 
 RefPlane fromJson(const QJsonObject& o, int id) {
   RefPlane rp; rp.id = id; rp.view = o.value("view").toString("front");
@@ -135,6 +161,7 @@ RefPlane fromJson(const QJsonObject& o, int id) {
   QJsonArray s = o.value("scl").toArray(); if (s.size() == 3) rp.scl = {s[0].toDouble(), s[1].toDouble(), s[2].toDouble()};
   QJsonArray l = o.value("loc").toArray(); if (l.size() == 16) { for (int i = 0; i < 16; i++) rp.loc[size_t(i)] = l[i].toDouble(); rp.hasLoc = true; }
   rp.lock = o.value("lock").isObject() ? o.value("lock") : QJsonValue(QJsonValue::Null);
+  rp.canvas = o.value("canvas").toInt(-1); rp.sheet = o.value("sheet").toBool();
   return rp;
 }
 QJsonObject toJson(const RefPlane& rp) {
@@ -143,6 +170,8 @@ QJsonObject toJson(const RefPlane& rp) {
                 {"pos", QJsonArray{rp.pos.x, rp.pos.y, rp.pos.z}}, {"quat", QJsonArray{rp.quat.x, rp.quat.y, rp.quat.z, rp.quat.w}}, {"scl", QJsonArray{rp.scl.x, rp.scl.y, rp.scl.z}}};
   if (rp.follows() && rp.hasLoc) { QJsonArray l; for (double v : rp.loc) l.append(v); o.insert("loc", l); }
   if (rp.lock.isObject()) o.insert("lock", rp.lock);
+  if (rp.canvas >= 0) o.insert("canvas", rp.canvas);
+  if (rp.sheet) o.insert("sheet", true);
   return o;
 }
 

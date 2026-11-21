@@ -75,4 +75,9 @@ if ($Install) {
     $p = Start-Process $setup -ArgumentList '--silent', '--no-desktop', '--dir', "`"$dir`"" -Wait -PassThru
     if ($p.ExitCode) { throw "Setup failed ($($p.ExitCode))" }
     Write-Host "Installed: $dir"
+    # (this PC only, not in the released package: the build's symbols beside the installed program, so a session record names
+    # the functions the program stood in when its window froze)
+    $pdb = Join-Path $native ("build\{0}\HairHarpy.pdb" -f $(if ($Publish) { 'Publish' } else { 'Release' }))
+    $sys = Join-Path $dir 'System'
+    if ((Test-Path $pdb) -and (Test-Path (Join-Path $sys 'HairHarpy.exe'))) { Copy-Item $pdb (Join-Path $sys 'HairHarpy.pdb') -Force; Write-Host "Symbols: $sys\HairHarpy.pdb" }
 }

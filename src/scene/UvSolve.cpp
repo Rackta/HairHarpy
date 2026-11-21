@@ -3,6 +3,8 @@
 #include <Eigen/Sparse>
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <map>
 #include <numeric>
@@ -82,7 +84,6 @@ void Dofs::tie(int d, int to, double s, double o) {
   par_[size_t(a.r)] = b.r; s_[size_t(a.r)] = ks; o_[size_t(a.r)] = ko;
 }
 bool Dofs::anyHeld() const { for (int d = 0; d < size(); d++) if (held_[size_t(find(d).r)]) return true; return false; }
-int Dofs::heldPoints() const { int n = 0; for (int i = 0; i * 2 + 1 < size(); i++) if (held_[size_t(find(2 * i).r)] && held_[size_t(find(2 * i + 1).r)]) n++; return n; }
 Dofs::Map Dofs::resolve() const {
   Map M; const int n = size(); M.var.assign(size_t(n), -1); M.s.assign(size_t(n), 0); M.o.assign(size_t(n), 0); M.val.assign(size_t(n), 0);
   std::vector<int> idx(size_t(n), -1);
@@ -165,7 +166,7 @@ std::vector<P2> tutteImpl(const std::vector<Vec3>& X, const std::vector<Tri>& tr
   // the borders: the edges of one triangle only, as the triangles go round (the inside on their left)
   std::map<std::pair<int, int>, int> dir; for (auto& t : tris) for (int j = 0; j < 3; j++) dir[{t[size_t(j)], t[size_t((j + 1) % 3)]}]++;
   std::vector<int> next(size_t(n), -1); int nb = 0;
-  for (auto& [e, c] : dir) if (!dir.count({e.second, e.first})) { if (next[size_t(e.first)] >= 0) return {}; next[size_t(e.first)] = e.second; nb++; }
+  for (auto& [e, c] : dir) if (!dir.count({e.second, e.first})) { if (next[size_t(e.first)] >= 0) { if (std::getenv("UVDBG")) std::fprintf(stderr, "  tutte: border branches at %d\n", e.first); return {}; } next[size_t(e.first)] = e.second; nb++; }
   if (!nb) return {};
   std::vector<std::vector<int>> loops; std::vector<double> len; std::vector<char> seen(size_t(n), 0);
   for (int s = 0; s < n; s++) {
@@ -238,7 +239,7 @@ double distortion(const std::vector<P2>& U, const std::vector<Vec3>& X, const st
 }
 
 // ---------- SLIM ----------
-SlimResult slim(std::vector<P2>& U, const std::vector<Vec3>& X, const std::vector<Tri>& tris, const Dofs& D, int iters, const std::vector<std::array<int, 2>>* soft, double wSoft) {
+SlimResult slim(std::vector<P2>& U, const std::vector<Vec3>& X, const std::vector<Tri>& tris, const Dofs& D, int iters, const std::vector<std::array<int, 2>>* soft, double wSoft, const std::vector<double>* softOff, const std::vector<double>* softW) {
   SlimResult res; if (U.size() != X.size() || tris.empty()) return res;
   std::vector<Rest> R = rests(X, tris);
   if (orientation(R, tris, U) < 0) mirrorRest(R);             // (laid mirrored: worked on as it lies)
@@ -249,7 +250,9 @@ SlimResult slim(std::vector<P2>& U, const std::vector<Vec3>& X, const std::vecto
   auto toU = [&](const Eigen::VectorXd& zz, std::vector<P2>& out) { out.resize(X.size()); for (size_t d = 0; d < size_t(D.size()); d++) out[d / 2][d % 2] = (M.var[d] >= 0 ? M.s[d] * zz[M.var[d]] : 0) + M.o[d]; };
   toU(z, U);
   double sumA = 0; for (auto& r : R) if (r.A > 0) sumA += r.A; if (!(sumA > 0)) sumA = 1;
-  auto penalty = [&](const std::vector<P2>& V) { double p = 0; if (soft) for (auto& s : *soft) { const double d = V[size_t(s[0]) / 2][size_t(s[0]) % 2] - V[size_t(s[1]) / 2][size_t(s[1]) % 2]; p += d * d; } return wSoft * p / sumA; };
+  auto offOf = [&](size_t i) { return softOff && i < softOff->size() ? (*softOff)[i] : 0.0; };
+  auto wOf = [&](size_t i) { return softW && i < softW->size() ? (*softW)[i] : 1.0; };   // (each pair's own weight, times wSoft)
+  auto penalty = [&](const std::vector<P2>& V) { double p = 0; if (soft) for (size_t i = 0; i < soft->size(); i++) { const auto& s = (*soft)[i]; const double d = V[size_t(s[0]) / 2][size_t(s[0]) % 2] - V[size_t(s[1]) / 2][size_t(s[1]) % 2] - offOf(i); p += wOf(i) * d * d; } return wSoft * p / sumA; };
   auto energy = [&](const std::vector<P2>& V) { return energyOf(R, tris, V) + penalty(V); };   // (the stretch and the soft pull: what the steps lower)
   double E = energy(U); res.e0 = E; res.e1 = E;
   if (!std::isfinite(E)) return res;                           // (a triangle turned over: SLIM can't start)
@@ -281,7 +284,7 @@ SlimResult slim(std::vector<P2>& U, const std::vector<Vec3>& X, const std::vecto
       }
     }
     if (soft) { const double sw = std::sqrt(wSoft);              // (the soft pairs: √w · (x_a − x_b) → 0)
-      for (auto& s : *soft) { double cst = 0; for (auto [d, cf] : {std::pair<size_t, double>{size_t(s[0]), sw}, {size_t(s[1]), -sw}}) { if (M.var[d] >= 0) T.emplace_back(row, M.var[d], cf * M.s[d]); cst += cf * M.o[d]; }
+      for (size_t i = 0; i < soft->size(); i++) { const auto& s = (*soft)[i]; const double swi = sw * std::sqrt(wOf(i)); double cst = -swi * offOf(i); for (auto [d, cf] : {std::pair<size_t, double>{size_t(s[0]), swi}, {size_t(s[1]), -swi}}) { if (M.var[d] >= 0) T.emplace_back(row, M.var[d], cf * M.s[d]); cst += cf * M.o[d]; }
         b.push_back(-cst); row++; } }
     SpMat A(row, M.unknowns); A.setFromTriplets(T.begin(), T.end());
     const Eigen::VectorXd bv = Eigen::Map<Eigen::VectorXd>(b.data(), Eigen::Index(b.size()));

@@ -36,7 +36,6 @@ struct LobeMap {
   std::shared_ptr<topo::Bvh> bvh; int GB = 40; std::vector<std::vector<int>> bins;      // (its triangles in 3D; on the square by cells)
 };
 std::vector<LobeMap> maps(const topo::TTopo& T, const std::vector<Vec3>& P, const std::vector<int>& lab);
-bool toUV(const LobeMap& M, const Vec3& p, double& u, double& v, double* dist = nullptr);   // (a point near it → its place on the square)
 Vec3 fromUV(const LobeMap& M, double u, double v);                                          // (a place on the square → the lobe)
 // one lobe laid over another: mirrored (across its middle plane — the normal n through rc) or not, then turned, sized
 // and moved — p → R·(p − c0)·s + c1; err: how far its points stay from the other's surface (root mean square)

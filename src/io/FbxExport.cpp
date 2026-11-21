@@ -3,6 +3,7 @@
 // has them, else smooth ones split at the hard edges), the smoothing (per edge — soft / hard — or 3ds Max smoothing
 // groups per polygon), edge creases, the UVs and the material slots. Y up, centimetres (UnitScaleFactor 1).
 #include "io/Export.h"
+#include "scene/Topo.h"
 #include <QColor>
 #include <QDateTime>
 #include <QSet>
@@ -80,7 +81,7 @@ struct Dsu { std::vector<int> p; explicit Dsu(size_t n) : p(n) { std::iota(p.beg
   int find(int x) { while (p[size_t(x)] != x) x = p[size_t(x)] = p[size_t(p[size_t(x)])]; return x; }
   void unite(int a, int b) { a = find(a); b = find(b); if (a != b) p[size_t(a)] = b; } };
 
-struct Built { std::vector<Node> objects; std::vector<Node> conns; int models = 0, geoms = 0, mats = 0; };
+struct Built { std::vector<Node> objects; std::vector<Node> conns; int models = 0, geoms = 0, mats = 0; std::map<QString, int64_t> matIds; };   // (matIds: one Material per name — the meshes of a UV set share it)
 
 void buildMesh(Built& B, const ExportMesh& em, double sc, bool groups, int64_t& nextId, QSet<QString>& used) {
   const PolyMesh& m = *em.mesh; const int nf = m.faceCount(); if (nf <= 0) return;
@@ -154,9 +155,19 @@ void buildMesh(Built& B, const ExportMesh& em, double sc, bool groups, int64_t& 
     Node l = layerInfo("LayerElementUV", 101, "ByPolygonVertex", "IndexToDirect", {Node("UV", {pAd(uv)}), Node("UVIndex", {pAi(uvi)})});
     l.kids[1] = Node("Name", {pS("UVMap")}); geo.push_back(std::move(l)); layers.push_back("LayerElementUV");
   }
-  const int nm = std::max(1, int(m.matNames.size())); const bool perFace = int(m.faceMat.size()) == nf && m.matNames.size() > 1;
-  if (perFace) { std::vector<int32_t> fm(static_cast<size_t>(nf)); for (int f = 0; f < nf; f++) fm[size_t(f)] = std::clamp(m.faceMat[size_t(f)], 0, nm - 1);
-    geo.push_back(layerInfo("LayerElementMaterial", 101, "ByPolygon", "IndexToDirect", {Node("Materials", {pAi(fm)})})); }
+  // the materials: each polygon's UV set (the project's texture sets — a painter makes a texture per material: one per set, not one per mesh);
+  // a mesh with no sets — its UV Mats, else one of its own
+  const bool sets = !m.uvSetNames.empty() && int(m.faceSets.size()) == nf;
+  const QString own = topo::defaultUvSetName(m);   // (a mesh with no sets is in the project's "UV Set 1" — as the UV Sets list shows it)
+  std::vector<QString> mn; std::vector<int> mc; std::vector<int32_t> fm(static_cast<size_t>(nf), 0); { std::map<QString, int> at;
+    for (int f = 0; f < nf; f++) { QString n; int ci = -1;
+      if (sets) { int s = size_t(f) < m.faceLive.size() ? m.faceLive[size_t(f)] : -1; if (s < 0 || size_t(s) >= m.uvSetNames.size() || !(m.faceSets[size_t(f)] >> s & 1u)) { s = -1; for (size_t k = 0; k < m.uvSetNames.size(); k++) if (m.faceSets[size_t(f)] >> k & 1u) { s = int(k); break; } }
+        if (s >= 0) n = m.uvSetNames[size_t(s)]; }
+      if (n.isEmpty()) { const int fmI = size_t(f) < m.faceMat.size() ? m.faceMat[size_t(f)] : 0; if (fmI >= 0 && size_t(fmI) < m.matNames.size()) ci = fmI; n = own; }   // (its colour from its mat, if any)
+      auto r = at.emplace(n, int(mn.size())); if (r.second) { mn.push_back(n); mc.push_back(ci); } fm[size_t(f)] = r.first->second; } }
+  if (mn.empty()) { mn.push_back(own); mc.push_back(-1); }
+  const int nm = int(mn.size());
+  if (nm > 1) geo.push_back(layerInfo("LayerElementMaterial", 101, "ByPolygon", "IndexToDirect", {Node("Materials", {pAi(fm)})}));
   else geo.push_back(layerInfo("LayerElementMaterial", 101, "AllSame", "IndexToDirect", {Node("Materials", {pAi({0})})}));
   layers.push_back("LayerElementMaterial");
   std::vector<Node> layer{Node("Version", {pI(100)})};
@@ -172,14 +183,17 @@ void buildMesh(Built& B, const ExportMesh& em, double sc, bool groups, int64_t& 
                               p70("Lcl Scaling", "Lcl Scaling", "", "A", {pD(1), pD(1), pD(1)}), p70("DefaultAttributeIndex", "int", "Integer", "", {pI(0)}), p70("InheritType", "enum", "", "", {pI(1)})}),
     Node("MultiLayer", {pI(0)}), Node("MultiTake", {pI(0)}), Node("Shading", {pC(true)}), Node("Culling", {pS("CullingOff")})}));
   B.conns.push_back(Node("C", {pS("OO"), pL(model), pL(0)})); B.conns.push_back(Node("C", {pS("OO"), pL(geom), pL(model)}));
-  for (int i = 0; i < nm; i++) {
-    QString mn = size_t(i) < m.matNames.size() && !m.matNames[size_t(i)].isEmpty() ? m.matNames[size_t(i)] : name + "_mat";
-    QColor c(size_t(i) < m.matColor.size() && !m.matColor[size_t(i)].isEmpty() ? m.matColor[size_t(i)] : QStringLiteral("#9a9a9a")); if (!c.isValid()) c = QColor(0x9a, 0x9a, 0x9a);
-    const int64_t mat = ++nextId;
-    B.objects.push_back(Node("Material", {pL(mat), pS(cls(mn, "Material")), pS("")}, {
-      Node("Version", {pI(102)}), Node("ShadingModel", {pS("phong")}), Node("MultiLayer", {pI(0)}),
-      Node("Properties70", {}, {p70("DiffuseColor", "Color", "", "A", {pD(c.redF()), pD(c.greenF()), pD(c.blueF())}), p70("DiffuseFactor", "Number", "", "A", {pD(1)})})}));
-    B.conns.push_back(Node("C", {pS("OO"), pL(mat), pL(model)})); B.mats++;
+  for (int i = 0; i < nm; i++) {                                 // (in the order the polygons' indices count them; one Material per name across the file)
+    int64_t mat; auto known = B.matIds.find(mn[size_t(i)]);
+    if (known != B.matIds.end()) mat = known->second;
+    else { const int ci = mc[size_t(i)];
+      QColor c(ci >= 0 && size_t(ci) < m.matColor.size() && !m.matColor[size_t(ci)].isEmpty() ? m.matColor[size_t(ci)] : QStringLiteral("#9a9a9a")); if (!c.isValid()) c = QColor(0x9a, 0x9a, 0x9a);
+      mat = ++nextId; B.matIds[mn[size_t(i)]] = mat;
+      B.objects.push_back(Node("Material", {pL(mat), pS(cls(mn[size_t(i)], "Material")), pS("")}, {
+        Node("Version", {pI(102)}), Node("ShadingModel", {pS("phong")}), Node("MultiLayer", {pI(0)}),
+        Node("Properties70", {}, {p70("DiffuseColor", "Color", "", "A", {pD(c.redF()), pD(c.greenF()), pD(c.blueF())}), p70("DiffuseFactor", "Number", "", "A", {pD(1)})})}));
+      B.mats++; }
+    B.conns.push_back(Node("C", {pS("OO"), pL(mat), pL(model)}));
   }
   B.models++; B.geoms++;
 }

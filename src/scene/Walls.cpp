@@ -1,4 +1,4 @@
-#include "scene/Walls.h"
+﻿#include "scene/Walls.h"
 #include "scene/CurveMath.h"
 #include <QJsonArray>
 #include <QJsonObject>
@@ -100,7 +100,7 @@ std::vector<const Item*> lockCurves(const Scene& sc, const Item& sf, const std::
   return out;
 }
 
-struct Rows { std::vector<Vec3> A, B; std::vector<Vec3> cent; int n = 2; };
+struct Rows { std::vector<Vec3> A, B; std::vector<Vec3> cent; int n = 2; std::vector<double> v; };
 
 // wallShapeRows: adaptive rows — one where either curve turns by 6° or where 1.2 loop steps have gone by (never closer
 // than 0.15 step), both curves by length fraction; the lock's centre at each row tells which side is outward
@@ -168,7 +168,7 @@ std::optional<Rows> wallShapeRows(const Scene& sc, const CurveCache& cc, const I
   bool rev = !CL.empty() && CL[0].distanceTo(PA[0]) + CL[200].distanceTo(PA[fine]) > CL[0].distanceTo(PA[fine]) + CL[200].distanceTo(PA[0]);
   auto atF = [&](double f) { double x = clamp(rev ? 1 - f : f, 0, 1) * 200; int i = std::min(199, int(std::floor(x))); return CL[i].lerp(CL[i + 1], x - i); };
   for (int q : qs) {
-    r.A.push_back(PA[q]); r.B.push_back(PB[q]);
+    r.A.push_back(PA[q]); r.B.push_back(PB[q]); if (para) r.v.push_back(double(q) / fine);
     r.cent.push_back(!CL.empty() ? atF(double(q) / fine) : (PA[q] + PB[q]) * 0.5);
   }
   return r;
@@ -226,8 +226,18 @@ void surfaceData(const Scene& sc, const CurveCache& cc, const Item& sf, const Ro
     auto f0 = fade; fade = [f0, dz, Lf](int k) { return f0(k) * ease(clamp(dz[k] / Lf, 0, 1)); };
   }
 
+  // the bulge's profile along the wall (p.bprof — fitted to a mesh: Lock lines): each row's bulge = Bulge × the profile at
+  // the row's place along the wall (by the length of the rows' middles)
+  if (!wp.twin && wp.p.value("bprof").isArray() && wp.p.value("bprof").toArray().size() >= 2 && R > 1) {
+    const QJsonArray pa = wp.p.value("bprof").toArray(); std::vector<double> pr; for (const auto& v : pa) pr.push_back(v.toDouble());
+    std::vector<double> u(size_t(R), 0); for (int k = 1; k < R; k++) u[size_t(k)] = u[size_t(k - 1)] + ((A[k] + B[k]) - (A[k - 1] + B[k - 1])).length() * 0.5;
+    const double L = u[size_t(R - 1)] > 0 ? u[size_t(R - 1)] : 1; const int n = int(pr.size());
+    auto f0 = fade; fade = [f0, u, L, pr, n](int k) { const double x = clamp(u[size_t(k)] / L, 0, 1) * (n - 1); const int i = std::min(int(x), n - 2); const double t = x - i;
+      return f0(k) * (pr[size_t(i)] * (1 - t) + pr[size_t(i + 1)] * t); };
+  }
+
   int base = int(out.pos.size()), rowBase = out.vrow.empty() ? 0 : out.vrow.back() + 1;
-  out.grids.push_back({base, R, M, wp.twin});
+  out.grids.push_back({base, R, M, wp.twin, rw.v});
   for (int k = 0; k < R; k++) {
     Vec3 w = B[k] - A[k]; double f = fade(k);
     for (int j = 0; j < M; j++) {
@@ -297,7 +307,7 @@ double usedStep(const Scene& sc) {
     if (s.type != ItemType::Surface) continue;
     for (const Item* p = s.parent >= 0 ? sc.item(s.parent) : nullptr; p; p = p->parent >= 0 ? sc.item(p->parent) : nullptr) {
       double v = p->type == ItemType::Group ? p->raw.value("conv").toObject().value("step").toDouble(0) : 0;
-      if (v > 0) { w[std::stod(QString::number(v, 'g', 6).toStdString())]++; break; }
+      if (v > 0) { w[QString::number(v, 'g', 6).toDouble()]++;   /* (Qt's own reader: always a '.', whatever the system's locale) */ break; }
     }
   }
   double best = 0; int bn = 0; for (auto& [k, n] : w) if (n > bn) { bn = n; best = k; }

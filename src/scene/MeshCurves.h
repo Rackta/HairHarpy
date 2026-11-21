@@ -7,6 +7,7 @@
 #include "scene/Display.h"
 #include "scene/Scene.h"
 #include <QString>
+#include <array>
 #include <memory>
 #include <unordered_map>
 #include <vector>
@@ -35,6 +36,9 @@ std::vector<Chain> edgeChains(const Topo& T, const std::vector<int>& sel);      
 QString edgesToCurves(Scene& sc, Selection& sel, int meshId, const std::vector<int>& edges);
 // a file's curves (polylines) as this program's curves: each fitted with anchors (sharp corners kept), in a new group
 std::vector<int> polylinesToCurves(Scene& sc, const std::vector<std::vector<Vec3>>& lines, const QString& groupName);
+// lines (root → tip) whose ends sit on shared nodes (the lines meeting at a node share its anchor — the tip where they all come together)
+// → curves, each fitted with anchors, in a new group (the ids of the curves made)
+std::vector<int> nodeLinesToCurves(Scene& sc, const std::vector<std::vector<Vec3>>& lines, const std::vector<std::array<int, 2>>& ends, const std::vector<Vec3>& nodes, const QString& groupName);
 struct M2C { int maxC = 8; double angle = 30; int count = 6; QString root = "top"; };
 QString meshToCurves(Scene& sc, Selection& sel, int meshId, const M2C& opt);
 

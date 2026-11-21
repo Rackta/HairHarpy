@@ -4,6 +4,7 @@
 // into the project, ⇉ the first model's textures onto the other selected ones. Every change — one undo step.
 #pragma once
 #include <QJsonObject>
+#include <QStringList>
 #include <functional>
 #include <vector>
 
@@ -18,6 +19,9 @@ class Scene;
 void lookChanged(Viewport* vp, const std::vector<int>& ids, const std::function<void(QJsonObject& look)>& fn);
 // the window opened on a model (opened on a selected one — every selected model with UVs)
 void openTexWindow(QWidget* parent, Viewport* vp, Scene* sc, int id, int mat = -2);   // (mat: only that UV Mat's set)
+// image files dropped on a model (mesh, its base polygon under the drop; −1 — none): each into a map of a set — the set its
+// name holds, else the one dropped on; "alpha / opacity" in the name — the Opacity map, else Colour; textures turned on → the toast
+QString dropTextures(Viewport* vp, Scene* sc, const QStringList& files, int mesh, int face);
 // the head's models with textures (the Head row's ▦ / ◐)
 std::vector<int> headLookTargets(const Scene& sc);
 

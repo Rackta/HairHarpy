@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(HairHarpy VERSION 2.0.0 LANGUAGES C CXX)
+project(HairHarpy VERSION 2.0.1 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -51,7 +51,7 @@ add_library(eigen INTERFACE)
 target_include_directories(eigen SYSTEM INTERFACE ${eigen_SOURCE_DIR})
 target_compile_definitions(eigen INTERFACE EIGEN_MPL2_ONLY)
 
-set(HM_CORE_SOURCES src/scene/Scene.cpp src/scene/CurveMath.cpp src/scene/Walls.cpp src/scene/Cocoons.cpp src/scene/HairState.cpp src/scene/Display.cpp src/scene/Network.cpp src/scene/Convert.cpp src/scene/AutoFix.cpp src/scene/Edit.cpp src/scene/Cut.cpp src/scene/AnchorOps.cpp src/scene/Crown.cpp src/io/ProjectIO.cpp src/io/MeshImport.cpp src/scene/Refs.cpp src/scene/Topo.cpp src/scene/TopoEdit.cpp src/scene/Braid.cpp src/scene/Tubes.cpp src/view/Camera.cpp)
+set(HM_CORE_SOURCES src/scene/Scene.cpp src/scene/CurveMath.cpp src/scene/Walls.cpp src/scene/WallFit.cpp src/scene/Cocoons.cpp src/scene/HairState.cpp src/scene/Display.cpp src/scene/Network.cpp src/scene/Convert.cpp src/scene/AutoFix.cpp src/scene/Edit.cpp src/scene/Cut.cpp src/scene/AnchorOps.cpp src/scene/Crown.cpp src/io/ProjectIO.cpp src/io/MeshImport.cpp src/scene/Refs.cpp src/paint/PaintDoc.cpp src/scene/Topo.cpp src/scene/TopoEdit.cpp src/scene/Braid.cpp src/scene/Tubes.cpp src/scene/Looks.cpp src/view/Camera.cpp)
 
 file(GLOB_RECURSE APP_SOURCES CONFIGURE_DEPENDS src/*.cpp src/*.h)
 if(WIN32)
@@ -75,7 +75,35 @@ qt_add_executable(hm_uvtest tools/uvtest.cpp ${HM_CORE_SOURCES} src/scene/Uv.cpp
 target_include_directories(hm_uvtest PRIVATE src)
 target_link_libraries(hm_uvtest PRIVATE Qt6::Core Qt6::Gui ufbx eigen)
 
-foreach(t HairHarpy hm_selftest hm_uvtest)
+# console check of the Paint room core: hm_painttest — layers, brush, ABR, baking on synthetic data
+qt_add_executable(hm_painttest tools/painttest.cpp src/paint/PaintDoc.cpp src/paint/Brush.cpp src/paint/Abr.cpp src/paint/Bake.cpp src/paint/Region.cpp src/paint/Psd.cpp src/paint/LayerFx.cpp)
+target_include_directories(hm_painttest PRIVATE src)
+target_link_libraries(hm_painttest PRIVATE Qt6::Core Qt6::Gui)
+
+qt_add_executable(hm_shelltest tools/shelltest.cpp ${HM_CORE_SOURCES} src/scene/OuterShell.cpp)
+target_include_directories(hm_shelltest PRIVATE src)
+target_link_libraries(hm_shelltest PRIVATE Qt6::Core Qt6::Gui ufbx)
+
+# console check of the Subdivision modifier: hm_subdivtest — a cube, an open grid, creases, the UVs
+qt_add_executable(hm_subdivtest tools/subdivtest.cpp src/scene/Subdiv.cpp)
+target_include_directories(hm_subdivtest PRIVATE src)
+target_link_libraries(hm_subdivtest PRIVATE Qt6::Core Qt6::Gui)
+
+# console check of the primitives: hm_primtest <outdir> — PolySphere Stretch closed, counts, side-view PNGs
+qt_add_executable(hm_primtest tools/primtest.cpp src/scene/Primitives.cpp)
+target_include_directories(hm_primtest PRIVATE src)
+target_link_libraries(hm_primtest PRIVATE Qt6::Core Qt6::Gui)
+
+
+# console check of the hair flow coordinates (the Paint room's anime highlight groundwork): hm_flowtest <project> <outdir>
+qt_add_executable(hm_flowtest tools/flowtest.cpp ${HM_CORE_SOURCES} src/paint/HairFlow.cpp)
+target_include_directories(hm_flowtest PRIVATE src)
+target_link_libraries(hm_flowtest PRIVATE Qt6::Core Qt6::Gui ufbx)
+# console check of the cocoons' loops: hm_ringtest <project> [name part] — the largest gap between two loops per cocoon
+qt_add_executable(hm_ringtest tools/ringtest.cpp ${HM_CORE_SOURCES})
+target_include_directories(hm_ringtest PRIVATE src)
+target_link_libraries(hm_ringtest PRIVATE Qt6::Core Qt6::Gui ufbx)
+foreach(t HairHarpy hm_selftest hm_uvtest hm_painttest hm_subdivtest hm_shelltest hm_flowtest hm_primtest hm_ringtest)
   if(MSVC)
     target_compile_options(${t} PRIVATE /W3 /permissive- /utf-8)
     target_compile_definitions(${t} PRIVATE NOMINMAX _USE_MATH_DEFINES _CRT_SECURE_NO_WARNINGS)
@@ -103,6 +131,9 @@ qt_add_resources(HairHarpy images PREFIX /img BASE resources/images FILES ${HM_I
 # the bridge scripts (Blender add-on, Maya script) — saved from the Bridge panel
 file(GLOB HM_BRIDGE CONFIGURE_DEPENDS resources/bridge/*)
 qt_add_resources(HairHarpy bridge PREFIX /bridge BASE resources/bridge FILES ${HM_BRIDGE})
+# Head Collision's preset shapes (besides the primitives): :/coll/<name>.fbx
+file(GLOB HM_COLL CONFIGURE_DEPENDS resources/collision/*)
+qt_add_resources(HairHarpy collision PREFIX /coll BASE resources/collision FILES ${HM_COLL})
 # the FAQ (its sections, the search's synonyms and stop words — taken from the HTML version)
 qt_add_resources(HairHarpy faq PREFIX /faq BASE resources/faq FILES resources/faq/faq.json)
 
@@ -128,4 +159,13 @@ if(HM_DEVTOOLS)
     target_link_options(HairHarpy PRIVATE /DEBUG /OPT:REF /OPT:ICF /MAP)
     target_link_libraries(HairHarpy PRIVATE dbghelp)
   endif()
+endif()
+
+# lock lines on a real mesh: hm_lltest (polypaint / hard edges / creases → the lock's curves)
+qt_add_executable(hm_lltest tools/lltest.cpp src/scene/LockLines.cpp src/scene/MeshCurves.cpp src/scene/MeshMods.cpp src/scene/Subdiv.cpp ${HM_CORE_SOURCES})
+target_include_directories(hm_lltest PRIVATE src)
+target_link_libraries(hm_lltest PRIVATE Qt6::Core Qt6::Gui ufbx)
+if(MSVC)
+  target_compile_options(hm_lltest PRIVATE /W3 /permissive- /utf-8)
+  target_compile_definitions(hm_lltest PRIVATE NOMINMAX _USE_MATH_DEFINES _CRT_SECURE_NO_WARNINGS)
 endif()

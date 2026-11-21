@@ -1,5 +1,6 @@
 #include "scene/MeshMods.h"
 #include "scene/Edit.h"
+#include "scene/Subdiv.h"
 #include "scene/Topo.h"
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -33,10 +34,12 @@ std::vector<Vec3> vertexNormals(const PolyMesh& m) {
   for (auto& v : n) v = v.normalized();
   return n;
 }
-const std::vector<Vec3>& baseNormals(const PolyMesh* b) {
-  static std::map<const PolyMesh*, std::pair<size_t, std::vector<Vec3>>> cache;
-  auto& e = cache[b]; if (e.first != b->pos.size() || e.second.size() != b->pos.size()) { e.first = b->pos.size(); e.second = vertexNormals(*b); }
-  return e.second;
+const std::vector<Vec3>& baseNormals(const std::shared_ptr<PolyMesh>& b) {
+  struct E { std::weak_ptr<PolyMesh> w; std::vector<Vec3> n; };
+  static std::map<const PolyMesh*, E> cache;
+  for (auto i = cache.begin(); i != cache.end();) { if (i->second.w.expired()) i = cache.erase(i); else ++i; }   // (the bases gone: their normals dropped — a new one at the same address starts afresh)
+  auto& e = cache[b.get()]; if (e.w.lock() != b || e.n.size() != b->pos.size()) { e.w = b; e.n = vertexNormals(*b); }
+  return e.n;
 }
 }  // namespace
 
@@ -48,7 +51,9 @@ std::vector<int> modsOf(const Scene& sc, int mesh) {
 Vec3 baseCenter(const Item& m) { const PolyMesh* b = baseOf(m); return b ? b->bounds().center() : Vec3(); }
 double baseSize(const Item& m) { const PolyMesh* b = baseOf(m); if (!b) return 1; double s = b->bounds().size().length(); return s > 0 ? s : 1; }
 // (no limit now — any mesh is edited, wired; HM_HEAVY_TRIS / HM_WIRE_TRIS set one back)
+bool paintVis = false;
 std::vector<char> hiddenFaces(const Item& m, const PolyMesh& B) {
+  if (paintVis) { const QString pf = m.raw.value("pHidF").toString(); if (pf.isEmpty()) return {}; std::vector<char> h = topo::smDec(pf, B.faceCount()); if (int(h.size()) != B.faceCount()) return {}; return h; }
   const QJsonArray hg = m.raw.value("hidGroups").toArray(); const QString hf = m.raw.value("hidF").toString();
   if (hg.isEmpty() && hf.isEmpty()) return {};
   std::vector<char> h = hf.isEmpty() ? std::vector<char>(size_t(B.faceCount()), 0) : topo::smDec(hf, B.faceCount());
@@ -57,13 +62,8 @@ std::vector<char> hiddenFaces(const Item& m, const PolyMesh& B) {
     for (int f = 0; f < B.faceCount() && size_t(f) < B.faceGroup.size(); f++) if (gs.count(B.faceGroup[size_t(f)])) h[size_t(f)] = 1; }
   return h;
 }
-QByteArray hiddenSig(const Item& m) { return QJsonDocument(m.raw.value("hidGroups").toArray()).toJson(QJsonDocument::Compact) + "|" + m.raw.value("hidF").toString().toUtf8(); }
+QByteArray hiddenSig(const Item& m) { if (paintVis) return "P|" + m.raw.value("pHidF").toString().toUtf8(); return QJsonDocument(m.raw.value("hidGroups").toArray()).toJson(QJsonDocument::Compact) + "|" + m.raw.value("hidF").toString().toUtf8(); }
 
-long long heavyTris() { static const long long v = qEnvironmentVariableIsSet("HM_HEAVY_TRIS") ? qEnvironmentVariable("HM_HEAVY_TRIS").toLongLong() : (1LL << 62); return v; }
-bool heavy(const PolyMesh& b) { return (long long)b.faceVerts.size() - 2LL * b.faceCount() >= heavyTris(); }   // (triangles: corners − 2 per polygon)
-bool heavy(const Item& m) { const PolyMesh* b = baseOf(m); return b && heavy(*b); }
-long long wireTris() { static const long long v = qEnvironmentVariableIsSet("HM_WIRE_TRIS") ? qEnvironmentVariable("HM_WIRE_TRIS").toLongLong() : heavyTris(); return v; }
-bool wireless(const Item& m) { const PolyMesh* b = baseOf(m); return b && (long long)b->faceVerts.size() - 2LL * b->faceCount() >= wireTris(); }
 
 Affine xformMatrix(const QJsonObject& p, const Vec3& c0) {
   Vec3 c = p.value("cx").isDouble() ? Vec3(num(p, "cx", 0), num(p, "cy", 0), num(p, "cz", 0)) : c0;
@@ -86,7 +86,7 @@ std::vector<Affine> vsymCopies(const QJsonObject& vs) {
   auto refl = [&](int axis) { Affine F; F.L[axis][axis] = -1; return F; };
   std::vector<Affine> out;
   // (Mirror by sides: every axis picked — a copy for each mix of them: X and Y — three)
-  if (type == "mirror" && vs.value("axes").isArray() && !vs.value("axes").toArray().isEmpty()) {
+  if (type == "mirror" && vs.value("axes").isArray()) {   // (every axis switched off: nothing mirrored — not the old single axis)
     std::vector<int> ax; for (const QJsonValue& x : vs.value("axes").toArray()) { const int k = QString("xyz").indexOf(x.toString().left(1)); if (k >= 0 && std::find(ax.begin(), ax.end(), k) == ax.end()) ax.push_back(k); }
     for (int mask = 1; mask < (1 << ax.size()); mask++) { Affine T; for (size_t i = 0; i < ax.size(); i++) if (mask >> i & 1) T = Affine::mul(refl(ax[i]), T); out.push_back(T); }
     return out; }
@@ -97,8 +97,22 @@ std::vector<Affine> vsymCopies(const QJsonObject& vs) {
   return out;
 }
 QJsonObject vsymOf(const Scene& sc, const Item& m, const Item** group = nullptr) {
-  for (const Item* x = &m; x; x = x->parent >= 0 ? sc.item(x->parent) : nullptr) if (x->type == ItemType::Group && x->raw.value("vsym").isObject()) { if (group) *group = x; return x->raw.value("vsym").toObject(); }
+  for (const Item* x = &m; x; x = x->parent >= 0 ? sc.item(x->parent) : nullptr) if (x->type == ItemType::Group && x->raw.value("vsym").isObject() && !x->raw.value("vsym").toObject().value("off").toBool()) { if (group) *group = x; return x->raw.value("vsym").toObject(); }
   return {};
+}
+// a Subdivision group above a mesh (the nearest, not switched off): its settings
+QJsonObject subdivOf(const Scene& sc, const Item& m) {
+  for (const Item* x = &m; x; x = x->parent >= 0 ? sc.item(x->parent) : nullptr) if (x->type == ItemType::Group && x->raw.value("subdiv").isObject() && !x->raw.value("subdiv").toObject().value("off").toBool()) return x->raw.value("subdiv").toObject();
+  return {};
+}
+// the smooth surface of the mesh shown (the cage stays what is picked and edited)
+void makeSubd(const Scene& sc, Item& m) {
+  m.subd.reset(); m.subdGrid = false; m.subdDone = 0;
+  const QJsonObject sd = subdivOf(sc, m); if (sd.isEmpty() || !m.poly || m.poly->faceCount() == 0) return;
+  const subdiv::Opts o = subdiv::optsOf(sd); if (o.level <= 0) return;
+  // (the levels' own shape kept by Reconstruct: put back while the polygons are those of the base it was made for)
+  std::vector<subdiv::Detail> det; if (m.raw.contains("subdDetail") && m.base && m.poly->pos.size() == m.base->pos.size() && m.poly->faceCount() == m.base->faceCount()) det = subdiv::unpackDetails(m.raw.value("subdDetail"));
+  m.subd = subdiv::run(*m.poly, o, &m.subdDone, 2500000, det.empty() ? nullptr : &det); m.subdGrid = sd.value("grid").toBool(false);
 }
 Quat quatOfJ(const QJsonValue& v) { const QJsonArray a = v.toArray(); return a.size() == 4 ? Quat{a[0].toDouble(), a[1].toDouble(), a[2].toDouble(), a[3].toDouble()}.normalized() : Quat{}; }
 Affine frameOf(const Quat& q, const Vec3& o) { Affine G; const Vec3 E[3] = {q.rotate({1, 0, 0}), q.rotate({0, 1, 0}), q.rotate({0, 0, 1})};
@@ -155,7 +169,7 @@ std::vector<int> refresh(Scene& sc, std::map<int, QByteArray>& sig, const std::f
     bool shown = weightsShown && weightsShown(id);
     const Item* vg = nullptr; const QJsonObject vsym = vsymOf(sc, m, &vg);   // (a group's virtual symmetry: its copies shown with the mesh — about its frame)
     std::vector<Affine> vTs; if (vg) vTs = vsymWorld(sc, *vg);
-    QByteArray s = QByteArray::number(quintptr(m.base.get())) + (shown ? "S" : "-") + hiddenSig(m) + QJsonDocument(vsym).toJson(QJsonDocument::Compact);
+    QByteArray s = QByteArray::number(quintptr(m.base.get())) + (shown ? "S" : "-") + hiddenSig(m) + QJsonDocument(vsym).toJson(QJsonDocument::Compact) + "|sd" + QJsonDocument(subdivOf(sc, m)).toJson(QJsonDocument::Compact) + "|dt" + QByteArray::number(m.raw.value("subdDetail").toArray().size());
     for (auto& T : vTs) { s += QByteArray::number(T.t.x, 'g', 9) + "," + QByteArray::number(T.t.y, 'g', 9) + "," + QByteArray::number(T.t.z, 'g', 9) + ",";
       for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) s += QByteArray::number(T.L[i][j], 'g', 9) + ","; }
     for (auto* x : ex) s += QJsonDocument(x->raw).toJson(QJsonDocument::Compact);
@@ -163,7 +177,7 @@ std::vector<int> refresh(Scene& sc, std::map<int, QByteArray>& sig, const std::f
     sig[id] = s; changed.push_back(id);
     const PolyMesh& B = *m.base; const size_t n = B.pos.size();
     const std::vector<char> hidF = hiddenFaces(m, *m.base);
-    if (ex.empty() && hidF.empty() && !shown && vsym.isEmpty()) { m.poly = m.base; continue; }
+    if (ex.empty() && hidF.empty() && !shown && vsym.isEmpty()) { m.poly = m.base; makeSubd(sc, m); continue; }
     auto P = std::make_shared<PolyMesh>(); P->pos = B.pos; P->groupNames = B.groupNames;
     if (B.vcol.size() == n) P->vcol = B.vcol;                  // (the polypaint kept — a polygroup hidden, a modifier on)
     // Thickness: the weights push the surface along its normals (its mask holds them back, an older Mask modifier too)
@@ -171,7 +185,7 @@ std::vector<int> refresh(Scene& sc, std::map<int, QByteArray>& sig, const std::f
     std::vector<std::vector<double>> holds, thicks; std::vector<double> amts;
     for (auto* x : ex) if (x->raw.value("kind").toString() == "thick" && x->raw.value("mask").isArray()) { thicks.push_back(arr(x->raw.value("mask"))); holds.push_back(arr(x->raw.value("hold"))); amts.push_back(num(x->raw.value("p").toObject(), "amt", 0)); }
     auto weight = [&](size_t t, size_t v) { double w = v < holds[t].size() ? 1 - holds[t][v] : 1; for (auto& mk : masks) if (v < mk.size()) w *= 1 - mk[v]; return w; };
-    if (!thicks.empty()) { const auto& N = baseNormals(&B);
+    if (!thicks.empty()) { const auto& N = baseNormals(m.base);
       for (size_t t = 0; t < thicks.size(); t++) for (size_t v = 0; v < n && v < thicks[t].size(); v++) { double w = thicks[t][v]; if (!w) continue; P->pos[v] += N[v] * (w * amts[t] * weight(t, v)); } }
     // the weights shown while worked on: mask dark, thickness orange (out) / blue (in)
     if (shown) {
@@ -205,13 +219,16 @@ std::vector<int> refresh(Scene& sc, std::map<int, QByteArray>& sig, const std::f
       if (B.cornerUV.size() == B.faceVerts.size()) P->cornerUV.insert(P->cornerUV.end(), B.cornerUV.begin() + s0, B.cornerUV.begin() + e0);   // (its texture: UVs, material slots)
       if (hasN) for (int k = s0; k < e0; k++) P->cornerNormal.push_back(turnN(B.cornerNormal[size_t(k)]));
       if (size_t(fi) < B.faceMat.size()) P->faceMat.push_back(B.faceMat[size_t(fi)]);
+      if (size_t(fi) < B.faceSets.size()) P->faceSets.push_back(B.faceSets[size_t(fi)]); if (size_t(fi) < B.faceLive.size()) P->faceLive.push_back(B.faceLive[size_t(fi)]);   // (its UV set: the export names its material so)
     }
-    P->matNames = B.matNames; P->matMaps = B.matMaps; P->matColor = B.matColor; P->matAlpha = B.matAlpha; P->flipY = B.flipY;
+    P->uvSetNames = B.uvSetNames; P->matNames = B.matNames; P->matMaps = B.matMaps; P->matColor = B.matColor; P->matAlpha = B.matAlpha; P->flipY = B.flipY;
     P->hardEdges = B.hardEdges; P->creases = B.creases; P->seams = B.seams;
     if (!vsym.isEmpty()) {                                       // (the copies after the mesh's own vertices and polygons: its own indices stay)
       const size_t n0 = P->pos.size(); const int nf0 = P->faceCount(); const bool uv = P->cornerUV.size() == P->faceVerts.size(), cn = P->cornerNormal.size() == P->faceVerts.size() && !P->cornerNormal.empty();
-      const auto& Ts = vTs; int k = 0;
+      const auto& Ts = vTs; int k = 0; const auto he0 = P->hardEdges; const auto cr0 = P->creases; const auto se0 = P->seams;
       for (const Affine& T : Ts) { k++; const bool flip = T.det() < 0;
+        const int sh = int(n0) * k;                              // (the copy's edge marks: the original's, on its own vertices)
+        for (const auto& e : he0) P->hardEdges.push_back({e[0] + sh, e[1] + sh}); for (const auto& c : cr0) { PolyMesh::Crease q = c; q.a += sh; q.b += sh; P->creases.push_back(q); } for (const auto& e : se0) P->seams.push_back({e[0] + sh, e[1] + sh});
         for (size_t v = 0; v < n0; v++) P->pos.push_back(T.apply(P->pos[v]));
         if (P->vcol.size() >= n0) for (size_t v = 0; v < n0; v++) P->vcol.push_back(P->vcol[v]);
         for (int fi = 0; fi < nf0; fi++) { const int s0 = P->faceStart[size_t(fi)], e0 = P->faceStart[size_t(fi) + 1]; std::vector<int> vs; std::vector<std::array<float, 2>> us; std::vector<std::array<float, 3>> ns;
@@ -219,9 +236,9 @@ std::vector<int> refresh(Scene& sc, std::map<int, QByteArray>& sig, const std::f
             if (cn) { const auto& o = P->cornerNormal[size_t(q)]; Vec3 w = T.lin(Vec3(o[0], o[1], o[2])); w = w.lengthSq() > 0 ? w.normalized() : w; ns.push_back({float(w.x), float(w.y), float(w.z)}); } }
           if (flip) { std::reverse(vs.begin(), vs.end()); std::reverse(us.begin(), us.end()); std::reverse(ns.begin(), ns.end()); }
           P->addFace(vs.data(), int(vs.size())); if (uv) P->cornerUV.insert(P->cornerUV.end(), us.begin(), us.end()); if (cn) P->cornerNormal.insert(P->cornerNormal.end(), ns.begin(), ns.end());
-          if (size_t(fi) < P->faceGroup.size()) P->faceGroup.push_back(P->faceGroup[size_t(fi)]); if (size_t(fi) < P->faceMat.size()) P->faceMat.push_back(P->faceMat[size_t(fi)]); } }
+          if (size_t(fi) < P->faceGroup.size()) P->faceGroup.push_back(P->faceGroup[size_t(fi)]); if (size_t(fi) < P->faceMat.size()) P->faceMat.push_back(P->faceMat[size_t(fi)]); if (size_t(fi) < P->faceSets.size()) P->faceSets.push_back(P->faceSets[size_t(fi)]); if (size_t(fi) < P->faceLive.size()) P->faceLive.push_back(P->faceLive[size_t(fi)]); } }
     }
-    m.poly = P;
+    m.poly = P; makeSubd(sc, m);
   }
   for (auto it = sig.begin(); it != sig.end();) { if (!alive.count(it->first)) it = sig.erase(it); else ++it; }
   return changed;
@@ -230,7 +247,6 @@ std::vector<int> refresh(Scene& sc, std::map<int, QByteArray>& sig, const std::f
 int newMeshExtra(Scene& sc, int mesh, const QString& kind, QString* msg) {
   Item* m = sc.item(mesh); if (!m) return -1;
   const PolyMesh* B = baseOf(*m); if (!B) return -1;
-  if (heavy(*m) && kind != "xform") { if (msg) *msg = QObject::tr("%1: Over 300 000 triangles: no wireframe and not editable (it can be moved, rotated, scaled)").arg(m->name); return -1; }
   double size = baseSize(*m); QJsonObject p;
   if (kind == "xform") { p = QJsonObject{{"px", 0}, {"py", 0}, {"pz", 0}, {"rx", 0}, {"ry", 0}, {"rz", 0}, {"sx", 1}, {"sy", 1}, {"sz", 1}};
     QJsonArray pv = m->raw.value("pivot").toArray(); if (pv.size() == 3) { p.insert("cx", pv[0]); p.insert("cy", pv[1]); p.insert("cz", pv[2]); } }
@@ -277,7 +293,7 @@ void setMeshMatrix(Scene& sc, int mesh, const Affine& W) {
 bool paintWeights(Scene& sc, int xmod, bool hold, const QString& op, double target, double lo, double amt, bool absMode,
                   double brushR, const std::function<double(double)>& brushWeight, const ScreenFn& screen, const Vec3& eye, bool ortho, const Vec3& camDir) {
   Item* x = sc.item(xmod); if (!x) return false; Item* m = sc.item(x->raw.value("mesh").toInt(-1));
-  if (!m || !m->poly || heavy(*m) || !sc.isVisible(*m)) return false;
+  if (!m || !m->poly || !sc.isVisible(*m)) return false;
   const char* key = hold ? "hold" : "mask";
   std::vector<double> W = arr(x->raw.value(key)); const size_t n = m->poly->pos.size(); if (W.size() != n) W.resize(n, 0);
   const auto src = W; const auto N = vertexNormals(*m->poly);

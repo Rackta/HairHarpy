@@ -6,13 +6,13 @@
 #include "view/Viewport.h"
 #include "scene/MeshMods.h"
 #include <QDateTime>
+#include <algorithm>
 #include <cmath>
 #include <set>
 
 namespace hm {
 
 namespace {
-bool heavy(const PolyMesh& m) { return meshmods::heavy(m); }
 double segDist2(double mx, double my, const ScreenPt& a, const ScreenPt& b) {
   double vx = b.x - a.x, vy = b.y - a.y, l2 = vx * vx + vy * vy, t = l2 > 0 ? clamp(((mx - a.x) * vx + (my - a.y) * vy) / l2, 0, 1) : 0;
   return std::hypot(a.x + vx * t - mx, a.y + vy * t - my);
@@ -21,7 +21,7 @@ double segDist2(double mx, double my, const ScreenPt& a, const ScreenPt& b) {
 
 std::optional<Viewport::EdgePick> Viewport::pickEdge(const QPointF& m, bool hover) const {
   std::vector<const Item*> list;
-  for (auto& [id, it] : scene_->items) if ((it.type == ItemType::IMesh || it.type == ItemType::Mesh) && it.poly && scene_->isVisible(it) && !heavy(*it.poly)) list.push_back(&it);
+  for (auto& [id, it] : scene_->items) if ((it.type == ItemType::IMesh || it.type == ItemType::Mesh) && it.poly && scene_->isVisible(it)) list.push_back(&it);
   if (list.empty()) return std::nullopt;
   Projector P = projector();
   auto nearIn = [&](const Item* it, const meshc::Topo& T, const std::vector<int>& cand, double maxD) -> std::optional<EdgePick> {
@@ -70,7 +70,7 @@ void Viewport::edgeClick(const QPointF& m, bool ctrl, bool shift) {
   if (dbl) edgeClick_ = {}; else { edgeClick_.mesh = r->mesh; edgeClick_.e = r->e; edgeClick_.t = now; }
   bool same = edges.mesh == r->mesh; auto T = meshc::topoOf(*scene_->item(r->mesh)->poly);
   if (ctrl && shift) {                                       // the shortest path from the last picked edge
-    if (same && edges.last >= 0 && edges.last != r->e && !edges.list.empty()) {
+    if (same && edges.last >= 0 && edges.last < T->ne && edges.last != r->e && !edges.list.empty()) {   // (the last edge still one of the mesh's)
       auto p = meshc::edgePath(*T, scene_->item(r->mesh)->poly->pos, edges.last, r->e);
       if (!p.empty()) setEdgeSel(r->mesh, p, "add"); else { ui::toast(tr("No path between these edges (different parts of the mesh)")); setEdgeSel(r->mesh, {r->e}, "add"); }
     } else setEdgeSel(r->mesh, {r->e}, same ? "add" : "set");
@@ -87,7 +87,8 @@ void Viewport::edgeClick(const QPointF& m, bool ctrl, bool shift) {
 void Viewport::edgeBoxDeselect(double x0, double y0, double x1, double y1) {
   const Item* it = scene_->item(edges.mesh); if (!it || !it->poly || edges.list.empty()) return;
   auto T = meshc::topoOf(*it->poly); Projector P = projector(); std::vector<int> out;
-  for (int e : edges.list) { ScreenPt s = P.toScreen((it->poly->pos[size_t(T->ea[size_t(e)])] + it->poly->pos[size_t(T->eb[size_t(e)])]) * 0.5);
+  for (int e : edges.list) { if (e < 0 || e >= T->ne) continue;   // (picked on the mesh as it was before an edit: not its edge any more)
+    ScreenPt s = P.toScreen((it->poly->pos[size_t(T->ea[size_t(e)])] + it->poly->pos[size_t(T->eb[size_t(e)])]) * 0.5);
     if (s.z < 1 && s.x >= x0 && s.x <= x1 && s.y >= y0 && s.y <= y1) out.push_back(e); }
   if (out.empty()) return;
   setEdgeSel(edges.mesh, out, "remove"); emit brushChanged();
@@ -110,6 +111,8 @@ int Viewport::convertibleMesh() const {
 }
 void Viewport::edgesToCurves() {
   int mesh = edges.mesh; auto list = edges.list;
+  if (const Item* it = scene_->item(mesh); it && it->poly) { auto T = meshc::topoOf(*it->poly);   // (only the edges the mesh has now)
+    list.erase(std::remove_if(list.begin(), list.end(), [&](int e) { return e < 0 || e >= T->ne; }), list.end()); }
   runEdit([mesh, list](Scene& s, Selection& sl, const CurveCache&) { return meshc::edgesToCurves(s, sl, mesh, list); }, true);
 }
 void Viewport::meshToCurves(int mesh) {

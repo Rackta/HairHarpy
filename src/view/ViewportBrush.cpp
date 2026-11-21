@@ -34,7 +34,15 @@ double Viewport::brushWeight(double d) const {
 
 // the anchors the brush works on: the shown ones (not a disc's) — with curves / a disc selected, only theirs
 std::vector<int> Viewport::brushAnchors() const {
+  if (room() == "topo") {                                    // (the HairPreview: the anchors of the selected folders' curves — the Hair room's brush)
+    std::set<int> set; std::function<void(int)> add = [&](int id) { const Item* it = scene_->item(id); if (!it || !hairPreviewItem(id)) return;
+      if (it->type == ItemType::Group) for (int c : it->children) add(c); else if (it->type == ItemType::Curve && it->ring < 0) set.insert(it->anchors.begin(), it->anchors.end()); };
+    for (int id : sel_.items) add(id);
+    return std::vector<int>(set.begin(), set.end());
+  }
   std::set<int> set; bool limit = false;
+  // (anchors selected: only they — 21.11: a few anchors picked, the brush moved every anchor under it)
+  if (!sel_.anchors.empty()) { std::vector<int> out; for (int a : sel_.anchors) if (scene_->anchor(a) && !edit::isRingAnchor(*scene_, a)) out.push_back(a); return out; }
   for (int id : sel_.items) {
     const Item* it = scene_->item(id); if (!it) continue;
     if (it->type == ItemType::Curve && it->ring < 0) { limit = true; set.insert(it->anchors.begin(), it->anchors.end()); }
@@ -70,12 +78,23 @@ std::vector<std::pair<int, double>> Viewport::brushCapture(const QPointF& m) con
   return out;
 }
 
+// (the frozen handles round anchors a stroke moves unevenly let go — the curves through them smooth again, as after one anchor's drag:
+//  21.11, many locks brushed came out wavy until each curve's anchor was dragged by hand; a copy brushed with its original parted from
+//  it between the anchors)
+bool brushFreesHandles = true;                               // (checks: off — the stroke as before, to compare)
+void Viewport::releaseBrushed(const std::map<int, double>& W) {
+  if (!brushFreesHandles) return;
+  auto rel = releaseFrozenBrushed(*scene_, W);
+  if (!rel.empty()) { std::vector<int> r; for (auto& x : rel) r.push_back(x.anchor); markCurves(curvesTouching(*scene_, r)); }
+}
+
 void Viewport::startBrush(const QPointF& m, bool smooth) {
   bd_ = {}; bd_.last = m;
   if (smooth) { drag_ = Drag::BrushSmooth; ui::hud(tr("Smooth brush")); smoothStep(m); return; }
   bd_.n = cam_.dir();
   for (auto [a, w] : brushCapture(m)) { Vec3 p = scene_->anchor(a)->pos; bd_.cap.push_back({a, w, p, planeHit(ray(m), p, bd_.n), {}}); }
   { std::vector<int> l; for (auto& c : bd_.cap) l.push_back(c.a); hsym_ = hairSymTwins(l); }   // (Symmetry: the brushed anchors' twins follow mirrored)
+  { std::map<int, double> W; for (auto& c : bd_.cap) W[c.a] = c.w; for (int t : hsym_.twinIds()) W.try_emplace(t, 0.5); releaseBrushed(W); }
   // (both sides under the brush — the crown brushed across its middle: each side moved by the stroke and by its mirror,
   // not both the same way)
   for (size_t i = 0; i < bd_.cap.size(); i++) for (size_t k = 0; k < hsym_.T.size(); k++) { const Vec3 m = hsym_.T[k].apply(bd_.cap[i].start); int best = -1; double bdist = symo.tol;
@@ -98,6 +117,7 @@ void Viewport::smoothStep(const QPointF& m) {
     if (n) moves.push_back({a, t / double(n), w * 0.15});
   }
   HairSym H; { std::vector<int> l; for (auto& x : moves) l.push_back(std::get<0>(x)); H = hairSymTwins(l); }   // (Symmetry: each step's twins)
+  { std::map<int, double> W; for (auto& x : moves) W[std::get<0>(x)] = 0.5; for (int t : H.twinIds()) W.try_emplace(t, 0.5); releaseBrushed(W); }
   for (auto& [a, t, w] : moves) { Anchor* an = scene_->anchor(a); an->pos = an->pos.lerp(t, w); }
   if (!H.start.empty()) hairSymApply(H);
   if (!moves.empty()) { std::vector<int> l; for (auto& x : moves) l.push_back(std::get<0>(x)); const auto tw = H.twinIds(); l.insert(l.end(), tw.begin(), tw.end()); markCurves(curvesTouching(*scene_, l)); bd_.moved = true; scene_->revision++; }
@@ -123,6 +143,7 @@ void Viewport::startInflate(const QPointF& m, int sign) {
     if (n >= 2) bd_.cap.push_back({a, w, p, std::nullopt, cen / double(n)});
   }
   { std::vector<int> l; for (auto& c : bd_.cap) l.push_back(c.a); hsym_ = hairSymTwins(l); }   // (Symmetry: their twins too)
+  { std::map<int, double> W; for (auto& c : bd_.cap) W[c.a] = 0.5; for (int t : hsym_.twinIds()) W.try_emplace(t, 0.5); releaseBrushed(W); }   // (each anchor its own way: never one piece)
   drag_ = Drag::Inflate;
   ui::hud(!bd_.cap.empty() ? (sign > 0 ? tr("Inflate: drag — fatter") : tr("Shrink: drag — thinner")) : tr("No lock anchors under the brush"));
 }

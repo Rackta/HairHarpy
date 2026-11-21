@@ -7,6 +7,7 @@
 #include "ui/Theme.h"
 #include <QApplication>
 #include <QCursor>
+#include <QCloseEvent>
 #include <QKeyEvent>
 #include <QLabel>
 #include <QMouseEvent>
@@ -72,7 +73,7 @@ void Pie::layoutItems() {
       int idx = int(btns_.size()); btns_.push_back(b);
       // (its sub-list: above it, centred)
       if (!list[size_t(i)].sub.empty()) {
-        const auto& sub = list[size_t(i)].sub; int sw = 0; for (auto& s : sub) sw = std::max(sw, itemSize(s).width());
+        const auto& sub = list[size_t(i)].sub; int sw = b.r.width(); for (auto& s : sub) sw = std::max(sw, itemSize(s).width());   // (no narrower than its item: it covers the items it lies over whole — none of them in the way up to it)
         int sn = int(sub.size()), sh = h, st = sn * sh + (sn - 1) * 4;
         for (int k = 0; k < sn; k++) { Btn s; s.r = QRect(b.r.center().x() - sw / 2, b.r.top() - 6 - st + k * (sh + 4), sw, sh); s.it = &sub[size_t(k)]; s.level = 1; s.parent = idx; btns_.push_back(s); }
       }
@@ -102,7 +103,7 @@ void Pie::layoutItems() {
       for (int i = 0; i < ni; i++) {
         const PieItem& it = spec_.inner[size_t(i)]; double a = -PI / 2 + i * innerStep_;
         QPoint p = c_ + QPoint(int(std::lround(std::cos(a) * innerR_)), int(std::lround(std::sin(a) * innerR_)));
-        QSize s(fm.horizontalAdvance(it.label) + 24, fm.height() + 2 * PADY + 2);
+        QSize s = it.icon.isEmpty() ? QSize(fm.horizontalAdvance(it.label) + 24, fm.height() + 2 * PADY + 2) : QSize(ringIcon() + 14, ringIcon() + 14);   // (an icon: a square for it)
         Btn b; b.r = QRect(p.x() - s.width() / 2, p.y() - s.height() / 2, s.width(), s.height()); b.it = &it; b.ring = true; b.inner = true; b.ang = a;
         btns_.push_back(b);
       }
@@ -113,9 +114,18 @@ void Pie::layoutItems() {
 
 int Pie::hit(const QPoint& p) const {
   // (an open sub-list first: it lies over other items)
+  if (openSub_ >= 0) {
+    QRect sl; for (size_t i = 0; i < btns_.size(); i++) { const Btn& b = btns_[i]; if (b.level == 1 && b.parent == openSub_) { if (b.r.contains(p)) return int(i); sl |= b.r; } }
+    // (the way to it keeps it open — the gaps between its items, the gap down to its item and beside it: the pointer is on
+    // its item still. Before, the 6 px between the item and the list, or an item beside the narrower list, closed it on the
+    // way up — 2026-11-19 user report «Rotate junction»)
+    if (!sl.isNull()) { const QRect pr = btns_[size_t(openSub_)].r;
+      const QRect way(QPoint(std::min(sl.left(), pr.left()), sl.top()), QPoint(std::max(sl.right(), pr.right()), pr.bottom()));
+      if (way.contains(p)) return openSub_; }
+  }
   for (int i = int(btns_.size()) - 1; i >= 0; i--) {
     const Btn& b = btns_[size_t(i)];
-    if (b.level == 1 && openSub_ != b.parent) continue;
+    if (b.level == 1) continue;
     if (b.r.contains(p)) return i;
   }
   return -1;
@@ -165,6 +175,40 @@ void Pie::finish(bool cancelled) {
   auto cb = onCancel_;
   close();
   if (cancelled && cb) cb();
+}
+
+// (closed by the system — a popup goes when the window loses focus, a dialog opens over it: its end still runs; 20.11: Detect's
+// outline stayed drawn after its pie went that way)
+void Pie::closeEvent(QCloseEvent* e) {
+  if (cur_ == this) {
+    cur_ = nullptr; dwell_->stop();
+    if (hot_ >= 0 && btns_[size_t(hot_)].it->hot) btns_[size_t(hot_)].it->hot(false);
+    if (spec_.onEnd) spec_.onEnd();
+  }
+  QWidget::closeEvent(e);
+}
+
+QString Pie::subWalk() {
+  QStringList out; const int n = int(btns_.size());
+  for (int i = 0; i < n; i++) {
+    if (btns_[size_t(i)].level != 0 || btns_[size_t(i)].it->sub.empty()) continue;
+    for (int k = 0; k < n; k++) {
+      if (btns_[size_t(k)].level != 1 || btns_[size_t(k)].parent != i) continue;
+      // (straight and slanting: from the item's centre and from its corners to the sub-item's centre)
+      const QRect pr = btns_[size_t(i)].r; const QPoint to = btns_[size_t(k)].r.center(); int lost = 0; QPoint at;
+      for (QPoint from : {pr.center(), QPoint(pr.left() + 3, pr.center().y()), QPoint(pr.right() - 3, pr.center().y())}) {
+        setHot(-1); const int steps = std::max(std::abs(to.x() - from.x()), std::abs(to.y() - from.y()));
+        for (int s = 0; s <= steps; s++) {
+          const QPoint p = from + (to - from) * (double(s) / std::max(1, steps));
+          QMouseEvent ev(QEvent::MouseMove, QPointF(p), QPointF(mapToGlobal(p)), Qt::NoButton, Qt::NoButton, Qt::NoModifier); mouseMoveEvent(&ev);
+          if (openSub_ != i) { lost++; if (at.isNull()) at = p - pr.center(); break; }
+        }
+      }
+      out << QString("'%1' → '%2': %3").arg(btns_[size_t(i)].it->label, btns_[size_t(k)].it->label, lost ? QString("CLOSED %1/3 (first at %2,%3 from the item)").arg(lost).arg(at.x()).arg(at.y()) : QString("ok 3/3"));
+    }
+  }
+  // (the pointer left on the last sub-item: the list open for a picture)
+  return out.isEmpty() ? QString("no sub-lists") : out.join(" | ");
 }
 
 void Pie::mouseMoveEvent(QMouseEvent* e) { int h = hit(e->position().toPoint()); setHot(h >= 0 ? h : ringPick(e->position().toPoint())); }
@@ -257,6 +301,8 @@ void Pie::paintEvent(QPaintEvent*) {
     }
   };
   for (size_t i = 0; i < btns_.size(); i++) if (btns_[i].level == 0) drawBtn(btns_[i], int(i));
+  { QRect sl; for (auto& b : btns_) if (b.level == 1 && b.parent == openSub_) sl |= b.r;   // (a panel under the open sub-list: the items it lies over don't show through its gaps)
+    if (!sl.isNull()) { g.setPen(QPen(QColor(255, 255, 255, 30), 1)); g.setBrush(QColor(24, 24, 24, 240)); g.drawRoundedRect(QRectF(sl.adjusted(-5, -5, 5, 5)).adjusted(0.5, 0.5, -0.5, -0.5), 10, 10); } }
   for (size_t i = 0; i < btns_.size(); i++) if (btns_[i].level == 1 && btns_[i].parent == openSub_) drawBtn(btns_[i], int(i));
 }
 
@@ -412,6 +458,7 @@ void ThinkScope::progress(double p, const QString& stage) { if (!stage.isEmpty()
 static QString lastToast_;
 QString lastToast() { return lastToast_; }
 std::function<void(const QString&)>& toastHook() { static std::function<void(const QString&)> h; return h; }
+std::function<void(const QString&, const QJsonObject&)>& devHook() { static std::function<void(const QString&, const QJsonObject&)> h; return h; }
 std::function<void(const QString&)>& stepHook() { static std::function<void(const QString&)> h; return h; }
 void toast(const QString& msg) { lastToast_ = msg; if (toastHook()) toastHook()(msg); if (stepHook()) stepHook()(msg);
   QLabel* l = toastLbl(); l->setText(msg); l->adjustSize();
@@ -429,7 +476,7 @@ void hud(const QString& msg) {
   QLabel* l = hudLbl();
   if (msg.isEmpty()) { l->hide(); return; }
   l->setText(msg); l->adjustSize();
-  if (hudHost_) { QRect g(hudHost_->mapToGlobal(QPoint(0, 0)), hudHost_->size()); l->move(g.center().x() - l->width() / 2, g.top() + 10); }
+  if (hudHost_) { QRect g(hudHost_->mapToGlobal(QPoint(0, 0)), hudHost_->size()); l->move(g.center().x() - l->width() / 2, g.top() + 42); }   // (under the views' name labels — over the UV Editor they lay on its label)
   l->show(); l->raise();
 }
 void hud(const QString& msg, int ms) {

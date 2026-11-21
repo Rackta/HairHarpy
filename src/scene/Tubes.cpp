@@ -1,4 +1,4 @@
-#include "scene/Tubes.h"
+﻿#include "scene/Tubes.h"
 #include "scene/Edit.h"
 #include <QColor>
 #include <QJsonDocument>
@@ -67,10 +67,23 @@ std::vector<Frame> framesAlong(const std::vector<Vec3>& P, const Vec3& center) {
 struct Extra { int id; QString kind; QJsonObject p; std::vector<double> mask; std::vector<int> only; bool ignore; };
 
 double curlTurns(const Extra& x) { double s = 0; for (int k = 0; k < 4; k++) s += num(x.p, ("d" + std::to_string(k)).c_str(), 1); return s; }
-int extraRings(const std::vector<Extra>& ex, int NR) {
+double tubeRadius(const QJsonObject& p, double t);
+// the coil's nominal wire radius (the tube's, along its length): what a "pitch" is counted in
+double curlWireR(const QJsonObject& tp) { double r = 0; for (int k = 0; k <= 4; k++) r += num(tp, k < 2 ? "r0" : k < 4 ? "r1" : "r2", 0); r /= 5; return std::max(r, 1e-9); }
+// the turns over the whole lock: the four densities' sum, or — with a pitch (Telephone cord: the coils' distance along the lock
+// in wire thicknesses) — as many as the lock's length holds
+double curlTurnsFor(const Extra& x, double len, const QJsonObject& tp) {
+  const double pit = num(x.p, "pitch", 0);
+  if (pit > 0 && x.p.value("ribbon").toBool()) {                  // (the band narrows along the lock: more turns where it is narrow)
+    const double w0 = curlWireR(tp); double s = 0; for (int k = 0; k < 32; k++) s += len / 32 / std::max(pit * 2 * std::max(tubeRadius(tp, (k + 0.5) / 32), 0.2 * w0), 1e-9);
+    return s; }
+  return pit > 0 ? len / std::max(pit * 2 * curlWireR(tp), 1e-9) : curlTurns(x);
+}
+int extraRings(const std::vector<Extra>& ex, int NR, double len = 0, const QJsonObject& tp = {}) {
   double n = NR;
-  for (auto& x : ex) { if (x.kind == "curl") n = std::max(n, curlTurns(x) * 24 + 24); if (x.kind == "noise") n = std::max(n, (num(x.p, "freq", 0) ? num(x.p, "freq", 0) : 1) * 16 + 24); }
-  return std::min(int(std::floor(n + 0.5)), 900);
+  for (auto& x : ex) { if (x.kind == "curl") n = std::max(n, curlTurnsFor(x, len, tp) * clamp(num(x.p, "seg", 24), 4, 64) + 24); if (x.kind == "noise") n = std::max(n, (num(x.p, "freq", 0) ? num(x.p, "freq", 0) : 1) * 16 + 24); }
+  if (!(n >= 2)) n = 2;                                      // (NaN or a number too big for an int — a zero wire radius under a Pitch: capped before the cast, not after)
+  return int(std::floor(std::min(n, 900.0) + 0.5));
 }
 // how much of extra x works at t: every mask of the same modifier that applies to x lowers it (100% mask → nothing)
 double extraWeight(const Extra& x, double t, const std::vector<Extra>& ex) {
@@ -120,6 +133,7 @@ void thinCrowded(const QJsonObject& tp, const Extra& x, const std::vector<Vec3>&
 
 void applyExtras(const QJsonObject& tp, const std::vector<Extra>& ex, std::vector<Frame>& F, std::vector<double>& twist, std::vector<double>& thick, const Vec3& center) {
   const int n = int(F.size()); std::vector<Vec3> off(static_cast<size_t>(n)); twist.assign(size_t(n), 0); thick.assign(size_t(n), 1);
+  std::vector<Vec3> axis0, path0; std::vector<double> coilR(size_t(n), 0.0); for (const Frame& f0 : F) { axis0.push_back(f0.T); path0.push_back(f0.p); }   // (the lock's own direction: the axis a curl winds round)
   for (auto& x : ex) {
     const QJsonObject& p = x.p;
     if (x.kind == "noise") {
@@ -164,14 +178,34 @@ void applyExtras(const QJsonObject& tp, const std::vector<Extra>& ex, std::vecto
         std::vector<double> pre{0}; int h2 = 3 * k; for (double v : fac) pre.push_back(pre.back() + v);
         for (int i = 0; i < n; i++) { int a = std::max(0, i - h2), b = std::min(n - 1, i + h2); fac[size_t(i)] = (pre[size_t(b + 1)] - pre[size_t(a)]) / (b - a + 1); }
       }
+      // Telephone cord: a pitch (coil distance along the lock, in wire thicknesses) instead of the four densities, and straight
+      // ends — the coil radius grows from 0 over the first endA / last endB share of the lock
+      const double pit = num(p, "pitch", 0), wireR = curlWireR(tp), endA = clamp(num(p, "endA", 0), 0, 0.45), endB = clamp(num(p, "endB", 0), 0, 0.45);
+      // (the angle first: a pitch's cord keeps straight through its straight ends and its radius grows and falls over a turn and a quarter — a wire
+      // pulled out sideways in less would fold over itself)
+      const bool ribbon = p.value("ribbon").toBool(), cord = pit > 0 && !ribbon; const double th0 = th; std::vector<double> ths(size_t(n), th);
+      for (int i = 1; i < n; i++) { const double t = double(i) / (n - 1), w = extraWeight(x, t, ex);
+        const double loose = 1 + num(p, "tipLoose", 0) * ease(clamp((t - 0.7) / 0.3, 0, 1));   // (Loose tip: the last turns open out)
+        const double unit = (ribbon ? std::max(tubeRadius(tp, t), 0.2 * wireR) : wireR) * loose;   // (a ribbon: the band's own width — the tube radius here — is the unit, so the stack narrows with the lock)
+        double dth = pit > 0 ? 2 * PI * (*G)[size_t(i)].p.distanceTo((*G)[size_t(i - 1)].p) / std::max(pit * 2 * unit, 1e-12) : 2 * PI * four(x, "d", t) * 4 / (n - 1);
+        if (cord && (t < endA || t > 1 - endB)) dth = 0;
+        if (cord && pit > 0) {   // (while the coil is still narrower than the wire it winds slower: bent tighter than the wire is thick it would fold over itself)
+          const double Rnow = four(x, "r", t) * ease(clamp(std::abs(ths[size_t(i - 1)] - th0) / (2.5 * PI), 0, 1)), r = tubeRadius(tp, t), c = pit * 2 * wireR / (2 * PI);
+          if (Rnow < 1.5 * r && c < 0.75 * r) dth *= c / (0.75 * r); }
+        ths[size_t(i)] = ths[size_t(i - 1)] + dth * w * (p.value("rev").toBool() ? -1 : 1); }   // (rev: the spiral winds the other way)
+      const double thEnd = ths[size_t(n - 1)], GROW = 2.5 * PI;
       for (int i = 0; i < n; i++) {
-        double t = double(i) / (n - 1), w = extraWeight(x, t, ex);
-        if (i) th += 2 * PI * four(x, "d", t) * 4 / (n - 1) * w * (p.value("rev").toBool() ? -1 : 1);   // (rev: the spiral winds the other way)
-        const Frame& f = (*G)[size_t(i)]; double R = four(x, "r", t) * fac[size_t(i)] * w * rootIn(t);
+        double t = double(i) / (n - 1), w = extraWeight(x, t, ex); th = ths[size_t(i)];
+        const double ramp = cord ? ease(clamp(std::abs(th - th0) / GROW, 0, 1)) * (endB > 0 ? ease(clamp(std::abs(thEnd - th) / GROW, 0, 1)) : 1.0)
+                                 : (endA > 0 ? ease(clamp(t / endA, 0, 1)) : 1.0) * (endB > 0 ? ease(clamp((1 - t) / endB, 0, 1)) : 1.0);
+        // (a ribbon leaves its root winding out over three quarters of a turn, not straight out to the side)
+        const double rIn = ribbon ? ease(clamp(std::abs(th - th0) / (1.5 * PI), 0, 1)) : cord ? 1.0 : rootIn(t);
+        const Frame& f = (*G)[size_t(i)]; double R = four(x, "r", t) * fac[size_t(i)] * w * rIn * ramp; coilR[size_t(i)] = R;
         if (G != &F) off[size_t(i)] += ((*G)[size_t(i)].p - F[size_t(i)].p) * w;
         off[size_t(i)] += f.N * (R * std::cos(th)) + f.B * (R * std::sin(th));
         twist[size_t(i)] += (p.value("follow").toBool() ? th : 0) + rad(orZero(p, "spin")) * w;
         thick[size_t(i)] *= 1 + (num(p, "thick", 1) - 1) * w;
+        if (p.value("ribbon").toBool()) thick[size_t(i)] *= std::max(0.1, rIn);   // (the band starts as a point and widens as it winds out: wider than its own coil there it would fold over itself)
       }
     }
     if (x.kind == "thick" && !x.mask.empty())                         // painted weights: −1 thinner (to a point) … +1 twice as thick
@@ -184,6 +218,24 @@ void applyExtras(const QJsonObject& tp, const std::vector<Extra>& ex, std::vecto
   std::vector<Vec3> P; for (int i = 0; i < n; i++) P.push_back(F[size_t(i)].p + off[size_t(i)]);
   for (auto& x : ex) if (x.kind == "curl" && num(x.p, "thin", 0) > 0) thinCrowded(tp, x, P, thick, ex);
   F = framesAlong(P, center);
+  // Ribbon (an anime curl: flat bands stacked along the axis): the profile's wide side lies along the coil's axis — the lock's own
+  // direction — turned into the cross-section's plane, whatever way the sweep's frames have gone round
+  for (auto& x : ex) if (x.kind == "curl" && x.p.value("ribbon").toBool()) {
+    const double rr = rad(num(x.p, "ribbonRot", 0)); double prev = 0; bool have = false; Vec3 eLast;
+    for (int i = 0; i < n; i++) {
+      const double t = double(i) / (n - 1), w = extraWeight(x, t, ex); const Frame& f = F[size_t(i)]; const Vec3& A = axis0[size_t(i)];
+      Vec3 e = P[size_t(i)] - path0[size_t(i)]; e = e - A * e.dot(A); e = e.lengthSq() > 1e-12 ? e.normalized() : eLast; eLast = e;   // (out from the coil's axis)
+      // (the band lies on the cone the coil makes: along the axis, leaning in as far as the radius falls along it)
+      const int i0 = std::max(i - 2, 0), i1 = std::min(i + 2, n - 1); double run = 0; for (int q = i0; q < i1; q++) run += (path0[size_t(q + 1)] - path0[size_t(q)]).dot(A);
+      const Vec3 wide = A + e * (run > 1e-12 ? clamp((coilR[size_t(i1)] - coilR[size_t(i0)]) / run, -3, 3) : 0.0);
+      const Vec3 u = wide - f.T * f.T.dot(wide); if (u.lengthSq() < 1e-8) continue;
+      const Vec3 un = u.normalized(); double a = std::atan2(-un.dot(f.N), un.dot(f.B));
+      { const Vec3 nn = f.N * std::cos(a) + f.B * std::sin(a); if (nn.dot(e) < 0) a += PI; }   // (the profile's upper side outward)
+      a += rr;
+      if (have) { while (a - prev > PI) a -= 2 * PI; while (a - prev < -PI) a += 2 * PI; } prev = a; have = true;
+      twist[size_t(i)] = twist[size_t(i)] * (1 - w) + a * w;
+    }
+  }
 }
 
 std::vector<Extra> activeExtras(const Scene& sc, int tube) {
@@ -225,6 +277,7 @@ const std::vector<Preset>& builtinProfiles() {
     std::vector<Preset> v{{"Quad", {{-1, -0.35}, {1, -0.35}, {1, 0.35}, {-1, 0.35}}},
                           {"Trapezoid", {{-1, -0.35}, {1, -0.35}, {0.55, 0.35}, {-0.55, 0.35}}},
                           {"Triangle", {{-1, -0.35}, {1, -0.35}, {0, 0.5}}}};
+    v.push_back({"Band", {{-1, -0.05}, {-0.5, 0.14}, {0.5, 0.14}, {1, -0.05}, {0.5, -0.06}, {-0.5, -0.06}}});   // (a flat band, its outer side bowed: the stacked anime curl)
     Profile c; for (int k = 0; k < 8; k++) c.push_back({std::cos(k * PI / 4 - PI / 2), std::sin(k * PI / 4 - PI / 2)});
     v.push_back({"Circle", c});
     Profile h; for (int k = 0; k < 6; k++) h.push_back({std::cos(k * PI / 5), std::sin(k * PI / 5) * 0.8 - 0.35});
@@ -271,9 +324,6 @@ QColor profColor(int j) {
 }
 
 // ---------- extras ----------
-XKind xkind(const QString& k) {
-  return k == "mask" ? XKind::Mask : k == "thick" ? XKind::Thick : k == "twist" ? XKind::Twist : k == "noise" ? XKind::Noise : k == "curl" ? XKind::Curl : k == "xform" ? XKind::Xform : XKind::Unknown;
-}
 QString xkindName(const QString& k) {
   static const std::map<QString, QString> N{{"mask", "Mask"}, {"thick", "Thickness"}, {"twist", "Twist"}, {"noise", "Noise"}, {"curl", "Curls"}, {"xform", "Transform"}};
   auto it = N.find(k); return it == N.end() ? k : it->second;
@@ -343,7 +393,8 @@ void ensureTubeRef(Scene& sc, const CurveCache& cc, Item& t) {
 std::vector<std::vector<Vec3>> tubeRings(const Scene& sc, const Item& t, const std::vector<Vec3>& curvePts, int NR, const Vec3& center, const QJsonObject* pOverride) {
   QJsonObject p = pOverride ? *pOverride : t.raw.value("p").toObject();
   auto ex = activeExtras(sc, t.id);
-  std::vector<Frame> F = framesAlong(resample(curvePts, ex.empty() ? NR : extraRings(ex, NR)), center);
+  double plen = 0; for (size_t i = 1; i < curvePts.size(); i++) plen += curvePts[i].distanceTo(curvePts[i - 1]);
+  std::vector<Frame> F = framesAlong(resample(curvePts, ex.empty() ? NR : extraRings(ex, NR, plen, p)), center);
   std::vector<double> twist, thick;
   if (!ex.empty()) applyExtras(p, ex, F, twist, thick, center);
   auto P = tubeProfs(t);
@@ -477,9 +528,14 @@ QString convertTube(Scene& sc, const CurveCache& cc, Selection& sel, int tubeId,
   // curls and noise need more anchors to keep their shape: about 8 per turn / wave
   auto ex = activeExtras(sc, tubeId); ex.erase(std::remove_if(ex.begin(), ex.end(), [](const Extra& x) { return x.kind == "mask"; }), ex.end());
   if (!ex.empty()) {
-    double s = 0; for (auto& x : ex) s += x.kind == "curl" ? curlTurns(x) * 8 : (orZero(x.p, "freq") ? orZero(x.p, "freq") : 1) * 6;
-    int need = std::min(160, int(std::ceil(s)) + 4);
-    if (need > int(fr.size())) { fr.clear(); for (int k = 0; k < need; k++) fr.push_back(double(k) / (need - 1)); }
+    double s = 0; for (auto& x : ex) s += x.kind == "curl" ? curlTurnsFor(x, tot, p) * clamp(num(x.p, "anch", 8), 3, 16) : (orZero(x.p, "freq") ? orZero(x.p, "freq") : 1) * 6;
+    int need = std::min(400, int(std::ceil(s)) + 4);
+    if (need > int(fr.size())) { fr.clear();
+      // (spaced by the turns, not by the length: every turn the same number of cross-sections, a small tight one as a big one)
+      std::vector<Vec3> cen; for (auto& r : rings) { Vec3 c; for (auto& q : r) c += q; cen.push_back(c / double(r.size())); }
+      std::vector<double> v{0}, l{0}; Vec3 pd; bool hv = false; for (size_t i = 1; i < cen.size(); i++) { const Vec3 d = cen[i] - cen[i - 1]; const double m = d.length(); double da = 0; if (m > 1e-12) { const Vec3 u = d * (1 / m); if (hv) da = std::acos(clamp(pd.dot(u), -1, 1)); pd = u; hv = true; } v.push_back(v.back() + da); l.push_back(l.back() + m); }
+      const double VA = std::max(v.back(), 1e-9), LA = std::max(l.back(), 1e-12); for (size_t i = 0; i < v.size(); i++) v[i] = 0.85 * v[i] / VA + 0.15 * l[i] / LA;
+      size_t j = 0; for (int k = 0; k < need; k++) { const double s = double(k) / (need - 1); while (j + 2 < v.size() && v[j + 1] < s) j++; const double g = v[j + 1] - v[j]; fr.push_back(clamp((j + (g > 0 ? clamp((s - v[j]) / g, 0, 1) : 0)) / (v.size() - 1), 0, 1)); } }
   }
   bool collapse = p.value("collapse").toBool();
   if (collapse) { double ts = 1 - clamp(num(p, "tipLen", 0.25), 0.01, 1); bool far = true; for (double f : fr) if (std::abs(f - ts) <= 0.04) far = false; if (far) { fr.push_back(ts); std::sort(fr.begin(), fr.end()); } }
@@ -544,7 +600,7 @@ int newExtra(Scene& sc, const CurveCache& cc, int tubeId, const QString& kind) {
   else if (kind == "twist") p = QJsonObject{{"deg", 180}};
   else if (kind == "noise") p = QJsonObject{{"amp", r}, {"freq", 3}, {"sx", 1}, {"sy", 1}, {"plane", false}, {"rot0", 0}, {"rot1", 0}, {"rot2", 0}, {"seed", 1}, {"ampRef", r}, {"pure", 0}};
   else if (kind == "curl") p = QJsonObject{{"r0", r * 1.5}, {"r1", r * 1.5}, {"r2", r * 1.5}, {"r3", r * 1.5}, {"radRef", r}, {"d0", 1.5}, {"d1", 1.5}, {"d2", 1.5}, {"d3", 1.5},
-                                           {"thick", 1}, {"spin", 0}, {"follow", false}, {"phase", 0}, {"smooth", 0}, {"shrink", 0}};
+                                           {"thick", 1}, {"spin", 0}, {"follow", false}, {"phase", 0}, {"smooth", 0}, {"shrink", 0}, {"pitch", 0}, {"endA", 0}, {"endB", 0}, {"seg", 24}, {"anch", 8}, {"tipLoose", 0}};
   int num_ = edit::nextNumber(sc, ItemType::XMod);
   QString base = t->name; { auto mm = QRegularExpression("^Modifier \\d+ \\((.*)\\)$").match(base); if (mm.hasMatch()) base = mm.captured(1); }
   int parent = t->parent;

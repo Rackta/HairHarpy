@@ -48,7 +48,7 @@ void Camera::fitToBox(const Box3& box) {
 
 // free views: the default perspective framing of the whole model (upright, no roll); fixed views re-centre
 void Camera::reset() {
-  lastWheelDist = 0;                                         // (the wheel's rate starts over)
+  lastWheelDist = 0; freeRoll = false;                                         // (the wheel's rate starts over)
   uvCx = uvCy = 0.5; uvPpu = 0;                              // (the UV Editor: the tile fitted)
   pivot = sceneCenter;
   if (!fixedView(view)) {
@@ -59,7 +59,7 @@ void Camera::reset() {
 }
 
 void Camera::setView(const QString& mode) {
-  lastWheelDist = 0;                                         // (the wheel's rate starts over)
+  lastWheelDist = 0; freeRoll = false;                                         // (the wheel's rate starts over)
   if (mode == "uv") { view = mode; return; }                 // (the UV Editor: the 3D camera kept for when it goes back)
   bool wasFree = !fixedView(view);
   if (mode == "persp" || mode == "ortho") {
@@ -70,7 +70,7 @@ void Camera::setView(const QString& mode) {
     if (mode == "persp") pos = pivot + d * (-half / std::tan(fov / 2 * DEG));
     else { pos = pivot + d * (-sceneScale * 20); zoom = orthoHalf / std::max(half, 1e-6); }
   } else {
-    Vec3 d = viewDirOf(mode); double dist = sceneScale * 20;
+    Vec3 d = viewDirOf(mode); double dist = std::max(sceneScale * 20, worldReach(sceneCenter) * 2 + sceneScale);   // (outside all the scene holds)
     pos = sceneCenter + d * dist; up = mode == "top" ? Vec3(0, 0, -1) : Vec3(0, 1, 0); lookAt(sceneCenter);
     zoom = 1; pivot = sceneCenter;
   }
@@ -84,16 +84,21 @@ void Camera::orbit(double dx, double dy) {
     up = q.rotate(up); quat = (q * quat).normalized(); return;
   }
   if (fixedView(view)) return;
-  if (trackball) {                                           // (trackball: round the view's own up and right — no levelling)
+  if (trackball || freeRoll) {                               // (trackball — or a view rolled by hand: round the view's own up and right, no levelling)
     Quat q = Quat::fromAxisAngle(upVec(), -dx * 0.006) * Quat::fromAxisAngle(right(), -dy * 0.006);
     pos = q.rotate(pos - pivot) + pivot; quat = (q * quat).normalized(); up = upVec(); return;
   }
-  Quat qy = Quat::fromAxisAngle({0, 1, 0}, -dx * 0.006), qx = Quat::fromAxisAngle(right(), -dy * 0.006);
+  // turntable with no stop at the poles: the camera goes over the top and under the bottom freely — the model seen upside down, to
+  // paint it from any side. Upside down the turn left / right is taken the other way, so the model still follows the hand
+  const bool flipped = upVec().y < 0;
+  Quat qy = Quat::fromAxisAngle({0, 1, 0}, (flipped ? dx : -dx) * 0.006), qx = Quat::fromAxisAngle(right(), -dy * 0.006);
   Quat q = qy * qx;
-  if ((q * quat).rotate({0, 1, 0}).y < 0.02) q = qy;
   pos = q.rotate(pos - pivot) + pivot;
   quat = (q * quat).normalized();
-  level();                                                   // rounding errors never accumulate into a roll
+  // (rounding errors never accumulate into a roll: the horizon made level again — upside down stays upside down; straight above or
+  //  below the pivot there is no horizon to level by: left as it is)
+  const Vec3 d = dir();
+  if (std::abs(d.y) < 0.9995) { up = Vec3(0, upVec().y >= 0 ? 1 : -1, 0); quat = Quat::lookRotation(d, up); } else up = upVec();
 }
 
 double Camera::worldPerPixel() const {
@@ -110,7 +115,9 @@ void Camera::pan(double dx, double dy) {
 
 void Camera::dolly(double amount) {
   lastWheelDist = 0;                                         // (the wheel's rate starts over)
-  if (ortho()) { zoom = clamp(zoom * std::exp(amount * 0.01), 0.02, 500); return; }
+  // (a flat view's zoom: no tight bounds against the scene's size — 20.11: a model thousands of times the head framed at ×0.0002, the
+  // first Alt+RMB clamped it to ×0.02 — the view jumped in and could not go back out)
+  if (ortho()) { zoom = clamp(zoom * std::exp(amount * 0.01), 1e-7, 1e6); return; }
   double d = std::max(pivot.distanceTo(pos), sceneScale * 0.05);
   pos += dir() * (amount * d * 0.006);
 }
@@ -137,7 +144,7 @@ void Camera::wheel(double x, double y, double steps, std::optional<double> hitDi
     double nx = x / std::max(1, width) * 2 - 1, ny = 1 - y / std::max(1, height) * 2;
     auto at = [&](double z) { double h = orthoHalf / z; return pos + right() * (nx * h * aspect) + upVec() * (ny * h); };
     Vec3 p0 = at(zoom);
-    zoom = clamp(zoom * std::pow(1.15, s), 0.02, 500);
+    zoom = clamp(zoom * std::pow(1.15, s), 1e-7, 1e6);         // (no tight bounds: see dolly)
     pos += p0 - at(zoom);
   }
 }
@@ -149,7 +156,7 @@ void Camera::frame(const Box3& box, bool small) {
   double r = std::max(box.size().length() * 0.6, sceneScale * (small ? 0.02 : 0.1));
   pivot = c;
   if (!ortho()) pos = c + dir() * (-r / std::tan(fov / 2 * DEG));
-  else { double d = (pos - c).dot(dir()); pos = c + dir() * d; zoom = orthoHalf / r; }
+  else { double d = std::min({(pos - c).dot(dir()), -r * 4, -(worldReach(c) * 2)}); pos = c + dir() * d; zoom = orthoHalf / r; }   // (in front of all of it — 20.11: a far, big model framed from a camera set for a small head had it half behind)
 }
 
 }  // namespace hm

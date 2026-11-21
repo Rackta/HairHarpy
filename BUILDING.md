@@ -82,11 +82,13 @@ have the same hash as ours. What you can compare:
 |---|---|
 | `src/scene` | the scene: curves, walls, cocoons, the topology mesh, UV |
 | `src/view` | the viewport: Vulkan rendering, tools, input |
+| `src/paint` | the Paint room: layers, brushes, baking, PSD, the bridge to image editors |
+| `src/core` | shared maths |
 | `src/app` | windows and panels |
 | `src/io` | projects, import, export |
 | `src/ui` | shared interface pieces |
 | `shaders` | GLSL, compiled to SPIR-V at build time |
-| `resources` | images, the FAQ, the Blender / Maya bridge add-ons |
+| `resources` | images, the FAQ, the Blender / Maya / ZBrush bridge add-ons |
 | `installer` | the installer and the release scripts |
 | `tools` | console checks (`hm_selftest`, `hm_uvtest`) |
 

@@ -10,6 +10,7 @@
 //   drag — the weld distance's circle), Collapse Edge, Relax (Ctrl+R), Snap to the references, Mirror (by an axis,
 //   round it, a kaleidoscope, half a flower) and the group with a virtual symmetry.
 #include "scene/MeshMods.h"
+#include "scene/Subdiv.h"
 #include "ui/Pie.h"
 #include "view/SceneGeometry.h"
 #include "view/Viewport.h"
@@ -73,7 +74,7 @@ struct ChainSel { std::vector<tedit::Chain> chains; };
 
 // ---------- Edge Shaper / Slide / Normals / Optimize: a drag in empty space ----------
 bool Viewport::shapePress(const QPointF& mp, bool rmb, bool shift, bool ctrl) {
-  const int m = topoMesh(); Item* it = m >= 0 ? scene_->item(m) : nullptr; if (!it || topoHeavy(m)) return false;
+  const int m = topoMesh(); Item* it = m >= 0 ? scene_->item(m) : nullptr; if (!it) return false;
   // (Optimize and Normals select as the Select Cursor; their actions come from the menu — a button there arms the next
   // press: the weld distance picked by a drag, the normals turned by a drag, the mesh clicked to copy the normals from)
   if (tool_ == "toptimize") {
@@ -90,6 +91,8 @@ bool Viewport::shapePress(const QPointF& mp, bool rmb, bool shift, bool ctrl) {
   if (auto r0 = tool_ == "tnormals" ? std::optional<TopoPick>{} : tPick(mp, {m})) {   // (on the mesh: the selection, as the Select Cursor — but Edge Shaper / Slide:
     bool onSel = false; const char key = tKey();                    //  RMB anywhere, LMB from the selection itself — the shaping)
     if (tsel_.id == m) { const int el = key == 'f' ? r0->f : key == 'e' ? r0->e : r0->v; onSel = (key == 'f' ? tsel_.f : key == 'e' ? tsel_.e : tsel_.v).count(el) > 0; }
+    // (Slide, LMB on an element that isn't picked: taken hold of — it is picked (alone) and slides as the drag goes; no selection brush here)
+    if (tool_ == "tslide" && !rmb && !onSel && !shift) { const int el = key == 'f' ? r0->f : key == 'e' ? r0->e : r0->v; if (el < 0) return false; tselApply(m, {el}, "set", key); onSel = true; }
     if (!((tool_ == "tshaper" || tool_ == "tslide") && (rmb || onSel))) return false;
   }
   if (tool_ == "toptimize") return false;
@@ -229,6 +232,7 @@ void Viewport::shapeMove(const QPointF& mp) {
   const int m = tt_.m; Item* it = m >= 0 ? scene_->item(m) : nullptr; if (!it || !it->base) return;
   const double dx = mp.x() - tt_.press.x(), dy = mp.y() - tt_.press.y(); tt_.moved = tt_.moved || std::hypot(dx, dy) >= 3;
   if (tt_.drag == 16) { ttools.optWeld = std::max(1e-6, std::max(1.0, tt_.adj0 + dx) * worldPerPixelAt(cam_.pivot)); ui::hud(tr("Weld distance: %1 mm").arg(ttools.optWeld * 10, 0, 'g', 3)); overlayRev_++; requestUpdate(); return; }
+  if (!tt_.moved) return;                                           // (under 3 px: the mesh left as it is — a release then writes no step)
   if (tt_.drag == 13) {
     const double t = std::clamp(dx / 150, 0.0, 1.0); std::vector<Vec3> P = tt_.base;
     for (size_t i = 0; i < tt_.verts.size(); i++) P[size_t(tt_.verts[i])] = tt_.base[size_t(tt_.verts[i])] + (tt_.tgt[i] - tt_.base[size_t(tt_.verts[i])]) * t;
@@ -267,13 +271,14 @@ void Viewport::shapeMove(const QPointF& mp) {
 void Viewport::shapeRelease() {
   const int m = tt_.m; Item* it = m >= 0 ? scene_->item(m) : nullptr; const int kind = tt_.drag; tt_.drag = 0; ui::hud({});
   if (kind == 16) { saveModelPrefs(); overlayRev_++; emit topoState(); return; }
-  if (!it || !tt_.moved) { ttTouch(); return; }
+  if (!it || !tt_.moved) { if (kind == 15) tt_.before.reset(); ttTouch(); return; }   // (the normals' source mesh let go too)
   if (kind == 15) { tt_.before.reset(); scene_->revision++; commit(true); emit topoState(); return; }
   topoWrite(m, baseSp(*it)); commit(false); emit topoState(); ttTouch();
 }
 
 // ---------- the polygons' normals ----------
 QString Viewport::tReverseNormals() {
+  if (!eachBusy_ && uvMulti()) return tEachMesh([&] { return tReverseNormals(); }, true);   // (several meshes picked: done on each — on its own picks, or on the whole of it)
   const int m = topoMesh(); Item* it = m >= 0 ? scene_->item(m) : nullptr; if (!it) return "!";
   const PolyMesh& B = *baseOf(*it); MeshEd E = MeshEd::from(B); auto fs = tSelFaces(m); if (fs.empty()) { fs.resize(E.f.size()); std::iota(fs.begin(), fs.end(), 0); }
   for (int f : fs) { auto& F = E.f[size_t(f)]; std::reverse(F.v.begin(), F.v.end()); std::reverse(F.uv.begin(), F.uv.end()); std::reverse(F.n.begin(), F.n.end()); for (auto& q : F.n) q = {-q[0], -q[1], -q[2]}; }
@@ -282,6 +287,7 @@ QString Viewport::tReverseNormals() {
 
 // each joined piece of the selected polygons turned one way (as its polygon facing out the most); none selected — all
 QString Viewport::tAlignNormals() {
+  if (!eachBusy_ && uvMulti()) return tEachMesh([&] { return tAlignNormals(); }, true);   // (several meshes picked: done on each — on its own picks, or on the whole of it)
   const int m = topoMesh(); Item* it = m >= 0 ? scene_->item(m) : nullptr; if (!it) return "!";
   const PolyMesh& B = *baseOf(*it); MeshEd E = MeshEd::from(B); auto fs = tSelFaces(m); if (fs.empty()) { fs.resize(E.f.size()); std::iota(fs.begin(), fs.end(), 0); }
   std::set<int> S(fs.begin(), fs.end()); std::map<tedit::EK, std::vector<int>> byEdge;
@@ -397,6 +403,7 @@ std::map<int, Vec3> Viewport::normTarget(const Item& it, const PolyMesh& d, cons
 // the soft shading of a stylised face. Sphere: the normals from the selection's middle (a little behind it) outward. The
 // border hard (when asked); the rest of the mesh keeps its normals
 QString Viewport::tNormalsSmooth() {
+  if (!eachBusy_ && uvMulti()) return tEachMesh([&] { return tNormalsSmooth(); }, true);   // (several meshes picked: done on each — on its own picks, or on the whole of it)
   const int m = topoMesh(); Item* it = m >= 0 ? scene_->item(m) : nullptr; if (!it) return "!";
   auto fs = tSelFaces(m); if (fs.empty()) { ui::toast(tr("Select the polygons whose normals become smooth (a face, a head…)")); return "!"; }
   auto nb = std::make_shared<PolyMesh>(*baseOf(*it)); PolyMesh& d = *nb;
@@ -512,7 +519,8 @@ QString Viewport::tNormalsCopy(int from) {
 
 // ---------- cleaning ----------
 QString Viewport::tRelaxMesh() {
-  const int m = topoMesh(); Item* it = m >= 0 ? scene_->item(m) : nullptr; if (!it || topoHeavy(m)) return "!";
+  if (!eachBusy_ && uvMulti()) return tEachMesh([&] { return tRelaxMesh(); }, true);   // (several meshes picked: done on each — on its own picks, or on the whole of it)
+  const int m = topoMesh(); Item* it = m >= 0 ? scene_->item(m) : nullptr; if (!it) return "!";
   const PolyMesh& B = *baseOf(*it); auto T = topo::ttopo(baseSp(*it)); std::vector<int> vs = topoMode == "object" ? std::vector<int>{} : tSelVerts(m);
   if (vs.empty()) { vs.resize(B.pos.size()); std::iota(vs.begin(), vs.end(), 0); }
   topo::Bvh surf; std::vector<uint32_t> tris; for (int f = 0; f < B.faceCount(); f++) { const int s = B.faceStart[size_t(f)]; for (int k = s + 1; k + 1 < B.faceStart[size_t(f) + 1]; k++) { tris.push_back(uint32_t(B.faceVerts[size_t(s)])); tris.push_back(uint32_t(B.faceVerts[size_t(k)])); tris.push_back(uint32_t(B.faceVerts[size_t(k + 1)])); } }
@@ -535,6 +543,7 @@ QString Viewport::tRelaxMesh() {
 }
 
 QString Viewport::tCollapseEdges() {
+  if (!eachBusy_ && uvMulti()) return tEachMesh([&] { return tCollapseEdges(); }, true);   // (several meshes picked: done on each — on its own picks, or on the whole of it)
   const int m = topoMesh(); Item* it = m >= 0 ? scene_->item(m) : nullptr; if (!it || tsel_.id != m || topoMode == "object") { ui::toast(tr("Select edges to collapse")); return "!"; }
   const PolyMesh& B = *baseOf(*it); auto T = topo::ttopo(baseSp(*it)); std::vector<std::pair<int, int>> es;
   if (tKey() == 'e') for (int e : tsel_.e) es.push_back({T->ea[size_t(e)], T->eb[size_t(e)]});
@@ -560,11 +569,13 @@ QString Viewport::tCollapseEdges() {
 }
 
 QString Viewport::tSnapToGeom() {
+  if (!eachBusy_ && uvMulti()) return tEachMesh([&] { return tSnapToGeom(); }, true);   // (several meshes picked: done on each — on its own picks, or on the whole of it)
   const int m = topoMesh(); Item* it = m >= 0 ? scene_->item(m) : nullptr; if (!it) return "!";
+  for (auto& [id, t] : scene_->items) if (id != m && t.type == ItemType::IMesh && t.poly && scene_->isVisible(t)) shellWait(id);   // (not one vertex onto an inner wall still being told apart)
   std::vector<std::shared_ptr<const topo::Bvh>> tg;
-  for (auto& [id, t] : scene_->items) if (id != m && t.type == ItemType::IMesh && t.poly && t.raw.value("tref").toBool() && scene_->isVisible(t)) if (auto b = bvhOf(id, true)) tg.push_back(b);
+  for (auto& [id, t] : scene_->items) if (id != m && t.type == ItemType::IMesh && t.poly && t.raw.value("tref").toBool() && scene_->isVisible(t)) if (auto b = bvhSurf(id)) tg.push_back(b);
   const bool refs = !tg.empty();
-  if (!refs) for (auto& [id, t] : scene_->items) if (id != m && t.type == ItemType::IMesh && t.poly && scene_->isVisible(t)) if (auto b = bvhOf(id, true)) tg.push_back(b);
+  if (!refs) for (auto& [id, t] : scene_->items) if (id != m && t.type == ItemType::IMesh && t.poly && scene_->isVisible(t)) if (auto b = bvhSurf(id)) tg.push_back(b);
   if (tg.empty()) { ui::toast(tr("No reference geometry to snap to — mark a mesh as a reference (its settings)")); return "!"; }
   std::vector<int> vs = topoMode == "object" ? std::vector<int>{} : tSelVerts(m); const PolyMesh& B = *baseOf(*it);
   if (vs.empty()) { vs.resize(B.pos.size()); std::iota(vs.begin(), vs.end(), 0); }
@@ -605,7 +616,8 @@ QString Viewport::tSnapToGeom() {
 // polygon) taken out, the polygons of one or two points left taken out, the doubled polygons made one; a vertex in the
 // middle of a side (two edges, two polygons) taken out too when asked — in the selection, or the whole mesh
 QString Viewport::tOptimize() {
-  const int m = topoMesh(); Item* it = m >= 0 ? scene_->item(m) : nullptr; if (!it || topoHeavy(m)) return "!";
+  if (!eachBusy_ && uvMulti()) return tEachMesh([&] { return tOptimize(); }, true);   // (several meshes picked: done on each — on its own picks, or on the whole of it)
+  const int m = topoMesh(); Item* it = m >= 0 ? scene_->item(m) : nullptr; if (!it) return "!";
   const PolyMesh& B = *baseOf(*it); MeshEd E = MeshEd::from(B);
   std::vector<int> vs = topoMode == "object" ? std::vector<int>{} : tSelVerts(m); std::vector<char> in(E.pos.size(), vs.empty() ? 1 : 0); for (int v : vs) in[size_t(v)] = 1;
   // (welded: a grid of cells the weld distance wide)
@@ -706,11 +718,15 @@ int addCopies(MeshEd& E, const std::vector<int>& faces, const std::vector<Affine
   int made = 0;
   for (const Affine& T : Ts) {
     const bool flip = T.det() < 0; std::map<int, int> map;
-    for (int v : vs) { const Vec3 w = T.apply(M.apply(E.pos[size_t(v)])); int hit = -1;
-      for (int dx = -1; dx <= 1 && hit < 0; dx++) for (int dy = -1; dy <= 1 && hit < 0; dy++) for (int dz = -1; dz <= 1 && hit < 0; dz++) { auto g = grid.find(cell(w, dx, dy, dz)); if (g == grid.end()) continue;
-        for (int q : g->second) if (M.apply(E.pos[size_t(q)]).distanceTo(w) <= eps) { hit = q; break; } }
+    // (one copy never welds onto itself and never two of its vertices onto one: close but separate vertices — a closed mouth's lips,
+    //  an eyelid's slit — stay apart; only the seam's vertices meet their own place / an earlier copy's, the nearest first)
+    const int fresh0 = int(E.pos.size()); std::set<int> used;
+    for (int v : vs) { const Vec3 w = T.apply(M.apply(E.pos[size_t(v)])); int hit = -1; double hd = eps;
+      if (M.apply(E.pos[size_t(v)]).distanceTo(w) <= eps) hit = v;   // (on the plane: its own place)
+      else for (int dx = -1; dx <= 1; dx++) for (int dy = -1; dy <= 1; dy++) for (int dz = -1; dz <= 1; dz++) { auto g = grid.find(cell(w, dx, dy, dz)); if (g == grid.end()) continue;
+        for (int q : g->second) { if (q >= fresh0 || used.count(q)) continue; const double d = M.apply(E.pos[size_t(q)]).distanceTo(w); if (d <= hd) { hd = d; hit = q; } } }
       if (hit < 0) { hit = E.addVert(Mi.apply(w)); grid[cell(w, 0, 0, 0)].push_back(hit); }
-      map[v] = hit; }
+      used.insert(hit); map[v] = hit; }
     const Affine TL = Affine::mul(Mi, Affine::mul(T, M));          // (local → the copy's local: the corners' own normals turned with it)
     for (int f : faces) { MeshEd::F F = E.f[size_t(f)]; for (int& v : F.v) v = map[v]; for (auto& q : F.n) if (!normals) q = {0, 0, 0}; else if (q[0] != 0 || q[1] != 0 || q[2] != 0) { const Vec3 n = TL.lin(Vec3(q[0], q[1], q[2])).normalized(); q = {float(n.x), float(n.y), float(n.z)}; }
       if (flip) { std::reverse(F.v.begin(), F.v.end()); std::reverse(F.uv.begin(), F.uv.end()); std::reverse(F.n.begin(), F.n.end()); }
@@ -732,8 +748,9 @@ Affine Viewport::mirFrame(int m) const {
 }
 
 QString Viewport::tMirrorMesh() {
+  if (!eachBusy_ && uvMulti()) return tEachMesh([&] { return tMirrorMesh(); }, true);   // (several meshes picked: done on each — on its own picks, or on the whole of it)
   if (ttools.mirType == "mirror" && ttools.mirReplace) return tMirrorReplace();   // (the copy in place of the other side's region)
-  const int m = topoMesh(); Item* it = m >= 0 ? scene_->item(m) : nullptr; if (!it || topoHeavy(m)) { ui::toast(tr("Select a mesh")); return "!"; }
+  const int m = topoMesh(); Item* it = m >= 0 ? scene_->item(m) : nullptr; if (!it) { ui::toast(tr("Select a mesh")); return "!"; }
   const PolyMesh& B = *baseOf(*it); MeshEd E = MeshEd::from(B); auto fs = topoMode == "object" ? std::vector<int>{} : tSelFaces(m);
   if (fs.empty()) { fs.resize(E.f.size()); std::iota(fs.begin(), fs.end(), 0); }
   const Affine M = meshmods::meshMatrix(*scene_, *it); const int a = std::clamp(ttools.mirAxis, 0, 2);
@@ -778,17 +795,17 @@ int Viewport::vsymGroupOf(int item) const {
 // the selected meshes into a new group whose symmetry is only shown (in any place) — Apply makes it real
 QString Viewport::vsymCreate(const QString& type) {
   std::vector<int> ms; for (int id : sel_.items) if (const Item* x = scene_->item(id); x && x->type == ItemType::IMesh) ms.push_back(id);
-  if (ms.empty()) { ui::toast(tr("Select the meshes for the group with a virtual symmetry")); return "!"; }
-  QString msg;
+  QString msg;   // (no meshes picked: an empty group — drag meshes into it in the outliner)
   runEdit([&](Scene& s, Selection& sel, const CurveCache&) -> QString {
-    const int parent = s.item(s.item(ms[0])->parent) ? s.item(ms[0])->parent : meshesGroup(s);   // (at the root: inside Meshes)
+    const int parent = !ms.empty() && s.item(s.item(ms[0])->parent) ? s.item(ms[0])->parent : meshesGroup(s);   // (at the root: inside Meshes)
     Item& g = s.addItem(ItemType::Group, parent, tr("Symmetry group")); g.expanded = true;
     g.raw = QJsonObject{{"sym", QJsonValue()}, {"guides", "hide"}, {"conv", QJsonValue()}, {"guidesGroup", false}, {"meshesGroup", false}, {"importGroup", false},
                         {"labels", QJsonValue()}, {"guidesOff", false}, {"logic", 2}, {"view", QJsonValue()}, {"side", "scene"}, {"spos", QJsonValue()},
                         {"vsym", QJsonObject{{"type", type}, {"axis", ttools.mirAxis}, {"count", ttools.mirCount}, {"axes", QJsonArray{QString("xyz")[std::clamp(ttools.mirAxis, 0, 2)] + QString("+")}}, {"weld", true}, {"weldDist", 0.05}}}};
     const int gid = g.id;
     for (int id : ms) { s.removeFromParent(id); s.item(id)->parent = gid; s.item(gid)->children.push_back(id); }
-    sel.items = {gid}; msg = tr("A group with a virtual symmetry (%1): only shown — Apply in its menu makes it real").arg(type); return msg;
+    sel.items = {gid}; msg = ms.empty() ? tr("An empty group with a virtual symmetry (%1): drag meshes into it in the outliner").arg(type)
+                                         : tr("A group with a virtual symmetry (%1): only shown — Apply in its menu makes it real").arg(type); return msg;
   });
   return msg;
 }
@@ -808,9 +825,116 @@ QString Viewport::vsymApply(int group) {
       if (any) E.removeFaces(del); }
     std::vector<int> fs(E.f.size()); std::iota(fs.begin(), fs.end(), 0); made += addCopies(E, fs, Ts, M, std::max({1e-6, wd, B.bounds().size().length() * 1e-4}));
     topoWrite(m, std::make_shared<PolyMesh>(E.to(B))); }
-  scene_->item(group)->raw.remove("vsym");
+  { // (made real: the group is of no use any more — its meshes take its place in the outliner)
+    const int par = scene_->item(group)->parent; const std::vector<int> kids = scene_->item(group)->children;
+    std::vector<int>& to = par >= 0 && scene_->item(par) ? scene_->item(par)->children : scene_->roots;
+    auto at = std::find(to.begin(), to.end(), group); const long pos = at == to.end() ? long(to.size()) : long(at - to.begin());
+    to.erase(std::remove(to.begin(), to.end(), group), to.end()); to.insert(to.begin() + std::min<long>(pos, long(to.size())), kids.begin(), kids.end());
+    for (int k : kids) if (Item* c = scene_->item(k)) c->parent = par;
+    scene_->items.erase(group);
+    sel_.items.erase(std::remove(sel_.items.begin(), sel_.items.end(), group), sel_.items.end()); if (sel_.items.empty()) sel_.items = kids; onSelChange(); }
   scene_->revision++; commit(true); emit topoState(); emit sceneEdited();
   const QString msg = tr("Symmetry made real: %1 polygons in %2 mesh%3").arg(made).arg(ms.size()).arg(ms.size() == 1 ? "" : "es"); ui::toast(msg); return msg;
+}
+
+// the Subdivide tool: the selected polygons (none picked, or Object mode — the whole mesh) split into quads for good
+QString Viewport::tSubdivide() {
+  if (!eachBusy_ && uvMulti()) return tEachMesh([&] { return tSubdivide(); }, true);   // (several meshes picked: done on each — on its own picks, or on the whole of it)
+  const int m = topoMesh(); Item* it = m >= 0 ? scene_->item(m) : nullptr; if (!it || it->type != ItemType::IMesh || !baseOf(*it)) { ui::toast(tr("Pick a mesh to subdivide")); return "!"; }
+  const PolyMesh& B = *baseOf(*it); const auto fs = topoMode == "object" ? std::vector<int>{} : tSelFaces(m);
+  std::vector<char> pk(size_t(B.faceCount()), fs.empty() ? 1 : 0); for (int f : fs) if (f >= 0 && f < B.faceCount()) pk[size_t(f)] = 1;
+  int done = 0; std::vector<int> made; auto R = subdiv::subdivideRegion(B, pk, ttools.subdSmooth, ttools.subdLevels, &made, &done);
+  if (!R || done == 0) { ui::toast(tr("Too many polygons to subdivide — fewer levels or a smaller region")); return "!"; }
+  const int before = B.faceCount(); const bool region = !fs.empty();
+  topoWrite(m, R);
+  const int ver = tsel_.ver + 1; tsel_ = {}; tsel_.id = m; tsel_.B = R.get(); tsel_.ver = ver;
+  if (region) { if (topoMode != "poly") { topoMode = "poly"; updateGizmo(); } tsel_.f.insert(made.begin(), made.end()); }   // (the new polygons stay picked)
+  thov_ = {}; tt_.hov = {}; ttTouch(); updateGizmo(); tt_.lastAfter = R; tt_.lastM = m;
+  QString msg = tr("Subdivided (%1, %2 level%3): %4 → %5 polygons%6").arg(ttools.subdSmooth ? tr("smooth") : tr("simple")).arg(done).arg(done == 1 ? "" : "s").arg(before).arg(R->faceCount()).arg(region ? tr(" — the selected ones") : QString());
+  if (done < ttools.subdLevels) msg += tr(" (stopped short of the levels asked: too many polygons)");
+  scene_->revision++; commit(true); emit topoState(); ui::toast(msg); return msg;
+}
+
+int Viewport::subdivGroupOf(int item) const {
+  for (const Item* x = scene_->item(item); x; x = x->parent >= 0 ? scene_->item(x->parent) : nullptr) if (x->type == ItemType::Group && x->raw.value("subdiv").isObject()) return x->id;
+  return -1;
+}
+
+// the selected meshes into a new Subdivision group: they are shown smoothed (the cage stays what is edited) — Apply makes it real
+QString Viewport::subdivCreate() {
+  std::vector<int> ms; for (int id : sel_.items) if (const Item* x = scene_->item(id); x && x->type == ItemType::IMesh) ms.push_back(id);
+  QString msg;   // (no meshes picked: an empty group — drag meshes into it in the outliner)
+  runEdit([&](Scene& s, Selection& sel, const CurveCache&) -> QString {
+    const int parent = !ms.empty() && s.item(s.item(ms[0])->parent) ? s.item(ms[0])->parent : meshesGroup(s);   // (at the root: inside Meshes)
+    Item& g = s.addItem(ItemType::Group, parent, tr("Subdivision group")); g.expanded = true;
+    g.raw = QJsonObject{{"sym", QJsonValue()}, {"guides", "hide"}, {"conv", QJsonValue()}, {"guidesGroup", false}, {"meshesGroup", false}, {"importGroup", false},
+                        {"labels", QJsonValue()}, {"guidesOff", false}, {"logic", 2}, {"view", QJsonValue()}, {"side", "scene"}, {"spos", QJsonValue()},
+                        {"subdiv", QJsonObject{{"level", 1}, {"grid", false}, {"smoothOpen", true}, {"uv", "smooth"}}}};
+    const int gid = g.id;
+    for (int id : ms) { s.removeFromParent(id); s.item(id)->parent = gid; s.item(gid)->children.push_back(id); }
+    sel.items = {gid}; msg = ms.empty() ? tr("An empty Subdivision group: drag meshes into it in the outliner — they are shown smoothed")
+                                         : tr("A Subdivision group: its meshes are shown smoothed — the level and the rest in its settings, Apply makes it real"); return msg;
+  });
+  return msg;
+}
+
+// Reconstruct: the high-poly meshes of the group taken one level down — each becomes the mesh it is the subdivision of (triangles and
+// quads, never n-gons); what the subdivision of that lacks of the original is kept as the detail of level 1 (the older details move up
+// a level). The group's level goes up by one, so what is shown stays the same. Again and again, until nothing is left to reconstruct.
+QString Viewport::subdivReconstruct(int group) {
+  Item* g = scene_->item(group); if (!g || !g->raw.value("subdiv").isObject()) { ui::toast(tr("Select a Subdivision group")); return "!"; }
+  subdiv::Opts o = subdiv::optsOf(g->raw.value("subdiv").toObject());
+  std::vector<int> ms; std::function<void(int)> walk = [&](int id) { const Item* x = scene_->item(id); if (!x) return; if (x->type == ItemType::IMesh) ms.push_back(id); for (int c : x->children) walk(c); }; walk(group);
+  if (ms.empty()) { ui::toast(tr("No meshes in the group — put the high-poly model into it first")); return "!"; }
+  int done = 0, stuck = 0; long long before = 0, after = 0; QString why, lastName;
+  for (int m : ms) { Item* it = scene_->item(m); if (!it || !it->base) continue;
+    const auto old = subdiv::unpackDetails(it->raw.value("subdDetail"));
+    auto R = subdiv::reconstruct(*it->base, old, o);
+    if (!R.cage) { stuck++; why = R.why; continue; }
+    before += it->base->faceCount(); after += R.cage->faceCount(); topoWrite(m, R.cage);
+    if (Item* it2 = scene_->item(m)) { it2->raw.insert("subdDetail", subdiv::packDetails(R.details)); lastName = it2->name; }
+    done++; }
+  if (!done) {
+    const QString r = why == "ngon" ? tr("the next level down would need n-gons, and those are not restored")
+                    : why == "notquads" ? tr("the mesh has triangles or n-gons — a subdivision is quads only")
+                    : why == "nonmanifold" ? tr("the mesh is not a clean surface (an edge of three polygons, polygons turned both ways)")
+                    : why == "empty" ? tr("the mesh is empty") : tr("the mesh is not the subdivision of a lower one");
+    const QString msg = tr("Minimum subdivision level reached — nothing to reconstruct: %1").arg(r); ui::toast(msg); return "!" + msg; }
+  { Item* gi = scene_->item(group); QJsonObject sd = gi->raw.value("subdiv").toObject(); sd.insert("level", std::min(6, o.level + 1)); gi->raw.insert("subdiv", sd); }   // (shown as before: one level more)
+  scene_->revision++; commit(true); emit topoState(); emit sceneEdited();
+  QString msg = tr("Reconstructed one level: %1 → %2 polygons; its detail is level 1 now").arg(before).arg(after);
+  if (stuck) msg += tr(" (%1 mesh%2 could not go lower)").arg(stuck).arg(stuck == 1 ? "" : "es");
+  ui::toast(msg); return msg;
+}
+
+QString Viewport::subdivApply(int group) {
+  Item* g = scene_->item(group); if (!g || !g->raw.value("subdiv").isObject()) { ui::toast(tr("Select a Subdivision group")); return "!"; }
+  const subdiv::Opts o = subdiv::optsOf(g->raw.value("subdiv").toObject());
+  std::vector<int> ms; std::function<void(int)> walk = [&](int id) { const Item* x = scene_->item(id); if (!x) return; if (x->type == ItemType::IMesh) ms.push_back(id); for (int c : x->children) walk(c); }; walk(group);
+  if (ms.empty()) { ui::toast(tr("No meshes in the group — drag some into it in the outliner")); return "!"; }
+  if (o.level <= 0) { ui::toast(tr("Level 0 — nothing to apply")); return "!"; }
+  long long polys = 0; int meshes = 0, shortBy = 0;
+  for (int m : ms) { Item* it = scene_->item(m); if (!it || !it->base) continue;
+    int done = 0; const auto det = subdiv::unpackDetails(it->raw.value("subdDetail"));   // (the levels' own shape from Reconstruct comes with it)
+    auto R = subdiv::run(*it->base, o, &done, 3000000, det.empty() ? nullptr : &det);
+    if (!R) { shortBy++; continue; }
+    if (done < o.level) shortBy++;
+    polys += R->faceCount(); meshes++; topoWrite(m, R); if (Item* it2 = scene_->item(m)) it2->raw.remove("subdDetail"); }   // (baked: the details are in the geometry now)
+  if (!meshes) { ui::toast(tr("Too many polygons for this level — lower it")); return "!"; }
+  { // (made real: the modifier is of no use any more; the group goes when it holds nothing else — its meshes take its place in the outliner)
+    Item* gi = scene_->item(group); gi->raw.remove("subdiv");
+    if (!gi->raw.value("vsym").isObject()) {
+      const int par = gi->parent; const std::vector<int> kids = gi->children;
+      std::vector<int>& to = par >= 0 && scene_->item(par) ? scene_->item(par)->children : scene_->roots;
+      auto at = std::find(to.begin(), to.end(), group); const long pos = at == to.end() ? long(to.size()) : long(at - to.begin());
+      to.erase(std::remove(to.begin(), to.end(), group), to.end()); to.insert(to.begin() + std::min<long>(pos, long(to.size())), kids.begin(), kids.end());
+      for (int k : kids) if (Item* c = scene_->item(k)) c->parent = par;
+      scene_->items.erase(group);
+      sel_.items.erase(std::remove(sel_.items.begin(), sel_.items.end(), group), sel_.items.end()); if (sel_.items.empty()) sel_.items = kids; onSelChange(); } }
+  scene_->revision++; commit(true); emit topoState(); emit sceneEdited();
+  QString msg = tr("Subdivision made real: %1 polygons in %2 mesh%3").arg(polys).arg(meshes).arg(meshes == 1 ? "" : "es");
+  if (shortBy) msg += tr(" — %1 of them stopped short of the level (too many polygons)").arg(shortBy);
+  ui::toast(msg); return msg;
 }
 
 }  // namespace hm
@@ -828,6 +952,7 @@ namespace hm {
 // from the camera (the back wall — orange in two-tone) put into every corner there, so the edge's band shades as the
 // wall behind it and the border melts away (a sleeve's cut edge, a hem's thickness)
 QString Viewport::tNormalsFromBack() {
+  if (!eachBusy_ && uvMulti()) return tEachMesh([&] { return tNormalsFromBack(); }, true);   // (several meshes picked: done on each — on its own picks, or on the whole of it)
   const int m = topoMesh(); Item* it = m >= 0 ? scene_->item(m) : nullptr; if (!it) return "!";
   if (tsel_.id != m || tsel_.e.empty()) { ui::toast(tr("Select the edges whose normals should blend into the back wall (Edge mode)")); return "!"; }
   auto nb = std::make_shared<PolyMesh>(*baseOf(*it)); PolyMesh& d = *nb; auto T = topo::ttopo(baseSp(*it)); const auto W = ttWorld(m);
@@ -901,6 +1026,7 @@ QString Viewport::tNormalsFromBack() {
 // the selected vertices' normals set to one direction: a world axis (+x … -z), toward the camera (cam) or their average
 // (one); reset — back to the standard smoothing (smooth everywhere but the hard edges; nothing selected — the whole mesh)
 QString Viewport::tNormalsSet(const QString& dir) {
+  if (!eachBusy_ && uvMulti()) return tEachMesh([&] { return tNormalsSet(dir); }, true);   // (several meshes picked: done on each — on its own picks, or on the whole of it)
   const int m = topoMesh(); Item* it = m >= 0 ? scene_->item(m) : nullptr; if (!it) return "!";
   const std::vector<int> sel = tSelVerts(m);
   auto nb = std::make_shared<PolyMesh>(*baseOf(*it)); PolyMesh& d = *nb;
@@ -934,7 +1060,7 @@ QString Viewport::tNormalsSet(const QString& dir) {
 namespace hm {
 int Viewport::tSelectOpenEdges() {
   const int m = topoMesh(); const Item* it = m >= 0 ? scene_->item(m) : nullptr; if (!it) return 0;
-  auto T = topo::ttopo(it->base ? it->base : it->poly); tsel_ = {}; tsel_.id = m;
+  auto T = topo::ttopo(it->base ? it->base : it->poly); const int ver = tsel_.ver; tsel_ = {}; tsel_.id = m; tsel_.ver = ver;   // (the version carried on: tSelVerts caches by it)
   for (int e = 0; e < T->ne; e++) if (T->ef1[size_t(e)] < 0) tsel_.e.insert(e);
   tsel_.ver++; topoRev_++; emit topoState(); return int(tsel_.e.size());
 }

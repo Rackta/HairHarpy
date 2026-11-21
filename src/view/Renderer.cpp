@@ -1,4 +1,4 @@
-﻿#include "view/Renderer.h"
+#include "view/Renderer.h"
 #include "scene/Cocoons.h"
 #include "scene/Looks.h"
 #include "scene/Refs.h"
@@ -7,6 +7,7 @@
 #include "scene/Tubes.h"
 #include "scene/Walls.h"
 #include "view/Viewport.h"
+#include <QDateTime>
 #include <QPainter>
 #include <QJsonDocument>
 #include <QElapsedTimer>
@@ -164,6 +165,7 @@ VkPipeline Renderer::makePipeline(VkPipelineLayout layout, const QString& vs, co
 void Renderer::initResources() {
   VkDevice dev = w_->device();
   df_ = w_->vulkanInstance()->deviceFunctions(dev);
+  w_->gpuReset();                       // (a device made again: the walls and rings it lost are built anew)
   VkPhysicalDeviceFeatures feat{};
   w_->vulkanInstance()->functions()->vkGetPhysicalDeviceFeatures(w_->physicalDevice(), &feat);
   wideLines_ = feat.wideLines;
@@ -242,6 +244,32 @@ looks::MapSrc Renderer::refImage(const RefPlane& rp) const {
   s.label = rp.name; return s;
 }
 
+// a plane's ✏ drawing on the GPU: its composed picture, uploaded again whenever its rev changes (every stroke); the texture and
+// descriptor set it replaces freed once the frames in flight are done with them
+QString Renderer::sketchTexture(int planeId) {
+  const QImage* flat = nullptr; qint64 rev = 0;
+  if (planeId == PAINT_VIEW) {                                   // (the Paint room's map: one texture kept; a stroke's step sends only the part it changed)
+    auto& pv = w_->scene()->paintView; QString& cur = sketchKey_[PAINT_VIEW];
+    if (!pv.on || pv.flat.isNull()) { dropTex(cur); sketchKey_.erase(PAINT_VIEW); paintRevDone_ = -1; return {}; }
+    auto t = cur.isEmpty() ? texCache_.end() : texCache_.find(cur);
+    if (t != texCache_.end() && t->second.view && !pv.full && paintTexSize_ == pv.flat.size()) {
+      if (pv.rev != paintRevDone_) { if (pv.dirty.w == pv.flat.width() && pv.dirty.h == pv.flat.height()) { const auto rs = pv.dirty.runs(); if (!rs.empty()) { ProfScope pp("paintPatch"); updateRegion(t->second, pv.flat, rs, true); } } pv.dirty.clear(); paintRevDone_ = pv.rev; }
+      return cur; }
+    dropTex(cur); cur = QString("sk:pv:%1#c").arg(++paintGen_); texCache_[cur] = uploadImage(pv.flat, true); paintTexSize_ = pv.flat.size(); pv.full = false; pv.dirty.clear(); paintRevDone_ = pv.rev;
+    return texCache_[cur].view ? cur : QString(); }
+  else { const auto& S = w_->scene()->refSketches; auto f = S.find(planeId); if (f != S.end() && !f->second.flat.isNull()) { flat = &f->second.flat; rev = f->second.rev; } }
+  if (!flat) { if (auto k = sketchKey_.find(planeId); k != sketchKey_.end()) { dropTex(k->second); sketchKey_.erase(k); } return {}; }
+  QString& cur = sketchKey_[planeId];
+  const QString key = QString("sk:%1:%2#c").arg(planeId).arg(rev);
+  if (cur != key) { dropTex(cur); cur = key; texCache_[key] = uploadImage(*flat, true); }
+  return texCache_[key].view ? key : QString();
+}
+void Renderer::dropTex(const QString& k) {
+  if (k.isEmpty()) return;
+  if (auto t = texCache_.find(k); t != texCache_.end()) { deadTex_.push_back({t->second, VK_NULL_HANDLE, w_->concurrentFrameCount() + 1}); texCache_.erase(t); }
+  if (auto s = texSets_.find(k + "|"); s != texSets_.end()) { deadTex_.push_back({GpuTex{}, s->second, w_->concurrentFrameCount() + 1}); texSets_.erase(s); }
+}
+
 // an image to the GPU (device-local, optimal tiling) with its mip levels made by blits; colour maps in sRGB
 Renderer::GpuTex Renderer::uploadImage(const QImage& src, bool srgb) {
   GpuTex t; VkDevice dev = w_->device();
@@ -304,6 +332,54 @@ Renderer::GpuTex Renderer::uploadImage(const QImage& src, bool srgb) {
   return t;
 }
 
+// a part of a texture sent again: the rectangle (widened to a multiple of 64 texels, so each of the first mip levels holds it whole)
+// copied into level 0, the levels under it made anew there by blits; the small levels (64 texels and less) made anew whole. The frames
+// still drawing with the texture are waited for by the barrier (the same queue): no new image, no new descriptor
+void Renderer::updateRegion(GpuTex& t, const QImage& src, std::vector<QRect> rs, bool srgb) {
+  (void)srgb; if (!t.img || src.isNull()) return; VkDevice dev = w_->device();
+  const int W = src.width(), H = src.height(); const int A = 64;
+  for (QRect& r : rs) r = QRect(QPoint((r.left() / A) * A, (r.top() / A) * A), QPoint(std::min(W, ((r.right() + A) / A) * A) - 1, std::min(H, ((r.bottom() + A) / A) * A) - 1)).intersected(QRect(0, 0, W, H));
+  rs.erase(std::remove_if(rs.begin(), rs.end(), [](const QRect& r) { return r.isEmpty(); }), rs.end()); if (rs.empty()) return;
+  uint32_t mips = 1; for (uint32_t s = uint32_t(std::max(W, H)); s > 1; s >>= 1) mips++;
+  // (all the rectangles' texels one after another in one buffer)
+  QByteArray bytes; std::vector<VkBufferImageCopy> cps;
+  for (const QRect& r : rs) { const QImage part = src.copy(r).convertToFormat(QImage::Format_RGBA8888); VkBufferImageCopy cp{}; cp.bufferOffset = VkDeviceSize(bytes.size());
+    cp.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}; cp.imageOffset = {r.x(), r.y(), 0}; cp.imageExtent = {uint32_t(r.width()), uint32_t(r.height()), 1}; cps.push_back(cp);
+    for (int y = 0; y < part.height(); y++) bytes.append(reinterpret_cast<const char*>(part.constScanLine(y)), qsizetype(part.width()) * 4); }
+  Buf staging = makeBuffer(bytes.constData(), VkDeviceSize(bytes.size()), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+  VkCommandBufferAllocateInfo ca{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO}; ca.commandPool = w_->graphicsCommandPool(); ca.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; ca.commandBufferCount = 1;
+  VkCommandBuffer cb; df_->vkAllocateCommandBuffers(dev, &ca, &cb);
+  VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO}; bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+  df_->vkBeginCommandBuffer(cb, &bi);
+  auto barrier = [&](uint32_t mip, uint32_t count, VkImageLayout from, VkImageLayout to, VkAccessFlags sa, VkAccessFlags da, VkPipelineStageFlags ss, VkPipelineStageFlags ds) {
+    VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER}; b.oldLayout = from; b.newLayout = to; b.srcAccessMask = sa; b.dstAccessMask = da;
+    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED; b.image = t.img; b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, mip, count, 0, 1};
+    df_->vkCmdPipelineBarrier(cb, ss, ds, 0, 0, nullptr, 0, nullptr, 1, &b); };
+  barrier(0, mips, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+  df_->vkCmdCopyBufferToImage(cb, staging.buf, t.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, uint32_t(cps.size()), cps.data());
+  int32_t mw = W, mh = H;
+  for (uint32_t i = 1; i < mips; i++) {
+    barrier(i - 1, 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    const int32_t nw = std::max(1, mw / 2), nh = std::max(1, mh / 2);
+    const int sh = int(i) - 1; std::vector<VkImageBlit> bls;
+    if (i <= 6 && (1 << i) <= A) {                               // (each rectangle at this level and the one above: whole texels, twice the size)
+      for (const QRect& r : rs) { VkImageBlit bl{}; bl.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, i - 1, 0, 1}; bl.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, i, 0, 1};
+        const int32_t x0 = r.x() >> sh, y0 = r.y() >> sh, x1 = std::min(mw, int32_t((r.right() + 1) >> sh)), y1 = std::min(mh, int32_t((r.bottom() + 1) >> sh));
+        bl.srcOffsets[0] = {x0, y0, 0}; bl.srcOffsets[1] = {x1, y1, 1}; bl.dstOffsets[0] = {x0 / 2, y0 / 2, 0}; bl.dstOffsets[1] = {std::max(x0 / 2 + 1, x1 / 2), std::max(y0 / 2 + 1, y1 / 2), 1}; bls.push_back(bl); } }
+    else { VkImageBlit bl{}; bl.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, i - 1, 0, 1}; bl.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, i, 0, 1}; bl.srcOffsets[1] = {mw, mh, 1}; bl.dstOffsets[1] = {nw, nh, 1}; bls.push_back(bl); }
+    df_->vkCmdBlitImage(cb, t.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, t.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, uint32_t(bls.size()), bls.data(), VK_FILTER_LINEAR);
+    mw = nw; mh = nh;
+  }
+  if (mips > 1) barrier(0, mips - 1, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+  barrier(mips - 1, 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+  df_->vkEndCommandBuffer(cb);
+  VkSubmitInfo sub{VK_STRUCTURE_TYPE_SUBMIT_INFO}; sub.commandBufferCount = 1; sub.pCommandBuffers = &cb;
+  df_->vkQueueSubmit(w_->graphicsQueue(), 1, &sub, VK_NULL_HANDLE);
+  { ProfScope pw("gpuWaitPatch"); df_->vkQueueWaitIdle(w_->graphicsQueue()); }
+  df_->vkFreeCommandBuffers(dev, w_->graphicsCommandPool(), 1, &cb);
+  df_->vkDestroyBuffer(dev, staging.buf, nullptr); df_->vkFreeMemory(dev, staging.mem, nullptr);
+}
+
 void Renderer::destroyTex(GpuTex& t) {
   VkDevice dev = w_->device();
   if (t.view) df_->vkDestroyImageView(dev, t.view, nullptr);
@@ -323,6 +399,7 @@ QString Renderer::textureFor(const looks::MapSrc& s, bool srgb) {
     if (img.isNull()) qWarning("could not read the texture %s", qPrintable(s.label));
     it = texCache_.emplace(key, img.isNull() ? GpuTex{} : uploadImage(img, srgb)).first;
   }
+  if (it->second.view) texSeen_[key] = QDateTime::currentMSecsSinceEpoch();
   return it->second.view ? key : QString();
 }
 
@@ -413,6 +490,63 @@ void Renderer::syncChecker(const Item& it, std::set<QString>& usedTex, std::set<
   texMeshes_.push_back(std::move(g));
 }
 
+// the Paint room: a mesh with the map being painted on the polygons of the UV set painted in (every polygon — the project's single
+// texture), the rest plain. Its texture is the canvas's picture — a new one at every stroke, so the part only carries a mark (32) and
+// is drawn with this frame's (paintDs_)
+QByteArray Renderer::paintOthersKey() const {                   // (the other painted sets and their revisions: a mesh is made anew when one changes)
+  QByteArray k; for (const auto& [name, pr] : w_->scene()->paintView.others) if (!pr.first.isNull()) k += "|" + name.toUtf8(); return k + "|";
+}
+void Renderer::syncPaintView(const Item& it, std::set<QString>& usedTex, std::set<QString>& usedSets) {
+  const PolyMesh& m = *it.poly; const QString set = w_->scene()->paintView.set;
+  // (smooth shading — the hard edges and the file's own normals kept: the model as it will look, not its facets. The polygons of the
+  // other UV sets: with the mesh's own textures, as the Topology room shows them)
+  const auto sets = looks::setsOf(it); const QJsonArray LS = looks::lookOf(it).value("sets").toArray();
+  TexDraw d = buildTexDraw(m, sets, false);
+  int k = -1; if (!set.isEmpty()) for (size_t i = 0; i < m.uvSetNames.size(); i++) if (m.uvSetNames[i] == set) k = int(i);
+  std::vector<char> inFace(size_t(m.faceCount()), 0); std::vector<int> cornerFace(m.faceVerts.size(), 0);
+  if (d.verts.size() == m.faceVerts.size()) for (int f = 0; f < m.faceCount(); f++) {
+    const int s = m.faceStart[size_t(f)], e = m.faceStart[size_t(f) + 1]; for (int c = s; c < e; c++) cornerFace[size_t(c)] = f;
+    const bool on = set.isEmpty() || (k >= 0 && size_t(f) < m.faceSets.size() && (m.faceSets[size_t(f)] >> k & 1)); inFace[size_t(f)] = on;
+    if (on && k >= 0 && size_t(k) < m.setUV.size() && m.setUV[size_t(k)].size() == m.faceVerts.size() && !(size_t(f) < m.faceLive.size() && m.faceLive[size_t(f)] == k))
+      for (int c = s; c < e; c++) { const auto& u = m.setUV[size_t(k)][size_t(c)]; d.verts[size_t(c)].uv[0] = u[0]; d.verts[size_t(c)].uv[1] = m.flipY ? 1 - u[1] : u[1]; }   // (the set's own UV where the polygon shows another's)
+  }
+  // (the other UV sets with paint: each one's picture as it was left when the brush went elsewhere — on its own polygons, by its own UV)
+  std::vector<int> faceOther(size_t(m.faceCount()), -1); std::vector<QString> otherKey;
+  if (!set.isEmpty() && d.verts.size() == m.faceVerts.size()) for (const auto& [name, pr] : w_->scene()->paintView.others) {
+    if (name == set || pr.first.isNull()) continue; int k2 = -1; for (size_t i = 0; i < m.uvSetNames.size(); i++) if (m.uvSetNames[i] == name) k2 = int(i); if (k2 < 0) continue;
+    int ni = -1; for (size_t i = 0; i < paintOtherNames_.size(); i++) if (paintOtherNames_[i] == name) ni = int(i); if (ni < 0) { ni = int(paintOtherNames_.size()); paintOtherNames_.push_back(name); }
+    const int oi = int(otherKey.size()); otherKey.push_back(QString::number(ni));
+    const bool own = size_t(k2) < m.setUV.size() && m.setUV[size_t(k2)].size() == m.faceVerts.size();
+    for (int f = 0; f < m.faceCount(); f++) { if (inFace[size_t(f)] || faceOther[size_t(f)] >= 0 || !(size_t(f) < m.faceSets.size() && (m.faceSets[size_t(f)] >> k2 & 1))) continue; faceOther[size_t(f)] = oi;
+      if (own && !(size_t(f) < m.faceLive.size() && m.faceLive[size_t(f)] == k2)) for (int c = m.faceStart[size_t(f)]; c < m.faceStart[size_t(f) + 1]; c++) { const auto& u = m.setUV[size_t(k2)][size_t(c)]; d.verts[size_t(c)].uv[0] = u[0]; d.verts[size_t(c)].uv[1] = m.flipY ? 1 - u[1] : u[1]; } } }
+  if (keepTexVerts_) *keepTexVerts_ = d.verts;
+  GpuTexMesh g; g.itemId = it.id; std::vector<uint32_t> idx;
+  const VkDescriptorSet plain = descriptorFor(QString(), QString()); usedSets.insert("|");
+  { TexPart p; p.first = 0; for (const auto& T : d.bySet) for (size_t t = 0; t + 2 < T.size(); t += 3) if (size_t(T[t]) < cornerFace.size() && inFace[size_t(cornerFace[size_t(T[t])])]) { idx.push_back(T[t]); idx.push_back(T[t + 1]); idx.push_back(T[t + 2]); }
+    p.count = uint32_t(idx.size()); p.flags = 1 | 32; toLinear(Qt::white, p.color); p.ds = plain; if (p.count) g.parts.push_back(p); }
+  for (size_t oi = 0; oi < otherKey.size(); oi++) {              // (a part per other UV set that has paint)
+    TexPart p; p.first = uint32_t(idx.size());
+    for (const auto& T : d.bySet) for (size_t t = 0; t + 2 < T.size(); t += 3) if (size_t(T[t]) < cornerFace.size() && faceOther[size_t(cornerFace[size_t(T[t])])] == int(oi)) { idx.push_back(T[t]); idx.push_back(T[t + 1]); idx.push_back(T[t + 2]); }
+    p.count = uint32_t(idx.size()) - p.first; if (!p.count) continue;
+    p.flags = 1; toLinear(Qt::white, p.color); p.ds = plain; p.other = otherKey[oi].toInt(); g.parts.push_back(p); }
+  for (size_t i = 0; i < d.bySet.size(); i++) {                  // (the rest: a part per texture set of the mesh)
+    TexPart p; p.first = uint32_t(idx.size()); const auto& T = d.bySet[i];
+    for (size_t t = 0; t + 2 < T.size(); t += 3) if (size_t(T[t]) < cornerFace.size() && !inFace[size_t(cornerFace[size_t(T[t])])] && faceOther[size_t(cornerFace[size_t(T[t])])] < 0) { idx.push_back(T[t]); idx.push_back(T[t + 1]); idx.push_back(T[t + 2]); }
+    p.count = uint32_t(idx.size()) - p.first; if (!p.count) continue;
+    QString mk, ak; const bool on = int(i) < LS.size() ? LS[int(i)].toObject().value("on").toBool(true) : false;
+    if (on && i < sets.size()) { mk = textureFor(looks::resolve(it, int(i), 0), true); ak = textureFor(looks::resolve(it, int(i), 1), false);
+      const bool hasMap = !mk.isEmpty(), hasAlpha = !ak.isEmpty(), mapAlpha = hasMap && looks::setAlpha(it, int(i));
+      p.transparent = hasAlpha || mapAlpha; p.flags = (hasMap ? 1 : 0) | (hasAlpha ? 2 : 0) | (mapAlpha ? 4 : 0) | (p.transparent ? 8 : 0);
+      toLinear(QColor(looks::setColor(it, int(i), hasMap)), p.color); }
+    else toLinear(QColor(QRgb(looks::HEAD_GREY)), p.color);
+    if (!mk.isEmpty()) usedTex.insert(mk); if (!ak.isEmpty()) usedTex.insert(ak);
+    p.ds = descriptorFor(mk, ak); usedSets.insert(mk + "|" + ak); g.parts.push_back(p);
+  }
+  g.vb = makeBuffer(d.verts.data(), d.verts.size() * sizeof(TexVertex), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+  g.ib = makeBuffer(idx.data(), idx.size() * sizeof(uint32_t), VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+  texMeshes_.push_back(std::move(g));
+}
+
 // the element under the pointer in the UV Editor (Viewport::uvHoverDraw)
 void Renderer::syncUvHover() {
   const auto& D = w_->uvHoverDraw();
@@ -452,7 +586,8 @@ void Renderer::syncUv() {
   if (D.checker) { const QString mk = checkerTex(); if (!mk.isEmpty()) {           // (the labelled checker under the UV, its cells as on the mesh)
       uvTexDs_ = descriptorFor(mk, QString()); uvChk_ = true; const float k = float(w_->uvo.density / 8);
       const float C[6][2] = {{0, 0}, {1, 0}, {1, 1}, {0, 0}, {1, 1}, {0, 1}}; std::vector<TexVertex> q;
-      for (auto& c : C) q.push_back({{c[0], c[1], 0}, {0, 0, 1}, {c[0] * k, c[1] * k}});
+      if (!D.chk.empty()) for (auto& c : D.chk) q.push_back({{c[0], c[1], 0}, {0, 0, 1}, {c[0] * k, c[1] * k}}); else for (auto& c : C) q.push_back({{c[0], c[1], 0}, {0, 0, 1}, {c[0] * k, c[1] * k}});
+      uvQuadN_ = uint32_t(q.size());
       uvQuad_ = makeBuffer(q.data(), q.size() * sizeof(TexVertex), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT); } }
   // the texture under the UV: the picked UV Mat's map, else the mesh's first one
   if (D.texMesh >= 0) if (const Item* it = w_->scene()->item(D.texMesh); it && it->poly) {
@@ -463,6 +598,7 @@ void Renderer::syncUv() {
       uvTexDs_ = descriptorFor(mk, QString()); const bool fy = it->poly->flipY;
       const float C[6][2] = {{0, 0}, {1, 0}, {1, 1}, {0, 0}, {1, 1}, {0, 1}}; std::vector<TexVertex> q;
       for (auto& c : C) q.push_back({{c[0], c[1], 0}, {0, 0, 1}, {c[0], fy ? 1 - c[1] : c[1]}});
+      uvQuadN_ = 6;
       uvQuad_ = makeBuffer(q.data(), q.size() * sizeof(TexVertex), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT); }
   }
 }
@@ -470,8 +606,62 @@ void Renderer::syncUv() {
 void Renderer::initSwapChainResources() {}
 void Renderer::releaseSwapChainResources() {}
 
+// ---- the view window's target ----
+void Renderer::destroyOff() {
+  VkDevice dev = w_->device(); if (!dev) return;
+  if (off_.fb) df_->vkDestroyFramebuffer(dev, off_.fb, nullptr);
+  for (VkImageView v : {off_.colorV, off_.depthV, off_.msaaV}) if (v) df_->vkDestroyImageView(dev, v, nullptr);
+  for (VkImage i : {off_.color, off_.depth, off_.msaa}) if (i) df_->vkDestroyImage(dev, i, nullptr);
+  for (VkDeviceMemory m : {off_.colorM, off_.depthM, off_.msaaM}) if (m) df_->vkFreeMemory(dev, m, nullptr);
+  if (off_.read.buf) { df_->vkDestroyBuffer(dev, off_.read.buf, nullptr); df_->vkFreeMemory(dev, off_.read.mem, nullptr); }
+  off_ = Off{};
+}
+bool Renderer::ensureOff(int W, int H) {
+  if (off_.fb && off_.w == W && off_.h == H) return true;
+  destroyOff(); VkDevice dev = w_->device();
+  const VkSampleCountFlagBits S = w_->sampleCountFlagBits(); const bool ms = S > VK_SAMPLE_COUNT_1_BIT;
+  const VkFormat cf = w_->colorFormat(), dfm = w_->depthStencilFormat();
+  if (!offPass_) {                                             // (as QVulkanWindow's default pass — the pipelines fit it; its picture left ready to be copied out)
+    VkAttachmentDescription at[3]{};
+    at[0].format = cf; at[0].samples = VK_SAMPLE_COUNT_1_BIT; at[0].loadOp = ms ? VK_ATTACHMENT_LOAD_OP_DONT_CARE : VK_ATTACHMENT_LOAD_OP_CLEAR; at[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    at[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE; at[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE; at[0].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED; at[0].finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    at[1].format = dfm; at[1].samples = S; at[1].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; at[1].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    at[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE; at[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE; at[1].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED; at[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    at[2].format = cf; at[2].samples = S; at[2].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; at[2].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    at[2].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE; at[2].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE; at[2].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED; at[2].finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    VkAttachmentReference cr{ms ? 2u : 0u, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL}, rr{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL}, dr{1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
+    VkSubpassDescription sp{}; sp.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS; sp.colorAttachmentCount = 1; sp.pColorAttachments = &cr; sp.pDepthStencilAttachment = &dr; if (ms) sp.pResolveAttachments = &rr;
+    VkRenderPassCreateInfo ri{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO}; ri.attachmentCount = ms ? 3 : 2; ri.pAttachments = at; ri.subpassCount = 1; ri.pSubpasses = &sp;
+    if (df_->vkCreateRenderPass(dev, &ri, nullptr, &offPass_) != VK_SUCCESS) { offPass_ = VK_NULL_HANDLE; return false; }
+  }
+  auto mk = [&](VkFormat f, VkSampleCountFlagBits s, VkImageUsageFlags u, VkImageAspectFlags asp, VkImage& img, VkDeviceMemory& mem, VkImageView& view) {
+    VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO}; ii.imageType = VK_IMAGE_TYPE_2D; ii.format = f; ii.extent = {uint32_t(W), uint32_t(H), 1}; ii.mipLevels = 1; ii.arrayLayers = 1; ii.samples = s;
+    ii.tiling = VK_IMAGE_TILING_OPTIMAL; ii.usage = u; ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (df_->vkCreateImage(dev, &ii, nullptr, &img) != VK_SUCCESS) { img = VK_NULL_HANDLE; return false; }
+    VkMemoryRequirements req; df_->vkGetImageMemoryRequirements(dev, img, &req); uint32_t mt = w_->deviceLocalMemoryIndex();
+    if (!(req.memoryTypeBits & (1u << mt))) { VkPhysicalDeviceMemoryProperties mp; w_->vulkanInstance()->functions()->vkGetPhysicalDeviceMemoryProperties(w_->physicalDevice(), &mp);
+      for (uint32_t i = 0; i < mp.memoryTypeCount; i++) if ((req.memoryTypeBits & (1u << i)) && (mp.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) { mt = i; break; } }
+    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO}; ai.allocationSize = req.size; ai.memoryTypeIndex = mt;
+    if (df_->vkAllocateMemory(dev, &ai, nullptr, &mem) != VK_SUCCESS) { mem = VK_NULL_HANDLE; return false; }
+    df_->vkBindImageMemory(dev, img, mem, 0);
+    VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO}; vi.image = img; vi.viewType = VK_IMAGE_VIEW_TYPE_2D; vi.format = f; vi.subresourceRange = {asp, 0, 1, 0, 1};
+    return df_->vkCreateImageView(dev, &vi, nullptr, &view) == VK_SUCCESS;
+  };
+  const bool sten = dfm == VK_FORMAT_D24_UNORM_S8_UINT || dfm == VK_FORMAT_D32_SFLOAT_S8_UINT || dfm == VK_FORMAT_D16_UNORM_S8_UINT;
+  bool ok = mk(cf, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_IMAGE_ASPECT_COLOR_BIT, off_.color, off_.colorM, off_.colorV)
+         && mk(dfm, S, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, VK_IMAGE_ASPECT_DEPTH_BIT | (sten ? VK_IMAGE_ASPECT_STENCIL_BIT : 0), off_.depth, off_.depthM, off_.depthV)
+         && (!ms || mk(cf, S, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, VK_IMAGE_ASPECT_COLOR_BIT, off_.msaa, off_.msaaM, off_.msaaV));
+  if (ok) { VkImageView views[3] = {off_.colorV, off_.depthV, off_.msaaV};
+    VkFramebufferCreateInfo fi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO}; fi.renderPass = offPass_; fi.attachmentCount = ms ? 3 : 2; fi.pAttachments = views; fi.width = uint32_t(W); fi.height = uint32_t(H); fi.layers = 1;
+    ok = df_->vkCreateFramebuffer(dev, &fi, nullptr, &off_.fb) == VK_SUCCESS; }
+  if (ok) { const std::vector<uchar> z(size_t(W) * size_t(H) * 4, 0); off_.read = makeBuffer(z.data(), VkDeviceSize(z.size()), VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT); ok = off_.read.buf != VK_NULL_HANDLE; }
+  if (!ok) { destroyOff(); return false; }
+  off_.w = W; off_.h = H; return true;
+}
+
 void Renderer::releaseResources() {
   VkDevice dev = w_->device();
+  destroyOff(); if (offPass_) { df_->vkDestroyRenderPass(dev, offPass_, nullptr); offPass_ = VK_NULL_HANDLE; }
   for (auto& m : static_) if (!m.cached) retire(m);
   for (auto& m : shells_) retire(m);
   for (auto& m : tubes_) retire(m);
@@ -489,14 +679,16 @@ void Renderer::releaseResources() {
   for (auto& [k, ds] : texSets_) deadTex_.push_back({GpuTex{}, ds, 0});
   for (auto& [k, t] : texCache_) deadTex_.push_back({t, VK_NULL_HANDLE, 0});
   deadTex_.push_back({white_, VK_NULL_HANDLE, 0}); white_ = {};
-  texSets_.clear(); texCache_.clear(); texRev_ = -1;
-  for (GpuLines* g : {&curves_, &floor_, &axes_, &rings_, &ringsBack_, &lasso_, &joints_, &gizmo3_, &gizmo2_, &guides_, &masks_, &tubeGuides_, &tubeLoops_, &tubeWire_, &edgeSel_, &edgeHov_, &ribLines_, &paneFrames_, &paneActive_, &zone_}) retire(g->vb);
+  texSets_.clear(); texCache_.clear(); texSeen_.clear(); texRev_ = -1; sketchKey_.clear(); paintOtherKey_.clear(); paintOtherDs_.clear();
+  for (GpuLines* g : {&floorP_[0], &floorP_[1], &floorP_[2], &floorP_[3], &axesP_[0], &axesP_[1], &axesP_[2], &axesP_[3], &curves_, &floor_, &axes_, &rings_, &ringsBack_, &lasso_, &joints_, &gizmo3_, &gizmo2_, &guides_, &masks_, &tubeGuides_, &tubeLoops_, &tubeWire_, &edgeSel_, &edgeHov_, &ribLines_, &paneFrames_, &paneActive_, &zone_}) retire(g->vb);
+  for (auto& [k, g] : paneGrid_) retire(g.vb);
+  paneGrid_.clear();
   retire(points_);
-  collectGarbage(true);
   tubesRev_ = crownsRev_ = ribsRev_ = -1; crownStatic_ = -2;
-  retire(pins_);
+  retire(pins_); retire(markVb_); markCount_ = 0; for (auto& [k, g] : paneMarks_) retire(g.vb); paneMarks_.clear();
   for (VkPipeline* p : {&meshPipe_, &meshBlendPipe_, &meshDepthPipe_, &linePipe_, &lineTopPipe_, &pointPipe_, &meshBlendWritePipe_, &pointDepthPipe_}) if (*p) { df_->vkDestroyPipeline(dev, *p, nullptr); *p = VK_NULL_HANDLE; }
   retire(rpVb_);
+  collectGarbage(true);                 // (after the last retire: what was retired after it stayed queued, and was destroyed on the next device)
   for (VkPipeline* p : {&texPipe_, &texBlendPipe_, &rpBehindPipe_, &rpOverPipe_}) if (*p) { df_->vkDestroyPipeline(dev, *p, nullptr); *p = VK_NULL_HANDLE; }
   for (VkPipelineLayout* l : {&meshLayout_, &lineLayout_, &pointLayout_, &texLayout_}) if (*l) { df_->vkDestroyPipelineLayout(dev, *l, nullptr); *l = VK_NULL_HANDLE; }
   if (sampler_) { df_->vkDestroySampler(dev, sampler_, nullptr); sampler_ = VK_NULL_HANDLE; }
@@ -528,7 +720,8 @@ Renderer::ViewOpts Renderer::viewOpts() const {
   auto num = [&](const char* k, double def) { double x = v.value(k).toDouble(def); return x >= 0 && x <= 1 ? x : def; };
   o.xray = num("xray", 0.2); o.surfOp = std::max(0.05, num("surfOpacity", 0.85)); o.modOp = std::max(0.05, num("modOpacity", 0.45));
   o.anchorOp = num("anchorOpacity", 1); o.curveOp = num("curveOpacity", 1); o.guideOp = num("guideOpacity", 1); o.gridOp = num("gridOpacity", 1);
-  o.showGrid = v.value("showGrid").toBool(false); o.showLoops = v.value("showLoops").toBool(false);   // (the walls' lines: off unless switched on in Display) o.showMods = v.value("showMods").toBool(true); o.showMeshWire = v.value("showMeshWire").toBool(true);
+  o.showGrid = v.value("showGrid").toBool(false); o.showLoops = v.value("showLoops").toBool(false);   // (the walls' lines: off unless switched on in Display)
+  o.showMods = v.value("showMods").toBool(true); o.showMeshWire = v.value("showMeshWire").toBool(false);
   return o;
 }
 
@@ -741,7 +934,7 @@ bool Renderer::patchLive(int m, const std::shared_ptr<PolyMesh>& poly, const Pol
 }
 
 float Renderer::matCode(const Item& it, bool topoRoom) {
-  (void)topoRoom;                                               // (both rooms: the mesh's own material)
+  if (it.headTag && !topoRoom) return 0;                        // (a Head Collision object: no material of its own)
   if (it.type != ItemType::IMesh || !it.raw.value("mat").isObject() || it.raw.value("matOff").toBool()) return 0;
   QJsonObject m = it.raw.value("mat").toObject(); auto q = [&](const char* k, double d) { return double(std::lround(std::clamp(m.value(k).toDouble(d), 0.0, 1.0) * 255)); };
   return float(1 + q("roughness", 0.7) + q("metalness", 0) * 256 + q("specular", 1) * 65536);
@@ -758,7 +951,7 @@ void Renderer::dropMeshCaches() {
 void Renderer::syncStatic() {
   ProfScope prof_("syncStatic");
   for (auto& m : static_) if (!m.cached) retire(m);
-  static_.clear();
+  static_.clear(); wireDisp_.clear();
   for (auto& m : texMeshes_) if (!m.cached) { retire(m.vb); retire(m.ib); }
   texMeshes_.clear();
   for (auto& [id, c] : plainCache_) c.used = false;
@@ -766,49 +959,53 @@ void Renderer::syncStatic() {
   std::set<QString> usedTex, usedSets;
   const Scene& sc = *w_->scene();
   const ViewOpts V = viewOpts();
-  for (auto& [id, it] : sc.items) {
-    if (!it.poly || !sc.isVisible(it)) continue;
-    if (it.raw.contains("collCap")) continue;                   // (a collision capsule: its rings only, as an overlay)
-    bool converted = it.type == ItemType::Mesh, imesh = it.type == ItemType::IMesh;
-    const bool topoRoom = w_->room() == "topo";
-    bool wire = (converted || (imesh && V.showMeshWire && w_->topoWire(it)) || ((it.headTag || imesh) && w_->showWire && !topoRoom)) && !meshmods::wireless(it);   // (W in the Hair room: the head and the imported meshes)
+  // one shown mesh: `it` — what is drawn (inside a Subdivision group: the mesh itself as its cage — its wire only — and a copy
+  // of it whose poly is the smooth surface, `surf`), ck — its key in the caches
+  const bool topoRoom = w_->room() == "topo"; constexpr int SUBKEY = 0x40000000;
+  auto drawItem = [&](int id, const Item& it, int ck, bool cageOnly, bool surf) {
+    bool converted = it.type == ItemType::Mesh || (it.type == ItemType::IMesh && !topoRoom && w_->room() != "paint" && it.raw.contains("srcSurfs")), imesh = it.type == ItemType::IMesh;   // (a converted mesh: its wire in the Hair room as before)
+    if (imesh && !it.headTag && (w_->room() == "paint" || w_->topoWire(it))) wireDisp_.insert(id);   // (shown as wire by a view's ⬡ / ▦ or the Display's Wire — per view, when drawn)
+    bool wire = (converted || (imesh && (topoRoom && it.raw.value("twire").toBool(false)) && w_->topoWire(it))   /* (a mesh whose own Wireframe is switched on shows it whatever the Display's Wire says: with its Transparency up it is only the wire — it must not vanish) */ || ((it.headTag || imesh) && w_->showWire && !topoRoom));   // (W in the Hair room: the head and the imported meshes)
+    if (surf) wire = it.subdGrid;   // (the subdivided surface: its own grid only when asked)
     // (an imported mesh keeps its wire built while it may be shown: switched on / off without a rebuild)
-    const bool wireBuilt = imesh ? !meshmods::wireless(it) : wire;
-    // (flat faces unless Smooth normals (display) is on; a heavy mesh — no wireframe)
-    const bool flat = !it.raw.value("smoothN").toBool();
-    const bool checker = topoRoom && w_->uvo.c3d && w_->uvDispShown(id) && uv::has(*it.poly);   // (the object's UV checker — in every mode)
-    const bool textured = checker || (it.type == ItemType::IMesh && looks::shown(it) && !(topoRoom && w_->tdisp.noTex));   // (Topology: No textures)
+    const bool wireBuilt = imesh || wire;
+    // (flat faces unless Smooth normals (display) is on)
+    const bool flat = surf ? false : !it.raw.value("smoothN").toBool();
+    const bool checker = !cageOnly && topoRoom && w_->uvo.c3d && w_->uvDispShown(id) && uv::has(*it.poly);   // (the object's UV checker — in every mode)
+    const bool pview = !cageOnly && !checker && imesh && w_->room() == "paint" && w_->scene()->paintView.on && uv::has(*it.poly);   // (the Paint room: the map being painted, on the model)
+    const bool collObj = it.headTag && !topoRoom;                // (a Head Collision object: shown plain — one colour, no textures, no material)
+    const bool textured = !cageOnly && !collObj && (checker || pview || (it.type == ItemType::IMesh && looks::shown(it) && !(topoRoom && w_->tdisp.noTex)));   // (Topology: No textures)
     const bool cacheable = imesh;                                // (an imported mesh: a new PolyMesh whenever it changes)
     // (polypaint: shown with the standard material only — a texture, the checker, a custom material, the silhouette, the
     // polygroups or the UV stretch take its place)
     const bool matOn = topoRoom && it.raw.value("mat").isObject() && !it.raw.value("matOff").toBool();
-    const bool paint = imesh && it.poly->vcol.size() == it.poly->pos.size() && !it.poly->vcol.empty() && !textured && !matOn && !it.raw.value("unlit").toBool()
+    const bool paint = imesh && !collObj && it.poly->vcol.size() == it.poly->pos.size() && !it.poly->vcol.empty() && !textured && !matOn && !it.raw.value("unlit").toBool()
                        && !it.raw.value("pgView").toBool() && !(topoRoom && w_->uvo.s3d && w_->uvDispShown(id));
     if (textured) {
-      QByteArray tkey = checker ? "checker" + QByteArray::number(w_->uvo.density) : QJsonDocument(looks::lookOf(it)).toJson(QJsonDocument::Compact) + QByteArray::number(looks::revision());
+      QByteArray tkey = checker ? "checker" + QByteArray::number(w_->uvo.density) : pview ? "pview|" + w_->scene()->paintView.set.toUtf8() + paintOthersKey() + QJsonDocument(looks::lookOf(it)).toJson(QJsonDocument::Compact) + QByteArray::number(looks::revision()) : QJsonDocument(looks::lookOf(it)).toJson(QJsonDocument::Compact) + QByteArray::number(looks::revision());
       tkey += flat ? "|f" : "|s";
-      auto c = texMeshCache_.find(id);
+      auto c = texMeshCache_.find(ck);
       if (cacheable && c != texMeshCache_.end() && c->second.poly.lock() == it.poly && c->second.key == tkey) {
-        c->second.used = true; texMeshes_.push_back(c->second.g); texMeshes_.back().mat = matCode(it, topoRoom); texMeshes_.back().unlit = it.raw.value("unlit").toBool(); usedTex.insert(c->second.tex.begin(), c->second.tex.end()); usedSets.insert(c->second.sets.begin(), c->second.sets.end());
+        c->second.used = true; texMeshes_.push_back(c->second.g); texMeshes_.back().mat = pview ? 0.f : matCode(it, topoRoom); texMeshes_.back().unlit = it.raw.value("unlit").toBool() || (pview && w_->paintDisp != "std" && w_->paintDisp != "wire"); usedTex.insert(c->second.tex.begin(), c->second.tex.end()); usedSets.insert(c->second.sets.begin(), c->second.sets.end());
       } else {
-        std::set<QString> ut, us; std::vector<TexVertex> kept; const bool keep = cacheable && !meshmods::heavy(it);
-        keepTexVerts_ = keep ? &kept : nullptr; if (checker) syncChecker(it, ut, us); else syncTextured(it, ut, us); keepTexVerts_ = nullptr;
+        std::set<QString> ut, us; std::vector<TexVertex> kept; const bool keep = cacheable;
+        keepTexVerts_ = keep ? &kept : nullptr; if (checker) syncChecker(it, ut, us); else if (pview) syncPaintView(it, ut, us); else syncTextured(it, ut, us); keepTexVerts_ = nullptr;
         usedTex.insert(ut.begin(), ut.end()); usedSets.insert(us.begin(), us.end());
         if (cacheable) { if (c != texMeshCache_.end()) { retire(c->second.g.vb); retire(c->second.g.ib); }
-          texMeshes_.back().cached = true; texMeshes_.back().mat = matCode(it, topoRoom); texMeshes_.back().unlit = it.raw.value("unlit").toBool(); TexC e{it.poly, tkey, texMeshes_.back(), ut, us, true};
+          texMeshes_.back().cached = true; texMeshes_.back().mat = pview ? 0.f : matCode(it, topoRoom); texMeshes_.back().unlit = it.raw.value("unlit").toBool() || (pview && w_->paintDisp != "std" && w_->paintDisp != "wire"); TexC e{it.poly, tkey, texMeshes_.back(), ut, us, true};
           e.raw = it.poly.get(); e.keep = keep; e.flat = flat; e.uvScale = checker ? float(w_->uvo.density / 8) : 1.f; e.verts = std::move(kept);
-          texMeshCache_[id] = std::move(e); }
+          texMeshCache_[ck] = std::move(e); }
       }
     }
     float color[4];
-    if ((it.headTag && !topoRoom) || it.type == ItemType::Head) toLinear(QColor(0x9a, 0x9a, 0x9a), color); else itemBaseColor(sc, it, color);
+    if (collObj || it.type == ItemType::Head) toLinear(QColor(0x8e, 0x98, 0xa4), color); else itemBaseColor(sc, it, color);
     if (topoRoom && it.type == ItemType::IMesh && it.raw.value("mat").isObject() && !it.raw.value("matOff").toBool()) toLinear(QColor(it.raw.value("mat").toObject().value("color").toString("#9a9a9a")), color);   // (its material: the colour)
-    const bool noTris = textured && !topoRoom;                    // (its textured copy instead of the plain grey)
-    const QByteArray pkey = QByteArray::number(int(wireBuilt)) + "|" + QByteArray::number(int(flat)) + QByteArray::number(int(noTris)) + QByteArray::number(int(converted)) + (paint ? "|pp" : "");
+    const bool noTris = (textured && !topoRoom) || cageOnly;      // (its textured copy instead of the plain grey; a cage under its subdivided surface: the wire only)
+    const QByteArray pkey = QByteArray::number(int(wireBuilt)) + "|" + QByteArray::number(int(flat)) + QByteArray::number(int(noTris)) + QByteArray::number(int(converted)) + (paint ? "|pp" : "") + (surf ? "|sf" : "");
     if (paint) { color[0] = color[1] = color[2] = 1; }            // (the polypaint'"'"'s own colours)
-    auto pc = plainCache_.find(id);
+    auto pc = plainCache_.find(ck);
     if (cacheable && pc != plainCache_.end() && pc->second.poly.lock() == it.poly && pc->second.key == pkey) {
-      pc->second.used = true; GpuMesh g = pc->second.g; std::memcpy(g.color, color, sizeof color); g.textured = textured; g.paint = paint; g.wireOn = wire; g.mat = matCode(it, topoRoom); g.unlit = it.raw.value("unlit").toBool(); static_.push_back(g); continue;
+      pc->second.used = true; GpuMesh g = pc->second.g; std::memcpy(g.color, color, sizeof color); g.textured = textured; g.paint = paint; g.wireOn = wire; g.mat = matCode(it, topoRoom); g.unlit = it.raw.value("unlit").toBool(); static_.push_back(g); return;
     }
     std::vector<std::array<float, 3>> lin; if (paint) { lin.reserve(it.poly->vcol.size()); for (auto& c : it.poly->vcol) lin.push_back({std::pow(c[0], 2.2f), std::pow(c[1], 2.2f), std::pow(c[2], 2.2f)}); }   // (sRGB → linear)
     MeshDraw d = buildMeshDraw(*it.poly, wireBuilt, flat, paint ? &lin : nullptr);
@@ -820,9 +1017,22 @@ void Renderer::syncStatic() {
     }
     static_.push_back(uploadMesh(id, d, color, &lv)); static_.back().textured = textured; static_.back().paint = paint; static_.back().wireOn = wire; static_.back().mat = matCode(it, topoRoom); static_.back().unlit = it.raw.value("unlit").toBool();
     if (cacheable) { if (pc != plainCache_.end()) retire(pc->second.g); static_.back().cached = true; PlainC e{it.poly, pkey, static_.back(), true};
-      e.raw = it.poly.get(); e.flat = flat; e.keep = !meshmods::heavy(it);
+      e.raw = it.poly.get(); e.flat = flat; e.keep = true;
       if (e.keep) { e.verts = std::move(d.verts); e.wire = std::move(d.wire); e.lv = std::move(lv); }
-      plainCache_[id] = std::move(e); }
+      plainCache_[ck] = std::move(e); }
+  };
+  for (auto& [id, it] : sc.items) {
+    const bool hasSub = topoRoom && it.type == ItemType::IMesh && it.subd;
+    const bool shownSomewhere = w_->shownAnywhere(it);          // (the Paint room: a window showing a visibility set may draw what the scene's eyes hide)
+    if (it.poly && it.type == ItemType::IMesh && !shownSomewhere) {   // (hidden / isolated away: its built buffers stay — shown again without a rebuild of a heavy mesh)
+      for (int ck : {id, id | SUBKEY}) {
+        if (auto p = plainCache_.find(ck); p != plainCache_.end() && p->second.poly.lock() == (ck == id ? it.poly : it.subd)) p->second.used = true;
+        if (auto t = texMeshCache_.find(ck); t != texMeshCache_.end() && t->second.poly.lock() == (ck == id ? it.poly : it.subd)) { t->second.used = true; usedTex.insert(t->second.tex.begin(), t->second.tex.end()); usedSets.insert(t->second.sets.begin(), t->second.sets.end()); } }
+    }
+    if (!it.poly || !shownSomewhere) continue;
+    if (it.raw.contains("collCap")) continue;                   // (a collision capsule: its rings only, as an overlay)
+    drawItem(id, it, id, hasSub, false);
+    if (hasSub) { Item sub = it; sub.poly = it.subd; sub.subd.reset(); drawItem(id, sub, id | SUBKEY, false, true); }
   }
   for (auto c = plainCache_.begin(); c != plainCache_.end();) { if (c->second.used) { ++c; continue; } retire(c->second.g); c = plainCache_.erase(c); }
   for (auto c = texMeshCache_.begin(); c != texMeshCache_.end();) { if (c->second.used) { ++c; continue; } retire(c->second.g.vb); retire(c->second.g.ib); c = texMeshCache_.erase(c); }
@@ -832,19 +1042,29 @@ void Renderer::syncStatic() {
     for (int i = 0; i < int(sets.size()); i++) { QString mk = textureFor(looks::resolve(it, i, 0), true); if (!mk.isEmpty()) { usedTex.insert(mk); usedSets.insert(mk + "|"); } } }
   // (the reference planes' images stay too)
   for (const RefPlane& rp : sc.refPlanes) { QString mk = textureFor(refImage(rp), true); if (!mk.isEmpty()) usedTex.insert(mk); usedSets.insert(mk + "|"); }
+  for (auto& [id, k] : sketchKey_) { usedTex.insert(k); usedSets.insert(k + "|"); }
+  for (auto& [n, k] : paintOtherKey_) { usedTex.insert(k); usedSets.insert(k + "|"); }   // (the Paint room's other UV sets: freed where they are uploaded)   // (the ✏ drawings: freed by sketchTexture itself)
   // textures and their descriptor sets no mesh uses any more: freed once the frames in flight are done with them
   for (auto it = texSets_.begin(); it != texSets_.end();) { if (usedSets.count(it->first)) { ++it; continue; } deadTex_.push_back({GpuTex{}, it->second, w_->concurrentFrameCount() + 1}); it = texSets_.erase(it); }
-  for (auto it = texCache_.begin(); it != texCache_.end();) { if (usedTex.count(it->first) || !it->second.view) { ++it; continue; } deadTex_.push_back({it->second, VK_NULL_HANDLE, w_->concurrentFrameCount() + 1}); it = texCache_.erase(it); }
+  // (a file's map no mesh shows now — the Paint room draws its own pictures: kept three minutes more, so that coming back to the
+  // other rooms reads and uploads nothing anew)
+  const qint64 texNow = QDateTime::currentMSecsSinceEpoch();
+  for (auto it = texCache_.begin(); it != texCache_.end();) { if (usedTex.count(it->first) || !it->second.view) { ++it; continue; }
+    if (auto s = texSeen_.find(it->first); s != texSeen_.end()) { if (texNow - s->second < 180000) { ++it; continue; } texSeen_.erase(s); }
+    deadTex_.push_back({it->second, VK_NULL_HANDLE, w_->concurrentFrameCount() + 1}); it = texCache_.erase(it); }
   const Camera& cam = w_->camera();
   Box3 b = sc.bounds();
   // the floor: under the model (its bottom) or at the world origin (⊙), raised / lowered by a share of the model's
   // height; its opacity (0 — off); the world axes' opacity (applyFloor)
-  const auto& F = w_->floor; double hh = b.empty() ? 1 : std::max(1e-9, b.size().y);
+  for (int pi = 0; pi < 4; pi++) {                             // (each pane has its own floor and axes settings)
+  const auto& F = w_->paneFloor(pi); const QString pv = w_->paneCamera(pi).view; double hh = b.empty() ? 1 : std::max(1e-9, b.size().y);
   Vec3 fc = F.zero ? Vec3(0, 0, 0) : cam.sceneCenter; double fy = (F.zero ? 0 : (b.empty() ? 0 : b.min.y)) + F.dy * hh;
   { LineBatch fb = buildFloor(cam.sceneScale, fc, fy, F.op);   // (the view's snapping grid with it, when shown)
-    if (const auto g = w_->viewGrid(cam.view); g.on) { const LineBatch gb = buildViewGrid(cam.view, cam.sceneScale, fc, fy, g.step); fb.verts.insert(fb.verts.end(), gb.verts.begin(), gb.verts.end()); }
-    uploadLines(floor_, fb); }
-  uploadLines(axes_, buildAxes(cam.sceneScale, F.ax));
+    const bool axisView = pv == "front" || pv == "back" || pv == "left" || pv == "right" || pv == "top";   // (those: infinite, per pane — below)
+    if (const auto g = w_->viewGrid(pv); g.on && !axisView) { const LineBatch gb = buildViewGrid(pv, cam.sceneScale, fc, fy, g.step); fb.verts.insert(fb.verts.end(), gb.verts.begin(), gb.verts.end()); }
+    uploadLines(floorP_[pi], fb); }
+  uploadLines(axesP_[pi], buildAxes(cam.sceneScale, F.ax));
+  }
 }
 
 // one wall (gone / hidden — dropped): smooth-shaded, no lines on it
@@ -1227,13 +1447,16 @@ void Renderer::startNextFrame() {
   if (w_->uvPaneShown()) { w_->uvDraw(); if (w_->uvDrawSig() != uvSeen_) { syncUv(); uvSeen_ = w_->uvDrawSig(); }
     w_->uvHoverDraw(); if (w_->uvHoverSig() != uvHovSeen_) { syncUvHover(); uvHovSeen_ = w_->uvHoverSig(); } }
 
-  VkCommandBuffer cb = w_->currentCommandBuffer();
+  VkCommandBuffer cb = w_->currentCommandBuffer();   // (the one drawn into: the view window's own while its windows are drawn)
   const QSize sz = w_->swapChainImageSize();
   const double dpr = w_->devicePixelRatio();
   // (the window's panes in swapchain pixels: one, or the split screen's 2 — 4)
-  auto devRect = [&](int i) { QRect r = w_->paneRect(i); int x0 = int(std::lround(r.left() * dpr)), y0 = int(std::lround(r.top() * dpr)), x1 = int(std::lround((r.left() + r.width()) * dpr)), y1 = int(std::lround((r.top() + r.height()) * dpr));
+  // (the view window's windows too: drawn into its own picture — their places in it)
+  const std::vector<int> mainPanes = w_->shownPanes(), detPanes = w_->detachedPanes();
+  const QSize offSz = detPanes.empty() ? QSize() : QSize(std::max(1, int(std::lround(w_->detachedSize().width() * dpr))), std::max(1, int(std::lround(w_->detachedSize().height() * dpr))));
+  auto devRect = [&](int i) { QRect r = w_->paneRect(i); const bool det = w_->paneDetached(i); if (det) r.translate(-w_->detachedOrigin()); const QSize sz = det ? offSz : w_->swapChainImageSize(); int x0 = int(std::lround(r.left() * dpr)), y0 = int(std::lround(r.top() * dpr)), x1 = int(std::lround((r.left() + r.width()) * dpr)), y1 = int(std::lround((r.top() + r.height()) * dpr));
     x1 = std::min(x1, sz.width()); y1 = std::min(y1, sz.height()); return QRect(x0, y0, std::max(1, x1 - x0), std::max(1, y1 - y0)); };
-  const std::vector<int> panes = w_->shownPanes(); const int act = w_->activePane();
+  std::vector<int> panes = mainPanes; panes.insert(panes.end(), detPanes.begin(), detPanes.end()); const int act = w_->activePane();
   { QRect r = devRect(act); Camera& c = w_->camera(); c.width = r.width(); c.height = r.height(); }   // (the active pane's size: picking)
 
   // background #2a2a2a (linear: the swapchain is sRGB)
@@ -1244,7 +1467,6 @@ void Renderer::startNextFrame() {
   rp.renderPass = w_->defaultRenderPass(); rp.framebuffer = w_->currentFramebuffer();
   rp.renderArea.extent = {uint32_t(sz.width()), uint32_t(sz.height())};
   rp.clearValueCount = w_->sampleCountFlagBits() > VK_SAMPLE_COUNT_1_BIT ? 3 : 2; rp.pClearValues = clear;
-  df_->vkCmdBeginRenderPass(cb, &rp, VK_SUBPASS_CONTENTS_INLINE);
 
   const VkDeviceSize zero = 0;
   const VkShaderStageFlags VF = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
@@ -1273,14 +1495,84 @@ void Renderer::startNextFrame() {
       Vec3 n = rp.quat.rotate({0, 0, 1});
       const double C[6][4] = {{-0.5, 0.5, 0, 0}, {-0.5, -0.5, 0, 1}, {0.5, -0.5, 1, 1}, {-0.5, 0.5, 0, 0}, {0.5, -0.5, 1, 1}, {0.5, 0.5, 1, 0}};
       for (auto& c : C) { Vec3 p = m4Apply(M, {c[0], c[1], 0}); rpv.push_back({{float(p.x), float(p.y), float(p.z)}, {float(n.x), float(n.y), float(n.z)}, {float(c[2]), float(c[3])}}); }
-      rpDraws.push_back(d);
+      if (!rp.sheet || img) rpDraws.push_back(d);   // (a canvas sheet: no grey placeholder under its drawing)
+      // (its ✏ drawing over the picture: the same quad, its own texture, fully shown)
+      const QString sk = sketchTexture(rp.canvas);
+      if (!sk.isEmpty()) { RpDraw e{size_t(pi), uint32_t(rpv.size()), rp.over, descriptorFor(sk, QString()), {}, 1 | 4 | 8}; toLinear(QColor(Qt::white), e.color, rp.sheet ? float(rp.opacity) : 1.f);   // (4: its own alpha — clear where nothing is drawn)
+        for (int k = 0; k < 6; k++) rpv.push_back(rpv[d.first + uint32_t(k)]);
+        rpDraws.push_back(e); }
     }
   }
+  // (drawings of planes gone: their textures freed)
+  { const QString pk = sketchTexture(PAINT_VIEW); paintDs_ = pk.isEmpty() ? VK_NULL_HANDLE : descriptorFor(pk, QString()); }
+  { const auto& pvw = w_->scene()->paintView; const bool on = pvw.on && w_->room() == "paint";   // (the other UV sets' pictures: uploaded when changed)
+    for (auto it = paintOtherKey_.begin(); it != paintOtherKey_.end();) { const auto f = pvw.others.find(it->first); if (on && f != pvw.others.end() && !f->second.first.isNull()) { ++it; continue; } dropTex(it->second); it = paintOtherKey_.erase(it); }
+    paintOtherDs_.clear();
+    if (on) for (const auto& [name, pr] : pvw.others) { if (pr.first.isNull()) continue; QString& cur = paintOtherKey_[name];
+      auto& pvm = w_->scene()->paintView; const auto tc = cur.isEmpty() ? texCache_.end() : texCache_.find(cur);
+      const bool keep = tc != texCache_.end() && tc->second.view && !pvm.othersFull.count(name) && paintOtherSize_[name] == pr.first.size();
+      if (keep) { if (paintOtherRevDone_[name] != pr.second) { auto d = pvm.othersDirty.find(name);   // (a stroke over this set: only its tiles sent)
+          if (d != pvm.othersDirty.end() && d->second.w == pr.first.width() && d->second.h == pr.first.height()) { const auto rs = d->second.runs(); if (!rs.empty()) updateRegion(tc->second, pr.first, rs, true); d->second.clear(); }
+          paintOtherRevDone_[name] = pr.second; } }
+      else { dropTex(cur); cur = QString("pvo:%1:%2#c").arg(name).arg(pr.second); texCache_[cur] = uploadImage(pr.first, true); paintOtherSize_[name] = pr.first.size(); paintOtherRevDone_[name] = pr.second;
+        pvm.othersFull.erase(name); if (auto d = pvm.othersDirty.find(name); d != pvm.othersDirty.end()) d->second.clear(); }
+      if (texCache_[cur].view) paintOtherDs_[name] = descriptorFor(cur, QString()); } }   // (the Paint room's map: this frame's texture)
+  for (auto it = sketchKey_.begin(); it != sketchKey_.end();) { bool live = it->first == PAINT_VIEW; for (auto& r : w_->scene()->refPlanes) if (r.canvas == it->first) live = true;
+    if (live) { ++it; continue; } dropTex(it->second); it = sketchKey_.erase(it); }
   retire(rpVb_); if (!rpv.empty()) rpVb_ = makeBuffer(rpv.data(), rpv.size() * sizeof(TexVertex), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
 
+  // the orthographic views' grids (front / back / left / right / top), shown: lines over the whole rectangle the pane sees
+  { for (auto it = paneGrid_.begin(); it != paneGrid_.end();) { if (std::find(panes.begin(), panes.end(), it->first) == panes.end()) { retire(it->second.vb); it = paneGrid_.erase(it); } else ++it; }
+    for (int pi : panes) {
+      Camera gc = w_->paneCamera(pi); const QRect gr = devRect(pi); gc.width = gr.width(); gc.height = gr.height();
+      const bool wallZ = gc.view == "front" || gc.view == "back", wallX = gc.view == "left" || gc.view == "right";
+      const auto g = w_->viewGrid(gc.view);
+      if (!(wallZ || wallX || gc.view == "top") || !g.on) { if (auto f = paneGrid_.find(pi); f != paneGrid_.end()) { retire(f->second.vb); f->second = GpuLines{}; } continue; }
+      const double aspect = double(gc.width) / std::max(1, gc.height), hv = gc.orthoHalf / gc.zoom * 1.05, hu = hv * aspect;
+      const double u0 = wallX ? gc.pos.z : gc.pos.x, v0 = wallZ || wallX ? gc.pos.y : gc.pos.z;
+      uploadLines(paneGrid_[pi], buildViewGridInf(gc.view, w_->floorY(w_->paneFloor(pi)), w_->gridStepNow(gc, g.step), u0, v0, hu, hv));
+    } }
+
+  // the reference markers (📍, put on a reference canvas): a ring each, over everything, in every pane but the perspective one; in the side views a guide
+  // line across the pane at the marker's height (where the same point is in the other views)
+  { std::vector<PointVertex> mv; const Scene& S = *w_->scene();
+    if (S.refMarkersShown) for (const RefMarker& m : S.refMarkers) { float c[4]; toLinear(m.color, c); mv.push_back({{float(m.pos.x), float(m.pos.y), float(m.pos.z)}, {c[0], c[1], c[2], 18.f}, 2.f}); }
+    retire(markVb_); markCount_ = uint32_t(mv.size()); if (!mv.empty()) markVb_ = makeBuffer(mv.data(), mv.size() * sizeof(PointVertex), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+    for (auto it = paneMarks_.begin(); it != paneMarks_.end();) { if (std::find(panes.begin(), panes.end(), it->first) == panes.end()) { retire(it->second.vb); it = paneMarks_.erase(it); } else ++it; }
+    for (int pi : panes) {
+      Camera gc = w_->paneCamera(pi); const QRect gr = devRect(pi); gc.width = gr.width(); gc.height = gr.height();
+      LineBatch b; b.width = 1;
+      const bool side = gc.view == "front" || gc.view == "back" || gc.view == "left" || gc.view == "right";
+      if (side && S.refMarkersShown) {
+        const double hu = gc.orthoHalf / gc.zoom * 1.05 * double(gc.width) / std::max(1, gc.height); const Vec3 r = gc.quat.rotate({1, 0, 0});
+        for (const RefMarker& m : S.refMarkers) { float c[4]; toLinear(m.color, c, 0.45f); const double o = (gc.pos - m.pos).dot(r);
+          for (double k : {o - hu, o + hu}) { Vec3 p = m.pos + r * k; b.verts.push_back({{float(p.x), float(p.y), float(p.z)}, {c[0], c[1], c[2], c[3]}}); } }
+      }
+      uploadLines(paneMarks_[pi], b);
+    } }
+
   const ViewOpts V = viewOpts();
-  for (int pi : panes) {
+  // (the Paint room's windows showing a visibility set: each window draws the meshes its own eyes show — the built ones are those any window shows)
+  const bool paneFilter = w_->paneFilters(); std::map<int, std::set<int>> paneOff;
+  if (paneFilter) for (int pi : panes) { const auto hid = w_->paneHid(pi); std::set<int>& off = paneOff[pi];
+    for (const auto& [id, it] : w_->scene()->items) if (it.poly && !w_->shownWith(hid, it)) off.insert(id); }
+  // (two passes: the view window's windows first — into their own picture, in a command buffer of their own, done and read back at
+  //  once: the picture is of this very frame — then the viewport's)
+  VkCommandBuffer ocb = VK_NULL_HANDLE;
+  for (int pass = 0; pass < 2; pass++) {
+  if (pass == 0) {
+    if (detPanes.empty() || !ensureOff(offSz.width(), offSz.height())) continue;
+    VkCommandBufferAllocateInfo ca{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO}; ca.commandPool = w_->graphicsCommandPool(); ca.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; ca.commandBufferCount = 1;
+    df_->vkAllocateCommandBuffers(w_->device(), &ca, &ocb);
+    VkCommandBufferBeginInfo cbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO}; cbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT; df_->vkBeginCommandBuffer(ocb, &cbi);
+    VkRenderPassBeginInfo orp{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO}; orp.renderPass = offPass_; orp.framebuffer = off_.fb; orp.renderArea.extent = {uint32_t(off_.w), uint32_t(off_.h)};
+    orp.clearValueCount = rp.clearValueCount; orp.pClearValues = clear;
+    df_->vkCmdBeginRenderPass(ocb, &orp, VK_SUBPASS_CONTENTS_INLINE); cb = ocb;
+  } else { cb = w_->currentCommandBuffer(); df_->vkCmdBeginRenderPass(cb, &rp, VK_SUBPASS_CONTENTS_INLINE); }
+  for (int pi : (pass == 0 ? detPanes : mainPanes)) {
     const bool active = pi == act;
+    const std::set<int>* offNow = paneFilter ? &paneOff[pi] : nullptr;
+    auto offHere = [&](int itemId) { return offNow && offNow->count(itemId); };
     Camera cam = w_->paneCamera(pi); QRect R = devRect(pi); cam.width = R.width(); cam.height = R.height();
     VkViewport vpt{float(R.x()), float(R.y()), float(R.width()), float(R.height()), 0, 1};
     VkRect2D sc{{R.x(), R.y()}, {uint32_t(R.width()), uint32_t(R.height())}};
@@ -1319,7 +1611,7 @@ void Renderer::startNextFrame() {
         df_->vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, rpOverPipe_); df_->vkCmdBindVertexBuffers(cb, 0, 1, &uvQuad_.buf, &zero);
         MeshPC pc{}; std::memcpy(pc.viewProj, um.constData(), 64); toLinear(uvChk_ ? QColor(Qt::white) : QColor(0xd8, 0xd8, 0xd8), pc.color); pc.color[3] = uvOp_; pc.params[0] = 1; pc.params[3] = float(1 | 8);
         df_->vkCmdPushConstants(cb, texLayout_, VF, 0, sizeof(pc), &pc); df_->vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, texLayout_, 0, 1, &uvTexDs_, 0, nullptr);
-        df_->vkCmdDraw(cb, 6, 1, 0, 0);
+        df_->vkCmdDraw(cb, uvQuadN_, 1, 0, 0);
       }
       for (const GpuLines& g : uvGrid_) drawLines(g, true, um);
       if (!uvTris_.empty()) { df_->vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, meshBlendPipe_);
@@ -1342,13 +1634,19 @@ void Renderer::startNextFrame() {
       continue;
     }
     drawPlanes(false);                                         // (behind the model: first, writing no depth)
-    drawLines(floor_, false, vp);
+    drawLines(floorP_[pi & 3], false, vp);
+    if (auto pg = paneGrid_.find(pi); pg != paneGrid_.end()) drawLines(pg->second, false, vp, float(w_->paneFloor(pi).op));   // (this pane's infinite view grid: the Grid button's opacity too)
 
     Vec3 lightPos = cam.pos + cam.upVec() * (cam.sceneScale * 3) + cam.right() * (cam.sceneScale * 1.5);
     Vec3 L = (lightPos - cam.sceneCenter).normalized();
     const bool topoRoom = w_->room() == "topo", unlitAll = topoRoom && w_->tdisp.unlit;
+    // (this view's wireframe: a mesh shown as wire has no polygons here — its opacity 0 in this view only)
+    const Viewport::PaneWire pw = w_->paneWire(pi);
+    auto opOf = [&](int id) { if (pw.only && wireDisp_.count(id)) return 0.0; return topoRoom ? w_->topoOpacity(id) : 1.0; };
+    const bool hairRoom = w_->room() == "hair";
+    auto haloHere = [&](int id) { if (!hairRoom || id < 0) return false; const Item* it = w_->scene()->item(id); return it && it->type == ItemType::IMesh; };   // (the Hair room's imported meshes: grey, the halo when picked)
     auto drawMesh = [&](const GpuMesh& m, bool wall = false) {
-      if (!m.triCount) return;
+      if (!m.triCount || offHere(m.itemId)) return;
       MeshPC pc{}; std::memcpy(pc.viewProj, vp.constData(), 64);
       std::memcpy(pc.color, m.color, 16);
       pc.lightDir[0] = float(L.x); pc.lightDir[1] = float(L.y); pc.lightDir[2] = float(L.z); pc.lightDir[3] = m.mat;
@@ -1356,12 +1654,12 @@ void Renderer::startNextFrame() {
       const bool two = topoRoom && w_->topoTwoTone(m.itemId);
       pc.params[3] = float((two ? 1 : 0) | (cam.ortho() ? 2 : 0));
       pc.extra[0] = float(cam.pos.x); pc.extra[1] = float(cam.pos.y); pc.extra[2] = float(cam.pos.z); pc.extra[3] = topoRoom ? float(w_->topoPdo(m.itemId)) : 0.f;
-      if (topoRoom) { double op = w_->topoOpacity(m.itemId); if (op < 0.995) pc.color[3] = float(op); }
+      { const double op = opOf(m.itemId); if (op < 0.995) pc.color[3] = float(op); }
       if (!topoRoom && m.itemId >= 0 && m.itemId == w_->surfCutWall()) {   // (the Scissors' NURBS mode: the wall being cut — violet, apart from the orange selection)
         float v[4], e[4]; toLinear(QColor(0x9b, 0x5c, 0xff), v); toLinear(QColor(0x2a, 0x10, 0x48), e);
         for (int k = 0; k < 3; k++) pc.color[k] = pc.color[k] + (v[k] - pc.color[k]) * 0.6f + e[k] * 3.14159f;
       } else
-      if ((!m.transparent || m.hl || wall) && w_->isItemSelected(m.itemId) && !two && !topoRoom) {   // (a see-through wall too: its selection shown)        // (selected: the HTML version's emissive 0x4a2800 — not in the Topology room: its meshes keep their own grey / material)
+      if ((!m.transparent || m.hl || wall) && w_->isItemSelected(m.itemId) && !two && !topoRoom && !haloHere(m.itemId)) {   // (a see-through wall too: its selection shown)        // (selected: the HTML version's emissive 0x4a2800 — not in the Topology room: its meshes keep their own grey / material)
         float e[4]; toLinear(QColor(0x4a, 0x28, 0x00), e);
         if (wall) {                                                // (a wall: its group's colour may be anything — a red one hid the glow; painted over by a colour unlike its own)
           const QColor own = QColor::fromRgbF(std::pow(pc.color[0], 1 / 2.2f), std::pow(pc.color[1], 1 / 2.2f), std::pow(pc.color[2], 1 / 2.2f));
@@ -1376,7 +1674,7 @@ void Renderer::startNextFrame() {
       df_->vkCmdDrawIndexed(cb, m.triCount, 1, 0, 0, 0);
     };
     df_->vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, meshPipe_);
-    auto seeThrough = [&](const GpuMesh& m) { return topoRoom && w_->topoOpacity(m.itemId) < 0.995; };   // (Topology: the selected meshes' opacity)
+    auto seeThrough = [&](const GpuMesh& m) { return opOf(m.itemId) < 0.995; };   // (Topology: the selected meshes' opacity)
     auto plainShown = [&](const GpuMesh& m) { return !m.textured || (topoRoom && w_->topoTwoTone(m.itemId)); };
     const bool nav = w_->navigating() && !staticNav_.empty();   // (the camera moving: heavy meshes by their LOD)
     if (nav && active) w_->lodFrames++;
@@ -1389,18 +1687,21 @@ void Renderer::startNextFrame() {
     auto drawTex = [&](bool transparent) {
       bool bound = false;
       for (const GpuTexMesh& m : TM) {
-        if (!m.vb.buf || !m.ib.buf || (topoRoom && w_->topoTwoTone(m.itemId))) continue;
+        if (!m.vb.buf || !m.ib.buf || offHere(m.itemId) || opOf(m.itemId) < 0.01 || (topoRoom && w_->topoTwoTone(m.itemId))) continue;
         for (const TexPart& p : m.parts) {
           if (p.transparent != transparent || !p.count || !p.ds) continue;
           if (!bound) { df_->vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, transparent ? texBlendPipe_ : texPipe_); bound = true; }
           MeshPC pc{}; std::memcpy(pc.viewProj, vp.constData(), 64); std::memcpy(pc.color, p.color, 16);
           pc.lightDir[0] = float(L.x); pc.lightDir[1] = float(L.y); pc.lightDir[2] = float(L.z); pc.lightDir[3] = m.mat;
-          pc.params[0] = m.flat || unlitAll || m.unlit ? 1.f : 0.f; pc.params[1] = 1.3f; pc.params[2] = 1.7f; pc.params[3] = float(p.flags | (cam.ortho() ? 16 : 0));
+          pc.params[0] = m.flat || unlitAll || m.unlit ? 1.f : 0.f; pc.params[1] = 1.3f; pc.params[2] = 1.7f; pc.params[3] = float((p.flags & 15) | (cam.ortho() ? 16 : 0));
+          VkDescriptorSet ds = (p.flags & 32) && paintDs_ ? paintDs_ : p.ds;
+          if (p.other >= 0 && size_t(p.other) < paintOtherNames_.size()) { const auto f = paintOtherDs_.find(paintOtherNames_[size_t(p.other)]); if (f != paintOtherDs_.end()) ds = f->second; }
           pc.extra[0] = float(cam.pos.x); pc.extra[1] = float(cam.pos.y); pc.extra[2] = float(cam.pos.z); pc.extra[3] = topoRoom ? float(w_->topoPdo(m.itemId)) : 0.f;
-          if (topoRoom) { double op = w_->topoOpacity(m.itemId); if (op < 0.995) { pc.color[3] *= float(op); pc.params[3] = float(int(pc.params[3]) | 8); } }
-          if (w_->isItemSelected(m.itemId)) { float e[4]; toLinear(QColor(0x4a, 0x28, 0x00), e); for (int k = 0; k < 3; k++) pc.color[k] += e[k] * 3.14159f; }
+          { const double op = opOf(m.itemId); if (op < 0.995) { pc.color[3] *= float(op); pc.params[3] = float(int(pc.params[3]) | 8); } }
+          if (!topoRoom && !haloHere(m.itemId) && w_->room() != "paint" && w_->isItemSelected(m.itemId)) {   // (as drawMesh: the Topology room and the Hair room's imported meshes have the halo; the Paint room's maps shown as painted)
+            float e[4]; toLinear(QColor(0x4a, 0x28, 0x00), e); for (int k = 0; k < 3; k++) pc.color[k] += e[k] * 3.14159f; }
           df_->vkCmdPushConstants(cb, texLayout_, VF, 0, sizeof(pc), &pc);
-          df_->vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, texLayout_, 0, 1, &p.ds, 0, nullptr);
+          df_->vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, texLayout_, 0, 1, &ds, 0, nullptr);
           df_->vkCmdBindVertexBuffers(cb, 0, 1, &m.vb.buf, &zero);
           df_->vkCmdBindIndexBuffer(cb, m.ib.buf, 0, VK_INDEX_TYPE_UINT32);
           df_->vkCmdDrawIndexed(cb, p.count, 1, p.first, 0, 0);
@@ -1411,18 +1712,24 @@ void Renderer::startNextFrame() {
     drawTex(true);
     // (a see-through mesh: its depth first — then only its surface nearest the camera blended in; its far side and its
     // inner layers not seen through it)
-    for (const GpuMesh& m : S) if (seeThrough(m) && plainShown(m)) { df_->vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, meshDepthPipe_); drawMesh(m);
+    for (const GpuMesh& m : S) if (seeThrough(m) && plainShown(m) && opOf(m.itemId) >= 0.01) { df_->vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, meshDepthPipe_); drawMesh(m);
       df_->vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, meshBlendPipe_); drawMesh(m); }
     // (the Topology room's Object mode: a halo round each selected mesh — which of them are picked, seen at a glance)
-    if (topoRoom && w_->topoMode == "object") { df_->vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, meshPipe_);   // (after the see-through meshes: their depth there — the halo round them, not over them)
+    // (drawn after the Inspector's lines too — the hard edges' 3 px lines on a silhouette would cover it)
+    // (the Hair room: its imported meshes too — they stay grey as in the Topology room, picked ones get the halo; 20.11, the author:
+    // "the mesh's colour must be grey as in the Topology room" — the orange glow of the selection had tinted eleven of them)
+    auto drawHalo = [&] { if ((topoRoom && w_->topoMode == "object") || w_->room() == "hair") {
+      // (a mesh drawn at no opacity has no depth: the halo shader would then paint all of it — its depth alone first)
+      for (const GpuMesh& m : S) if (m.triCount && w_->isItemSelected(m.itemId) && (topoRoom || haloHere(m.itemId)) && opOf(m.itemId) < 0.01) { df_->vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, meshDepthPipe_); drawMesh(m); }
+      df_->vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, meshPipe_);   // (after the see-through meshes: their depth there — the halo round them, not over them)
       const double wpp = w_->worldPerPixelAt(cam.pivot), dp = std::max(1e-9, cam.pos.distanceTo(cam.pivot)); float hc[4]; toLinear(QColor(0xb0, 0x6c, 0xff), hc);
-      for (const GpuMesh& m : S) { if (!m.triCount || !w_->isItemSelected(m.itemId)) continue;
+      for (const GpuMesh& m : S) { if (!m.triCount || !w_->isItemSelected(m.itemId) || (!topoRoom && !haloHere(m.itemId))) continue;
         MeshPC pc{}; std::memcpy(pc.viewProj, vp.constData(), 64); std::memcpy(pc.color, hc, 16);
         const Vec3 vd = cam.dir(); pc.lightDir[0] = float(vd.x); pc.lightDir[1] = float(vd.y); pc.lightDir[2] = float(vd.z);
         pc.params[0] = 1; pc.params[1] = float(0.75 * wpp / dp); pc.params[2] = float(0.75 * wpp); pc.params[3] = float(64 | (cam.ortho() ? 2 : 0));
         pc.extra[0] = float(cam.pos.x); pc.extra[1] = float(cam.pos.y); pc.extra[2] = float(cam.pos.z); pc.extra[3] = 0;
         df_->vkCmdPushConstants(cb, meshLayout_, VF, 0, sizeof(pc), &pc); df_->vkCmdBindVertexBuffers(cb, 0, 1, &m.vb.buf, &zero);
-        df_->vkCmdBindIndexBuffer(cb, m.ib.buf, 0, VK_INDEX_TYPE_UINT32); df_->vkCmdDrawIndexed(cb, m.triCount, 1, 0, 0, 0); } }
+        df_->vkCmdBindIndexBuffer(cb, m.ib.buf, 0, VK_INDEX_TYPE_UINT32); df_->vkCmdDrawIndexed(cb, m.triCount, 1, 0, 0, 0); } } };
     // the NURBS walls and crowns see-through (the NURBS opacity, X-ray): after the solid scene
     for (bool write : {true, false}) {
       bool bound = false;
@@ -1430,7 +1737,8 @@ void Renderer::startNextFrame() {
       for (auto& [id, m] : walls_) tr(m, true);
       for (const GpuMesh& m : crowns_) tr(m);
     }
-    auto drawWire = [&](const GpuMesh& m) { if (!m.wireCount || !m.wireOn || (topoRoom && w_->topoTwoTone(m.itemId))) return; GpuLines g; g.vb = m.wb; g.count = m.wireCount; drawLines(g, false, vp, 1, topoRoom ? float(w_->topoPdo(m.itemId)) : 0.f); };
+    const bool dispWire = V.showMeshWire || pw.wire || pw.only;   // (the Display's Wire — every view; ⬡ / ▦ — this one)
+    auto drawWire = [&](const GpuMesh& m) { if (!m.wireCount || !(m.wireOn || (dispWire && wireDisp_.count(m.itemId))) ||  offHere(m.itemId) || (topoRoom && w_->topoTwoTone(m.itemId))) return; GpuLines g; g.vb = m.wb; g.count = m.wireCount; if (topoRoom) g.width = 1.6f; drawLines(g, false, vp, 1, topoRoom ? float(w_->topoPdo(m.itemId)) : 0.f); };
     for (const GpuMesh& m : S) drawWire(m);
     for (auto& [id, m] : walls_) drawWire(m);
     for (const GpuMesh& m : crowns_) drawWire(m);
@@ -1444,16 +1752,18 @@ void Renderer::startNextFrame() {
       // (the active mesh's every edge in a component mode: its own wire — patched as it is dragged — in the overlay's
       // colour; first, so the picked edges lie over it)
       { const auto& D = w_->topoDraw();
-        if (D.edgesOf >= 0) if (auto c = plainCache_.find(D.edgesOf); c != plainCache_.end() && c->second.g.wireCount && c->second.g.wb.buf) {
+        std::vector<int> wired = D.edgesMore; if (D.edgesOf >= 0) wired.insert(wired.begin(), D.edgesOf);
+        for (int wid : wired) if (auto c = plainCache_.find(wid); c != plainCache_.end() && c->second.g.wireCount && c->second.g.wb.buf) {
           GpuLines g; g.vb = c->second.g.wb; g.count = c->second.g.wireCount; g.width = D.edgesW; g.bias = 0.002f; float tc[4]; toLinear(D.edgesC, tc);
           if (wideLines_) { GpuLines u = g; u.width = D.edgesW + 1; float lc[4]; toLinear(QColor(0xc9, 0xa6, 0xe6), lc, 0.35f); drawLines(u, false, vp, 1, topoOvPdo_, lc); }   // (a light line under the dark one: the wire seen on the shaded side too)
           drawLines(g, false, vp, 1, topoOvPdo_, tc); } }
       for (const GpuLines& g : topoLines_) { if (g.xray > 0) drawLines(g, true, vp, g.xray); drawLines(g, false, vp, 1, g.noPdo ? 0.f : topoOvPdo_); }   // (an xray one: faint through what hides it first, itself over that)
     }
+    drawHalo();
 
     drawLines(curves_, false, vp);
     drawLines(rings_, false, vp);
-    drawLines(axes_, false, vp);
+    drawLines(axesP_[pi & 3], false, vp);
     drawLines(tubeLoops_, false, vp);
     if (!shells_.empty() || !tubes_.empty() || !ribs_.empty() || !ref_.empty()) {                  // (see-through shells and modifiers over the opaque scene)
       df_->vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, meshBlendPipe_);
@@ -1492,20 +1802,41 @@ void Renderer::startNextFrame() {
     drawPoints(pins_, pinCount_, pointPipe_, 1);
     drawPoints(topoPts_, topoPtCount_, pointDepthPipe_, 1, topoOvPdo_); drawPoints(topoPtsN_, topoPtNCount_, pointDepthPipe_, 1, 0);   // (the Hair room too: the Inspector's markers)
     drawPoints(topoPtsX_, topoPtXCount_, pointPipe_, 1);       // (the interior markers: seen through the mesh)
+    if (auto pm = paneMarks_.find(pi); pm != paneMarks_.end()) drawLines(pm->second, true, vp);   // (the reference markers: guides, rings — over everything)
+    if (w_->paneCamera(pi).view != "persp") drawPoints(markVb_, markCount_, pointPipe_, 1);   // (the reference markers: the ortho views only — not in the perspective)
     if (topoRoom) { if (vpts_.buf.buf && w_->topoDraw().pointsOf == vpts_.m) drawPoints(vpts_.buf, uint32_t(vpts_.pts.size()), pointDepthPipe_, 1, topoOvPdo_); }
     if (active) {                                              // (the lasso, the gizmo: the active pane's)
       drawLines(lasso_, true, ident);
       drawLines(gizmo3_, true, vp); drawLines(gizmo2_, true, vp);
     }
   }
+  if (pass == 0) {
+    VkDevice dev = w_->device();
+    df_->vkCmdEndRenderPass(ocb);
+    VkBufferImageCopy reg{}; reg.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}; reg.imageExtent = {uint32_t(off_.w), uint32_t(off_.h), 1};
+    df_->vkCmdCopyImageToBuffer(ocb, off_.color, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, off_.read.buf, 1, &reg);
+    df_->vkEndCommandBuffer(ocb);
+    VkSubmitInfo sub{VK_STRUCTURE_TYPE_SUBMIT_INFO}; sub.commandBufferCount = 1; sub.pCommandBuffers = &ocb;
+    df_->vkQueueSubmit(w_->graphicsQueue(), 1, &sub, VK_NULL_HANDLE); df_->vkQueueWaitIdle(w_->graphicsQueue());
+    df_->vkFreeCommandBuffers(dev, w_->graphicsCommandPool(), 1, &ocb);
+    void* p = nullptr;
+    if (df_->vkMapMemory(dev, off_.read.mem, 0, VkDeviceSize(off_.w) * off_.h * 4, 0, &p) == VK_SUCCESS) {
+      const bool bgr = w_->colorFormat() == VK_FORMAT_B8G8R8A8_SRGB || w_->colorFormat() == VK_FORMAT_B8G8R8A8_UNORM;
+      QImage img(off_.w, off_.h, bgr ? QImage::Format_RGB32 : QImage::Format_RGBX8888);
+      for (int y = 0; y < off_.h; y++) std::memcpy(img.scanLine(y), static_cast<const uchar*>(p) + size_t(y) * size_t(off_.w) * 4, size_t(off_.w) * 4);
+      df_->vkUnmapMemory(dev, off_.read.mem);
+      if (w_->detachedFrame) w_->detachedFrame(img);
+    }
+  }
+  }
   // split screen: the windows' frames, the active one outlined
-  if (panes.size() > 1) {
+  if (mainPanes.size() > 1) {
     VkViewport vpt{0, 0, float(sz.width()), float(sz.height()), 0, 1};
     VkRect2D sc{{0, 0}, {uint32_t(sz.width()), uint32_t(sz.height())}};
     df_->vkCmdSetViewport(cb, 0, 1, &vpt); df_->vkCmdSetScissor(cb, 0, 1, &sc);
     LineBatch fb; fb.width = 1; LineBatch fa; fa.width = 2;
     float cn[4], ca[4]; toLinear(QColor(0x44, 0x44, 0x44), cn); toLinear(QColor(0x4a, 0x7f, 0xd6), ca);
-    for (int pi : panes) {
+    for (int pi : mainPanes) {
       QRect R = devRect(pi); LineBatch& b = pi == act ? fa : fb; const float* c = pi == act ? ca : cn;
       double x0 = (R.left() + 0.5) / sz.width() * 2 - 1, x1 = (R.left() + R.width() - 0.5) / sz.width() * 2 - 1, y0 = (R.top() + 0.5) / sz.height() * 2 - 1, y1 = (R.top() + R.height() - 0.5) / sz.height() * 2 - 1;
       double P[4][2] = {{x0, y0}, {x1, y0}, {x1, y1}, {x0, y1}};

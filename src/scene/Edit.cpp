@@ -1,4 +1,4 @@
-#include "scene/Edit.h"
+﻿#include "scene/Edit.h"
 #include "scene/CurveMath.h"
 #include "scene/Cocoons.h"
 #include "scene/HairState.h"
@@ -277,7 +277,7 @@ std::optional<std::vector<Path>> pathCover(Scene& sc, const CurveCache& cc, cons
   return out;
 }
 
-std::vector<int> wallsAlongPaths(Scene& sc, const CurveCache& cc, const std::vector<Path>& paths, QString* msg) {
+std::vector<int> wallsAlongPaths(Scene& sc, const CurveCache& cc, const std::vector<Path>& paths, QString* msg, bool closeRing) {
   int n = int(paths.size()); std::vector<std::vector<Vec3>> R; for (auto& p : paths) R.push_back(resampleN(pathPts(sc, cc, p), 40));
   auto gap = [&](int i, int j) { double s = 0; for (size_t k = 0; k < R[size_t(i)].size(); k++) s += R[size_t(i)][k].distanceTo(R[size_t(j)][k]); return s; };
   int start = 0; double far = -1;
@@ -294,6 +294,10 @@ std::vector<int> wallsAlongPaths(Scene& sc, const CurveCache& cc, const std::vec
   }
   std::vector<int> made;
   for (size_t i = 0; i + 1 < ecs.size(); i++) { if (ecs[i] == ecs[i + 1]) continue; int s = makeSurface(sc, ecs[i], ecs[i + 1]); if (s >= 0) made.push_back(s); }
+  if (closeRing && n >= 3) {                                    // (a tube: the last path as near the first as the neighbours are)
+    double mx = 0; for (int i = 0; i + 1 < n; i++) mx = std::max(mx, gap(order[size_t(i)], order[size_t(i + 1)]));
+    if (gap(order.back(), order.front()) <= 1.5 * mx && ecs.back() != ecs.front()) { int s = makeSurface(sc, ecs.back(), ecs.front()); if (s >= 0) made.push_back(s); }
+  }
   sc.reindex();
   if (msg) {
     QStringList names; for (int e : ecs) names << sc.item(e)->name;
@@ -401,7 +405,7 @@ std::vector<int> lockCurves(const Scene& sc, const Selection& sel) {
   return ok;
 }
 
-std::vector<std::vector<int>> lockEnds(Scene& sc, const CurveCache& cc, const std::vector<int>& cs, int* dropped) {
+std::vector<std::vector<int>> lockEnds(Scene& sc, const CurveCache& cc, const std::vector<int>& cs, int* dropped, std::vector<std::vector<int>>* all) {
   std::set<int> set(cs.begin(), cs.end()); std::vector<int> net; for (int id : cs) if (segNetCurve(*sc.item(id))) net.push_back(id);
   std::vector<std::vector<int>> out; std::set<std::vector<int>> seen;
   auto push = [&](const std::vector<int>& ids) {
@@ -425,6 +429,7 @@ std::vector<std::vector<int>> lockEnds(Scene& sc, const CurveCache& cc, const st
     if (!(sc.anchor(ids.front())->pos.y >= sc.anchor(ids.back())->pos.y)) std::reverse(ids.begin(), ids.end());
     push(ids);
   }
+  if (all) *all = out;
   // a lock splitting into branches: its main branch only — the tip most strands go to (a tie: more anchors)
   std::vector<int> tipOrder; std::map<int, std::vector<size_t>> byTip;
   for (size_t i = 0; i < out.size(); i++) { if (!byTip.count(out[i][1])) tipOrder.push_back(out[i][1]); byTip[out[i][1]].push_back(i); }
@@ -506,6 +511,64 @@ QString detachGroup(Scene& sc, int gid, Selection& sel) {
          .arg(att ? QObject::tr(", %1 end%2 let go of another group's connector").arg(att).arg(att == 1 ? "" : "s") : QString());
 }
 
+QString splitLockBranches(Scene& sc, const CurveCache& cc, int item, Selection& sel) {
+  const Item* g = sc.item(item); while (g && g->type != ItemType::Group) g = sc.item(g->parent);
+  if (!g) return "!" + QObject::tr("Click a curve or a wall of a lock (a group)");
+  const int gid = g->id; const QString gname = g->name;
+  Selection gs; gs.items = {gid};
+  const auto lock = lockCurves(sc, gs);
+  std::vector<std::vector<int>> strands; lockEnds(sc, cc, lock, nullptr, &strands);
+  std::vector<int> tipOrder; std::map<int, std::vector<size_t>> byTip;
+  for (size_t i = 0; i < strands.size(); i++) { const int t = strands[i][1]; if (!byTip.count(t)) tipOrder.push_back(t); byTip[t].push_back(i); }
+  if (byTip.size() < 2) return "!" + QObject::tr("%1 has no branches: all its strands end at one tip").arg(gname);
+  int main = -1; for (int t : tipOrder) { auto& l = byTip[t]; if (main < 0 || l.size() > byTip[main].size() || (l.size() == byTip[main].size() && strands[l[0]].size() > strands[byTip[main][0]].size())) main = t; }
+  // each strand's anchors; a curve goes with the tips whose strands run along all of it
+  std::vector<std::set<int>> SA; for (auto& s : strands) SA.push_back(std::set<int>(s.begin(), s.end()));
+  auto tipsOf = [&](const Item* c) { std::set<int> t; for (size_t i = 0; i < strands.size(); i++) { bool on = true; for (int a : c->anchors) if (!SA[i].count(a)) { on = false; break; } if (on) t.insert(strands[i][1]); } return t; };
+  std::map<int, std::set<int>> moveC;                         // branch tip → its curves
+  for (int cid : lock) { const Item* c = sc.item(cid); if (!c) continue; const auto t = tipsOf(c); if (t.size() == 1 && !t.count(main)) moveC[*t.begin()].insert(cid); }
+  if (moveC.empty()) return "!" + QObject::tr("%1: its branches share all their curves with the main one — nothing to split off").arg(gname);
+  // the group's other curves (service curves, edge curves) and its walls: with the branch when all they lie on is the branch's
+  std::vector<int> inG; std::function<void(int)> walk = [&](int id) { const Item* x = sc.item(id); if (!x) return; for (int c : x->children) { const Item* y = sc.item(c); if (!y) continue; if (y->type == ItemType::Group) walk(c); else inG.push_back(c); } };
+  walk(gid);
+  std::map<int, int> tipOfC; for (auto& [t, cs] : moveC) for (int c : cs) tipOfC[c] = t;
+  std::map<int, std::set<int>> anchorsOf; for (auto& [t, cs] : moveC) for (int c : cs) for (int a : sc.item(c)->anchors) anchorsOf[t].insert(a);
+  for (int id : inG) { const Item* c = sc.item(id); if (!c || c->type != ItemType::Curve || tipOfC.count(id)) continue;
+    // (an edge curve runs root to tip over the pieces: one that runs onto a branch's own pieces is that branch's — its trunk
+    // pieces stay where they are. Left with the main lock, it brought the branch back into it)
+    if (c->hasPath()) { std::set<int> ts; for (auto& p : c->path) { auto f = tipOfC.find(p[0]); if (f != tipOfC.end()) ts.insert(f->second); } if (ts.size() == 1) { const int t0 = *ts.begin(); moveC[t0].insert(id); tipOfC[id] = t0; } continue; }
+    if (c->junc && !c->anchors.empty()) for (auto& [t, A] : anchorsOf) { bool all = true; for (int a : c->anchors) if (!A.count(a)) { all = false; break; } if (all) { moveC[t].insert(id); tipOfC[id] = t; break; } } }
+  std::map<int, std::vector<int>> moveAll; for (auto& [t, cs] : moveC) moveAll[t].assign(cs.begin(), cs.end());
+  for (int id : inG) { const Item* s = sc.item(id); if (!s || s->type != ItemType::Surface) continue;
+    auto fa = tipOfC.find(s->a), fb = tipOfC.find(s->b);
+    if (fa != tipOfC.end() && fb != tipOfC.end()) { if (fa->second == fb->second) moveAll[fa->second].push_back(id); }
+    else if (fa != tipOfC.end() || fb != tipOfC.end()) moveAll[(fa != tipOfC.end() ? fa : fb)->second].push_back(id); }   // (a wall from the trunk's curve to the branch's: it hangs on the branch)
+  // the new groups, right after the lock's own, with its loop settings and colour
+  std::vector<int> made; int k = 0; QStringList taken; for (auto& [id, it] : sc.items) if (it.type == ItemType::Group) taken << it.name;
+  const int gpar = sc.item(gid)->parent; const QString color = sc.item(gid)->color; const QJsonValue conv = sc.item(gid)->raw.value("conv");
+  int after = gid;
+  for (int t : tipOrder) { auto f = moveAll.find(t); if (f == moveAll.end()) continue;
+    QString nm; do { nm = QString("%1_%2").arg(gname, QChar('a' + std::min(k, 25))); k++; } while (taken.contains(nm)); taken << nm;
+    Item& ng = sc.addItem(ItemType::Group, gpar, nm); const int nid = ng.id; ng.color = color; ng.expanded = false; if (!conv.isUndefined() && !conv.isNull()) ng.raw.insert("conv", conv);
+    ng.raw.insert("branchOf", gid);                           // (its cocoon is a branch of the lock's own, whichever is made first — makeLiveCocoon)
+    auto& sib = gpar >= 0 ? sc.item(gpar)->children : sc.roots; sib.erase(std::remove(sib.begin(), sib.end(), nid), sib.end());
+    auto at = std::find(sib.begin(), sib.end(), after); sib.insert(at == sib.end() ? sib.end() : at + 1, nid); after = nid;
+    for (int id : f->second) { Item* x = sc.item(id); if (!x) continue;
+      auto& from = x->parent >= 0 ? sc.item(x->parent)->children : sc.roots; from.erase(std::remove(from.begin(), from.end(), id), from.end());
+      x->parent = nid; sc.item(nid)->children.push_back(id); }
+    made.push_back(nid); }
+  // a cocoon already made of the lock: the curves that left are not its lock any more (their walls would get its loops)
+  std::set<int> gone; for (auto& [t, cs] : moveC) gone.insert(cs.begin(), cs.end());
+  for (auto& [id, it] : sc.items) if (it.type == ItemType::Cocoon && it.raw.value("live").isObject()) {
+    QJsonObject live = it.raw.value("live").toObject(); QJsonArray L = live.value("lock").toArray(), keep; bool ch = false;
+    for (const QJsonValue& v : L) { if (gone.count(v.toInt())) ch = true; else keep.append(v); }
+    if (ch && !keep.isEmpty()) { live.insert("lock", keep); it.raw.insert("live", live); } }
+  sc.reindex(); sel.anchors.clear(); sel.items = made;
+  int nc = 0, nw = 0; for (int nid : made) for (int c : sc.item(nid)->children) { const Item* x = sc.item(c); if (x && x->type == ItemType::Surface) nw++; else nc++; }
+  QStringList names; for (int nid : made) names << sc.item(nid)->name;
+  return QObject::tr("%1: %2 branch%3 split off — %4 (%5 curves, %6 walls). Make a cocoon of each (◍): its loops go round that branch").arg(gname).arg(made.size()).arg(made.size() == 1 ? "" : "es").arg(names.join(", ")).arg(nc).arg(nw);
+}
+
 void matchProjectStep(Scene& sc, int gid) {
   double st = projectStep(sc);
   std::function<void(int)> down = [&](int id) { Item* x = sc.item(id); QJsonObject c = groupConv(sc, x); c.insert("step", st); x->raw.insert("conv", c);
@@ -540,7 +603,18 @@ int makeLiveCocoon(Scene& sc, const CurveCache& cc, CocoonSystem* cs, Selection&
   int host = -1; QJsonObject shape;
   if (!cs || !cs->trialShape(ends, lock, parent < 0 ? &host : nullptr, &shape)) { if (msg) *msg = QObject::tr("◍ These strands never run side by side — no shape for a cocoon"); return -1; }
   if (parent < 0) parent = host;
-  const Item* g = sc.item(lock[0]); while (g && g->type != ItemType::Group) g = sc.item(g->parent);
+  // the lock's group: the group selected (or the one the first selected item lies in) — the lock's first curve may be a trunk
+  // piece of another group, reached through an edge curve of a branch split off
+  const Item* g = nullptr;
+  for (int id : sel.items) if (const Item* x = sc.item(id); x && x->type != ItemType::Cocoon) { g = x; break; }
+  if (!g) g = sc.item(lock[0]);
+  while (g && g->type != ItemType::Group) g = sc.item(g->parent);
+  // a branch split off this lock (Scissors → Branches) whose cocoon was made first: this one takes its place, the branch's
+  // cocoon goes under this one — the branch takes the trunk's loops, not the trunk the branch's
+  std::vector<int> branchKs;                                    // (the cocoons of this lock's split-off branches: under this one)
+  if (g) { std::set<QString> bg; for (auto& [id, it] : sc.items) if (it.type == ItemType::Group && it.raw.value("branchOf").toInt(-1) == g->id) bg.insert(it.name);
+    if (!bg.empty()) for (auto& [id, it] : sc.items) if (it.type == ItemType::Cocoon && bg.count(it.raw.value("src").toString())) branchKs.push_back(id); }
+  for (int b : branchKs) if (parent == b) parent = sc.item(b)->parent;   // (grown out of its own branch's cocoon: that one's place instead)
   QStringList has; for (auto& [id, it] : sc.items) if (it.type == ItemType::Cocoon) has << it.name;
   QString base = QString("%1 cocoon").arg(g ? g->name : "Lock"), nm = base; for (int n = 1; has.contains(nm);) nm = QString("%1 %2").arg(base).arg(++n);
   int cn = nextNum(sc, ItemType::Cocoon, "Cocoon", "cocoon"); (void)cn;
@@ -556,6 +630,9 @@ int makeLiveCocoon(Scene& sc, const CurveCache& cc, CocoonSystem* cs, Selection&
     if (g) { auto& ch = g->parent >= 0 ? sc.item(g->parent)->children : sc.roots; ch.erase(std::remove(ch.begin(), ch.end(), k.id), ch.end());
       auto at = std::find(ch.begin(), ch.end(), g->id); ch.insert(at == ch.end() ? ch.end() : at + 1, k.id); }
   } else sc.item(parent)->expanded = true;
+  for (int bk : branchKs) if (Item* b = sc.item(bk); b && bk != k.id && b->parent != k.id) {   // (the branches' cocoons: under this one now)
+    auto& from = b->parent >= 0 ? sc.item(b->parent)->children : sc.roots; from.erase(std::remove(from.begin(), from.end(), bk), from.end());
+    b->parent = k.id; sc.item(k.id)->children.push_back(bk); }
   sel.anchors.clear(); sel.items = {k.id};
   if (msg) *msg = QObject::tr("◍ %1: %2 strands of %3 curves%4 — it follows the lock's shape; branches added later stay out").arg(nm).arg(ends.size()).arg(lock.size())
                   .arg(dropped ? QObject::tr(" — the main branch only (%1 strands of other branches left out)").arg(dropped) : QString());

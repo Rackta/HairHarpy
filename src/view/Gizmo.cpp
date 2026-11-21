@@ -167,8 +167,18 @@ Affine Gizmo::drag(const Camera& cam, double W, double H, double mx, double my, 
     return M;
   }
   if (mode == Mode::Rotate) {
-    Vec3 hp = planeHit(r, p0_, rotAxis_).value_or(p0_ + u0_); Vec3 u1 = (hp - p0_).normalized();
-    double ang = std::atan2(rotAxis_.dot(u0_.cross(u1)), u0_.dot(u1));
+    double ang = 0;
+    if (std::abs(rotAxis_.dot(rayAt(cam, mx0_, my0_, W, H).d)) < 0.15) {
+      // (the ring seen edge-on: its plane gives no usable hit — the turn from the pointer's travel along the ring's line on
+      // the screen, the ring's near side following the pointer, 100 px a radian)
+      const Vec3 s = -rotAxis_.cross(cam.dir()).normalized();
+      Projector P(cam, W, H); ScreenPt a = P.toScreen(p0_), b = P.toScreen(p0_ + s * (cam.sceneScale * 0.01));
+      double sx = b.x - a.x, sy = b.y - a.y, l = std::hypot(sx, sy);
+      if (l > 1e-6) ang = ((mx - mx0_) * sx + (my - my0_) * sy) / l / 100;
+    } else {
+      Vec3 hp = planeHit(r, p0_, rotAxis_).value_or(p0_ + u0_); Vec3 u1 = (hp - p0_).normalized();
+      ang = std::atan2(rotAxis_.dot(u0_.cross(u1)), u0_.dot(u1));
+    }
     if (shift) ang = std::round(ang / (PI / 4)) * (PI / 4);          // (Shift — 45° steps)
     rot_ = Quat::fromAxisAngle(rotAxis_, ang);
     M = Affine::fromQuat(rot_); M.t = p0_ - M.lin(p0_);

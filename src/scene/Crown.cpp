@@ -314,7 +314,7 @@ std::optional<CrownMesh> crownData(const Scene& sc, const CurveCache& cc, const 
 // widening below it); a head alone — all of it
 Box3 headRegion(const Scene& sc, double topY) {
   std::vector<Vec3> P; Box3 B;
-  for (auto& [id, it] : sc.items) if (it.headTag && it.poly && sc.isVisible(it)) for (const Vec3& p : it.poly->pos) { P.push_back(p); B.expand(p); }
+  for (auto& [id, it] : sc.items) if (it.headTag && it.poly) for (const Vec3& p : it.poly->pos) { P.push_back(p); B.expand(p); }
   const double H = topY - B.min.y; if (P.size() < 50 || !(H > 0)) return B;
   const int N = 160; const double dy = H * 0.6 / N;
   std::vector<double> lo(N, 1e300), hi(N, -1e300);
@@ -334,8 +334,8 @@ Box3 headRegion(const Scene& sc, double topY) {
 int createCrown(Scene& sc, const std::optional<Vec3>& target, const std::optional<Vec3>& normal, const HeadHit& hit, const Vec3& center, double scale, bool sym, Selection& sel, QString* msg, const std::vector<Vec3>* coll, bool bangs) {
   // fitting the reference to the head: its top (rays from above), its width at the lower connector's height (rays from
   // the sides) → scale; the back of the head there → where the back of the lower connector goes
-  bool head = false; for (auto& [id, it] : sc.items) if (it.headTag && it.poly && sc.isVisible(it)) head = true;
-  Box3 B; for (auto& [id, it] : sc.items) if (it.headTag && it.poly && sc.isVisible(it)) for (const Vec3& p : it.poly->pos) B.expand(p);   // (its vertices — where it is drawn)
+  bool head = false; for (auto& [id, it] : sc.items) if (it.headTag && it.poly) head = true;
+  Box3 B; for (auto& [id, it] : sc.items) if (it.headTag && it.poly) for (const Vec3& p : it.poly->pos) B.expand(p);   // (its vertices — where it is drawn)
   const Vec3 part0 = bangs ? Vec3((BPART[0][0] + BPART[1][0]) / 2, BPART[0][1], BPART[0][2]) : Vec3(TPART[0][0], TPART[0][1], TPART[0][2]);   // (a click: where the whorl / the bangs' parting goes)
   std::function<Vec3(const Vec3&)> place;
   double topAt = std::nan("");                                       // (where the crown's top goes: the collision's top)
@@ -344,7 +344,7 @@ int createCrown(Scene& sc, const std::optional<Vec3>& target, const std::optiona
     // model's, may lie well away from it: a tail, long hair, arms out. Rays from above along a line front to back through
     // it — the third highest they meet: an antenna or two at the front caught by a ray or two left out. Then the head
     // under it — a whole character marked: above its neck)
-    Vec3 bc; { int n = 0; const double y0 = B.max.y - 0.12 * B.size().y; for (auto& [id, it] : sc.items) if (it.headTag && it.poly && sc.isVisible(it)) for (const Vec3& p : it.poly->pos) if (p.y >= y0) { bc += p; n++; } bc = n ? bc / double(n) : B.center(); }
+    Vec3 bc; { int n = 0; const double y0 = B.max.y - 0.12 * B.size().y; for (auto& [id, it] : sc.items) if (it.headTag && it.poly) for (const Vec3& p : it.poly->pos) if (p.y >= y0) { bc += p; n++; } bc = n ? bc / double(n) : B.center(); }
     double big = scale * 2, R = B.size().y * 0.06; std::vector<Vec3> tops;
     for (int j = -8; j <= 8; j++) if (auto h = hit(Vec3(bc.x, B.max.y + big * 0.1, bc.z + j * R / 8), Vec3(0, -1, 0), false)) tops.push_back(*h);
     std::optional<Vec3> topP;

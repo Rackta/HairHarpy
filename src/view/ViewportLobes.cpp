@@ -81,11 +81,6 @@ QString Viewport::lobeDelete(int k) {
   if (fl.isEmpty()) it->raw.remove("lobeFlip"); else it->raw.insert("lobeFlip", fl);
   lobeWrite(m, lab, true); ui::toast(tr("%1 deleted").arg(name)); return name;
 }
-void Viewport::lobeRename(int k, const QString& name) {
-  const int m = lobeTarget(); Item* it = m >= 0 ? scene_->item(m) : nullptr; if (!it || name.trimmed().isEmpty()) return;
-  QJsonArray a = it->raw.value("lobes").toArray(); if (k < 1 || k > int(a.size())) return;
-  a[k - 1] = name.trimmed(); it->raw.insert("lobes", a); scene_->revision++; commit(false); emit topoState();
-}
 QString Viewport::lobeClear() {
   const int m = lobeTarget(); Item* it = m >= 0 ? scene_->item(m) : nullptr; if (!it) return "!";
   it->raw.remove("lobes"); it->raw.remove("lobeAct"); lobeWrite(m, std::vector<int>(size_t(baseOf(*it)->faceCount()), 0), true);
@@ -228,7 +223,7 @@ void Viewport::lobeFlip(int k) {
 // the mesh being built: the picked one (not the painted high-poly), else the last one
 int Viewport::lobeSource() const {
   const int t = lobeTarget();
-  auto good = [&](int id) { const Item* it = id >= 0 ? scene_->item(id) : nullptr; return it && id != t && it->type == ItemType::IMesh && it->poly && scene_->isVisible(*it) && baseOf(*it)->faceCount() > 0 && !meshmods::heavy(*it); };
+  auto good = [&](int id) { const Item* it = id >= 0 ? scene_->item(id) : nullptr; return it && id != t && it->type == ItemType::IMesh && it->poly && scene_->isVisible(*it) && baseOf(*it)->faceCount() > 0; };
   if (good(topoMesh())) return topoMesh(); return good(lb_.src) ? lb_.src : -1;
 }
 // what goes where: the polygons of the mesh being built on the lobe holding most of them (the template) — onto every lobe

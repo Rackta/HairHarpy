@@ -347,7 +347,7 @@ std::vector<int> SchemeView::routeIds(int curve) const {
   if (c->hasPath()) { for (auto& p : c->path) out.push_back(p[0]); return out; }
   const auto& A = c->anchors;
   for (size_t k = 0; k + 1 < A.size(); k++) for (auto& t : tracks_) {
-    const Item* q = sc_->item(t.c); int i = idxOf(q->anchors, A[k]);
+    const Item* q = sc_->item(t.c); if (!q) continue; int i = idxOf(q->anchors, A[k]);   // (a curve deleted before the view is made again)
     if (i >= 0 && ((i + 1 < int(q->anchors.size()) && q->anchors[size_t(i + 1)] == A[k + 1]) || (i > 0 && q->anchors[size_t(i - 1)] == A[k + 1]))) { if (std::find(out.begin(), out.end(), t.c) == out.end()) out.push_back(t.c); break; }
   }
   return out;
@@ -362,7 +362,7 @@ std::vector<QPointF> SchemeView::sidePts(int curve) const {
   if (isTrack(curve)) route.push_back({curve});
   else if (c->hasPath()) for (auto& p : c->path) route.push_back({p[0], p[1], p[2]});
   else { const auto& A = c->anchors;
-    for (size_t k = 0; k + 1 < A.size(); k++) for (auto& t : tracks_) { const Item* q = sc_->item(t.c); int i = idxOf(q->anchors, A[k]);
+    for (size_t k = 0; k + 1 < A.size(); k++) for (auto& t : tracks_) { const Item* q = sc_->item(t.c); if (!q) continue; int i = idxOf(q->anchors, A[k]);
       if (i >= 0 && ((i + 1 < int(q->anchors.size()) && q->anchors[size_t(i + 1)] == A[k + 1]) || (i > 0 && q->anchors[size_t(i - 1)] == A[k + 1]))) {
         if (!route.empty() && route.back().id == t.c && route.back().a1 == A[k]) route.back().a1 = A[k + 1]; else route.push_back({t.c, A[k], A[k + 1]}); break; } } }
   for (auto& s : route) {
@@ -506,14 +506,14 @@ void SchemeView::mouseMoveEvent(QMouseEvent* e) {
   int ch = chipAt(m); hovChip_ = ch;
   if (ch >= 0) {
     const Chip& c = chips_[size_t(ch)];
-    if (c.wall) { const Item* w = sc_->item(c.id); std::set<int> s; for (int x : routeIds(w->a)) s.insert(x); for (int x : routeIds(w->b)) s.insert(x); hover(s, c.id); }
+    if (c.wall) { const Item* w = sc_->item(c.id); if (!w) { hover({}); return; } std::set<int> s; for (int x : routeIds(w->a)) s.insert(x); for (int x : routeIds(w->b)) s.insert(x); hover(s, c.id); }
     else { auto r = routeIds(c.id); hover(std::set<int>(r.begin(), r.end())); }
     return;
   }
   if (int st = stationAt(m); st >= 0) { const auto& v = L_->items[size_t(st)]; hover(std::set<int>(v.cs.begin(), v.cs.end())); setCursor(Qt::SizeAllCursor); return; }
   unsetCursor();
   if (int t = trackAt(m); t >= 0) { hover({tracks_[size_t(t)].c}); setCursor(Qt::PointingHandCursor); return; }
-  if (int z = zoneAt(m); z >= 0) { const Item* w = sc_->item(z); std::set<int> s; for (int x : routeIds(w->a)) s.insert(x); for (int x : routeIds(w->b)) s.insert(x); hover(s, z); setCursor(Qt::PointingHandCursor); return; }
+  if (int z = zoneAt(m); z >= 0) { const Item* w = sc_->item(z); if (!w) { hover({}); return; } std::set<int> s; for (int x : routeIds(w->a)) s.insert(x); for (int x : routeIds(w->b)) s.insert(x); hover(s, z); setCursor(Qt::PointingHandCursor); return; }
   hover({});
 }
 
@@ -540,7 +540,7 @@ void SchemeView::mouseReleaseEvent(QMouseEvent* e) {
     vp_->setSelectedItems({}); vp_->setSelectedItems(sel); return;
   }
   if ((m - pressAt_).manhattanLength() > 4) return;
-  if (listBtn_.contains(m)) { int gid = gid_; sc_->item(gid)->raw.insert("view", "list"); if (changed) QMetaObject::invokeMethod(this, [f = changed] { f(); }, Qt::QueuedConnection); return; }
+  if (listBtn_.contains(m)) { int gid = gid_; vp_->runEdit([gid](Scene& s, Selection&, const CurveCache&) { if (Item* g = s.item(gid)) g->raw.insert("view", "list"); return QString(); }, false); if (changed) QMetaObject::invokeMethod(this, [f = changed] { f(); }, Qt::QueuedConnection); return; }
   if (!resetBtn_.isNull() && resetBtn_.contains(m)) { int gid = gid_; vp_->runEdit([gid](Scene& s, Selection&, const CurveCache&) { s.item(gid)->raw.insert("spos", QJsonValue()); return QString(); }, false); return; }
   if (int ch = chipAt(m); ch >= 0) { vp_->selectItem(chips_[size_t(ch)].id, add); return; }
   if (int t = trackAt(m); t >= 0) { vp_->selectItem(tracks_[size_t(t)].c, add); return; }
@@ -561,10 +561,11 @@ void SchemeView::mouseDoubleClickEvent(QMouseEvent* e) {
 bool SchemeView::event(QEvent* e) {
   if (e->type() == QEvent::ToolTip) {
     auto* h = static_cast<QHelpEvent*>(e); QPointF m = h->pos(); QString tip;
-    if (int ch = chipAt(m); ch >= 0) { const Item* x = sc_->item(chips_[size_t(ch)].id); tip = x->name + (x->junc ? QString() : tr("\nDouble-click or F2 — rename")); }
-    else if (int st = stationAt(m); st >= 0) { QStringList n; for (int c : L_->items[size_t(st)].cs) n << sc_->item(c)->name; tip = n.join(", ") + tr("\nDrag — move the station on the scheme"); }
-    else if (int t = trackAt(m); t >= 0) tip = sc_->item(tracks_[size_t(t)].c)->name;
-    else if (int z = zoneAt(m); z >= 0) tip = sc_->item(z)->name;
+    // (the items looked up in the live scene: one deleted before the view is made again has no tip)
+    if (int ch = chipAt(m); ch >= 0) { if (const Item* x = sc_->item(chips_[size_t(ch)].id)) tip = x->name + (x->junc ? QString() : tr("\nDouble-click or F2 — rename")); }
+    else if (int st = stationAt(m); st >= 0) { QStringList n; for (int c : L_->items[size_t(st)].cs) if (const Item* x = sc_->item(c)) n << x->name; tip = n.join(", ") + tr("\nDrag — move the station on the scheme"); }
+    else if (int t = trackAt(m); t >= 0) { if (const Item* x = sc_->item(tracks_[size_t(t)].c)) tip = x->name; }
+    else if (int z = zoneAt(m); z >= 0) { if (const Item* x = sc_->item(z)) tip = x->name; }
     else if (listBtn_.contains(m)) tip = tr("Show this group as the usual list");
     else if (!resetBtn_.isNull() && resetBtn_.contains(m)) tip = tr("Put every station moved by hand back where the layout puts it (double-click a station — just that one)");
     if (tip.isEmpty()) QToolTip::hideText(); else QToolTip::showText(h->globalPos(), tip, this);

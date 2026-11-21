@@ -91,7 +91,8 @@ Affine fitAffine(const std::vector<Vec3>& A, const std::vector<Vec3>& B) {
 
 // ---------- Mirror → Replace ----------
 QString Viewport::tMirrorReplace() {
-  const int m = topoMesh(); Item* it = m >= 0 ? scene_->item(m) : nullptr; if (!it || topoHeavy(m)) { ui::toast(tr("Select a mesh")); return "!"; }
+  if (!eachBusy_ && uvMulti()) return tEachMesh([&] { return tMirrorReplace(); }, true);   // (several meshes picked: done on each — on its own picks, or on the whole of it)
+  const int m = topoMesh(); Item* it = m >= 0 ? scene_->item(m) : nullptr; if (!it) { ui::toast(tr("Select a mesh")); return "!"; }
   if (topoMode == "object") { ui::toast(tr("Replace: select the polygons to carry over (a component mode)")); return "!"; }
   const PolyMesh& B = *baseOf(*it); MeshEd E = MeshEd::from(B); const auto fs = tSelFaces(m);
   if (fs.empty()) { ui::toast(tr("Replace: select the polygons to carry over")); return "!"; }
@@ -201,7 +202,8 @@ QString Viewport::tMirrorReplace() {
 
 // ---------- Apply To Identical ----------
 QString Viewport::tApplyIdentical() {
-  const int m = topoMesh(); Item* it = m >= 0 ? scene_->item(m) : nullptr; if (!it || topoHeavy(m)) { ui::toast(tr("Select the retopology mesh (its polygons on one part)")); return "!"; }
+  if (!eachBusy_ && uvMulti()) return tEachMesh([&] { return tApplyIdentical(); }, true);   // (several meshes picked: done on each — on its own picks, or on the whole of it)
+  const int m = topoMesh(); Item* it = m >= 0 ? scene_->item(m) : nullptr; if (!it) { ui::toast(tr("Select the retopology mesh (its polygons on one part)")); return "!"; }
   const PolyMesh& B = *baseOf(*it); MeshEd E = MeshEd::from(B);
   auto fs = topoMode == "object" ? std::vector<int>{} : tSelFaces(m); if (fs.empty()) { fs.resize(E.f.size()); std::iota(fs.begin(), fs.end(), 0); }
   if (fs.empty()) { ui::toast(tr("Nothing to copy")); return "!"; }

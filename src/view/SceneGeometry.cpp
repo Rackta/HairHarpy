@@ -186,6 +186,22 @@ LineBatch buildAxes(double scale, double opacity) {
 }  // namespace hm
 
 namespace hm {
+// an orthographic view's grid without an edge: the lines of whole steps over the rectangle the camera sees (every tenth one
+// brighter, counted from the origin — they stay put while the view pans and zooms)
+LineBatch buildViewGridInf(const QString& view, double floorY, double step, double u0, double v0, double halfU, double halfV) {
+  LineBatch b; b.width = 1; if (step <= 0) return b;
+  float c[4], c10[4]; toLinear(QColor(0x5a, 0x6a, 0x7a), c, 0.55f); toLinear(QColor(0x70, 0x88, 0xa0), c10, 0.8f);
+  const bool wallZ = view == "front" || view == "back", wallX = view == "left" || view == "right";
+  auto at = [&](double u, double v) { return wallZ ? Vec3(u, v, 0) : wallX ? Vec3(0, v, u) : Vec3(u, floorY, v); };
+  const long long i0 = (long long)std::floor((u0 - halfU) / step), i1 = (long long)std::ceil((u0 + halfU) / step);
+  const long long j0 = (long long)std::floor((v0 - halfV) / step), j1 = (long long)std::ceil((v0 + halfV) / step);
+  if (i1 - i0 > 600 || j1 - j0 > 600) return b;
+  const double ua = (double)i0 * step, ub = (double)i1 * step, va = (double)j0 * step, vb = (double)j1 * step;
+  for (long long i = i0; i <= i1; i++) { const double u = (double)i * step; putLine(b, at(u, va), at(u, vb), i % 10 == 0 ? c10 : c); }
+  for (long long j = j0; j <= j1; j++) { const double v = (double)j * step; putLine(b, at(ua, v), at(ub, v), j % 10 == 0 ? c10 : c); }
+  return b;
+}
+
 LineBatch buildViewGrid(const QString& view, double scale, const Vec3& center, double floorY, double step) {
   LineBatch b; b.width = 1; if (step <= 0) return b;
   float c[4], c10[4]; toLinear(QColor(0x5a, 0x6a, 0x7a), c, 0.55f); toLinear(QColor(0x70, 0x88, 0xa0), c10, 0.8f);

@@ -73,18 +73,67 @@ Your build is a program you made yourself from code you can read. You don't have
   computer — where the Blender or Maya bridge add-on receives them. Nothing leaves your computer.
 - The links "About the author", "Support the author" and the links in the FAQ open in your browser **only when you
   click them**.
-- It starts other programs only when you ask it to: RizomUV (UV editing, the path you set) and itself (Reload).
+- It starts other programs only when you ask it to: RizomUV (UV editing, the path you set), itself (Reload) and, in
+  the Paint room, the editor you send a layer, the view or a mesh to with the Bridge panel's buttons — Photoshop, Krita,
+  PaintTool SAI, 3D-Coat or another program whose path you set. Unless you set the path, it looks for these editors by
+  folder name in `Program Files`.
+- It reads the screen outside its own window in one case only: the Paint room's pipette with **From: The screen** chosen
+  takes the colour of the single pixel under the pointer when you press `V`. Nothing else of the screen is read and
+  nothing of it is kept or written. With the other pipette settings (the default) the screen is not read at all.
+- It reads the clipboard only when you paste (Ctrl+V or a Paste button: a picture for a reference or a canvas, a camera
+  position) and writes to it only when you press a command that copies something (the camera position, the selection's
+  description). Stopping a session recording puts the path of its folder there.
 - It writes:
-  - the files you save or export, where you save them;
+  - the files you save or export, where you save them. Two folders can appear next to a saved project file: the Paint
+    room's layers in `<project file>.paint`, and meshes kept as files of their own in `<project name>_files`;
   - autosaves, presets and projects into `System\` in the program folder (the portable version:
     `%APPDATA%\Catarackta\HairHarpy`);
+  - a copy of unsaved work, so that it can be restored after a crash: `recovery.hairmesh` in
+    `%APPDATA%\Catarackta\HairHarpy`, written about once a minute while there are unsaved changes and removed when you
+    save or discard them;
   - its settings into `HKEY_CURRENT_USER\Software\Catarackta\HairHarpy`;
+  - your own brushes (the ones you keep or import from an ABR file) into `%APPDATA%\Catarackta\HairHarpy\Brushes`;
+  - the alphas you add in the Paint room's brush panel: copies of the pictures you pick, in
+    `Documents\HairHarpy Brushes\Alphas` (the program also reads a brush preset pack from `Documents\HairHarpy Brushes`,
+    if you put one there, and never changes it);
+  - a picture you paste or drop into the Paint room's Reference panel: `Documents\HairHarpy References\pasted_<time>.png`;
   - exchange files for RizomUV into `%TEMP%\HairHarpy`, when you send a mesh there;
-  - **only while you record a session** (the **● Rec** button, pressed again to stop): a folder
-    `Documents\HairHarpy Sessions\session_<date>` with a log of the session — the tools, actions and buttons you used,
-    the program's messages, moments the window froze, the project's name and path, the camera, the names and polygon
-    counts of the selected and shown meshes — and your notes (**✎ Note** / F9): your text and a picture of the program's
-    window with your drawing over it. No mesh data and no other files go into it;
+  - exchange files of the Paint room's Bridge into `%TEMP%\HairHarpyBridge`, when you send something to Photoshop,
+    Krita, SAI or 3D-Coat: the layer or the view as a PNG or PSD, the UV islands' map, for 3D-Coat the mesh as an OBJ
+    with its maps. The program watches these files — and the "return folder", if you chose one — to take back what you
+    save in the editor;
+  - small pictures of your favourite alphas into `%TEMP%\HairHarpyAlphas`, when you open the alpha ring;
+  - **only when outliner rows are dragged into another open HairHarpy**: the dragged items as a file in `%TEMP%\HairHarpy\Drag`,
+    written at the moment that program asks for them; the program that takes them in deletes the file once it has read it;
+  - **only while Bridge → ZBrush → "Receive from ZBrush" is on**: the folder `%LOCALAPPDATA%\HairHarpy\ZBrush` with
+    `running_<process id>.pid` (the ZBrush plugin's sign that the program is open; removed when it closes) and `inbox\`,
+    where the plugin puts the SubTools you send from ZBrush — each is loaded into the open scene and its file deleted;
+  - **only when you press Bridge → ZBrush → "Install the plugin in ZBrush"**: the plugin file into
+    `%LOCALAPPDATA%\HairHarpy\ZBrush\plugin` and that folder added to the `ZBRUSH_PLUGIN_PATH` variable of your user's
+    environment (`HKEY_CURRENT_USER\Environment`), so ZBrush loads the plugin when it starts;
+  - **only while a session is being recorded** (the **● Rec** button, pressed again to stop — or from the program's
+    start to its end, if you yourself have put the settings file `Documents\HairHarpy Sessions\recorder.json` with
+    `"auto": true`; there is no such file by default): a folder `Documents\HairHarpy Sessions\session_<date>` (or in the
+    folder that settings file names) with a log of the session:
+    - the tools, actions, buttons, menu items, lists and sliders you used; the keys pressed in the program's windows
+      (so also what you type into its fields — a layer's name, for one) and how long a key was held;
+    - every mouse press and release with its place in the program's window and the part of the window under it, the
+      pointer's path inside the program's windows and the pen's pressure;
+    - the room's settings as they change (in the Paint room: the tool, the drawing mode, the layer's name, the UV set,
+      the brush's size, opacity and colour);
+    - presses on buttons that are switched off; the program's own warnings (Qt's messages); every two seconds the
+      processor's load, the program's share of it and the program's memory;
+    - how long the program's operations took (a stroke, an undo, a save, a room opened), how many frames a second it
+      drew, the moments the window froze and the names of the functions (the program's own, Qt's and the system's) it stood in at such a moment;
+    - the list of the program's actions with their keys, the system's and desktop's names and the Qt version, the
+      program's messages, the project's name and path, the camera, the names and polygon counts of the selected and
+      shown meshes;
+    - your notes (**✎ Note** / F9): your text, the tags you tick and a picture of the program's window with your drawing
+      over it;
+    - **pictures of the program's window every few seconds — only if that settings file asks for them**
+      (`"frames": true`).
+
+    No mesh data and no other files go into it; the recording reads nothing outside the program's own windows;
   - **if the program crashes**: a crash dump `crash_<time>.dmp` into `Documents\HairHarpy Sessions` (into the session's
     folder while recording). It is a snapshot of the program's memory at that moment, so it can hold parts of the open
     project.
@@ -92,9 +141,14 @@ Your build is a program you made yourself from code you can read. You don't have
   The program sends none of this anywhere. The folder appears only when something is written into it; you decide
   whether to send a session folder to the author, and you can delete it at any time.
 
+- The checks used in development are off unless you yourself start the program with their command-line options
+  (`--shot`, `--events`) or set one of the `HM_…` environment variables. They write pictures and logs into the file you
+  name or into `%TEMP%`, and keep their settings apart, in `HKEY_CURRENT_USER\Software\Catarackta\HairHarpyCheck`.
+
 **The bridge add-ons** (optional, `resources/bridge/`) are plain Python files you can read before installing. The
 Blender add-on listens on `127.0.0.1` only. The Maya bridge copies itself into your Maya scripts folder and adds one
-line to `userSetup.py` so it starts with Maya — the file says so at its top.
+line to `userSetup.py` so it starts with Maya — the file says so at its top. The ZBrush plugin (`hairharpy_zbrush.py`) only exports
+the SubTool you send into the `inbox` folder above — no network; its top says how to remove it.
 
 ## 6. Checking it yourself while it runs
 
@@ -119,8 +173,9 @@ with `sha256sum -c SHA256SUMS-linux.txt`.
   its icon `~/.local/share/icons/hicolor/256x256/apps/hairharpy.png` and, for opening `.hairmesh` files,
   `~/.local/share/mime/packages/hairharpy.xml`. `uninstall.sh` removes exactly these.
 - The program behaves as described in section 5, with Linux places: settings in `~/.config/Catarackta/HairHarpy.conf`;
-  projects, presets and autosaves in `~/.local/share/Catarackta/HairHarpy`; RizomUV exchange files in
-  `/tmp/HairHarpy`; session recordings in `~/Documents/HairHarpy Sessions`. The Linux build writes no crash dumps.
+  projects, presets, autosaves, the recovery copy and your brushes in `~/.local/share/Catarackta/HairHarpy`; exchange
+  files in `/tmp/HairHarpy`, `/tmp/HairHarpyBridge` and `/tmp/HairHarpyAlphas`; the ZBrush bridge's folder, if you
+  switch it on, is `~/HairHarpy/ZBrush`, and no environment variable is set; session recordings in `~/Documents/HairHarpy Sessions` (in `~/HairHarpy Sessions` where there is no Documents folder). The Linux build writes no crash dumps.
 - To see it yourself: `strace -f -e trace=network` or `ss -tp` show that its only connection is the bridge's
   `127.0.0.1`.
 

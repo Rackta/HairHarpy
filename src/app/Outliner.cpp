@@ -12,6 +12,8 @@
 #include <QApplication>
 #include <QColorDialog>
 #include <QDrag>
+#include <QCoreApplication>
+#include <QMimeData>
 #include <QHBoxLayout>
 #include <QHelpEvent>
 #include <QInputDialog>
@@ -19,6 +21,7 @@
 #include <QKeyEvent>
 #include <QLabel>
 #include <QLineEdit>
+#include <QMessageBox>
 #include <QMimeData>
 #include <QMouseEvent>
 #include <QPushButton>
@@ -37,14 +40,37 @@ namespace hm {
 
 namespace {
 const char* MIME = "application/x-hm-outliner";
+// a drag out of the outliner: within this program the rows move (MIME); another HairHarpy sees ITEMS_MIME and PID_MIME (this
+// program's process — its own window takes nothing from itself). The items' file is made only when the other program asks for it
+class ItemsMime : public QMimeData {
+public:
+  std::function<QByteArray()> make; mutable QByteArray made; mutable bool done = false;
+  QStringList formats() const override { QStringList f = QMimeData::formats(); if (make && !f.contains(hm::kItemsMime)) f << hm::kItemsMime; return f; }
+  bool hasFormat(const QString& m) const override { return (make && m == hm::kItemsMime) || QMimeData::hasFormat(m); }
+protected:
+  QVariant retrieveData(const QString& m, QMetaType t) const override {
+    if (m == hm::kItemsMime && make) { if (!done) { made = make(); done = true; } return made; }
+    return QMimeData::retrieveData(m, t); }
+};
 const QColor TXT(0xcf, 0xcf, 0xcf), MUT(0x8a, 0x8a, 0x8a), GON(0x6f, 0xdc, 0x8c), GOFF(0x77, 0x77, 0x77);
 
 const Item* parentOf(const Scene& sc, const Item* it) { return it && it->parent >= 0 ? sc.item(it->parent) : nullptr; }
 bool rawB(const Item& it, const char* k) { return it.raw.value(k).toBool(); }
-bool svcGroup(const Item& it) { return it.type == ItemType::Group && (rawB(it, "guidesGroup") || rawB(it, "meshesGroup") || rawB(it, "importGroup")); }
+bool svcGroup(const Item& it) { return it.type == ItemType::Group && (rawB(it, "guidesGroup") || rawB(it, "meshesGroup") || rawB(it, "importGroup") || rawB(it, "collGroup")); }
+// a lock drawn: closed and amber — locked; open and grey — free (as the Paint room's lists draw it)
+QPixmap lockPixOf(bool on) {
+  static QPixmap cache[2]; QPixmap& pm = cache[on ? 1 : 0]; if (!pm.isNull()) return pm;
+  QImage img(32, 32, QImage::Format_ARGB32_Premultiplied); img.fill(Qt::transparent);
+  { QPainter p(&img); p.setRenderHint(QPainter::Antialiasing); const QColor c = on ? QColor(0xe0, 0xa0, 0x50) : QColor(0x8a, 0x8a, 0x8a);
+    p.setPen(QPen(c, 3)); p.setBrush(Qt::NoBrush); QPainterPath sh;
+    if (on) { sh.moveTo(10, 15); sh.lineTo(10, 10); sh.arcTo(QRectF(10, 3, 12, 14), 180, -180); sh.lineTo(22, 15); }
+    else { sh.moveTo(10, 15); sh.lineTo(10, 8); sh.arcTo(QRectF(10, 1, 12, 14), 180, -180); }
+    p.drawPath(sh); p.setPen(Qt::NoPen); p.setBrush(c); p.drawRoundedRect(QRectF(6, 15, 20, 14), 3, 3); }
+  pm = QPixmap::fromImage(img); return pm;
+}
 bool sceneGroup(const Item* g) { return g && (svcGroup(*g) || g->raw.value("side").toString() == "scene"); }
 bool sceneType(ItemType t) { return t == ItemType::Head || t == ItemType::Mesh || t == ItemType::IMesh || t == ItemType::Guide || t == ItemType::Cocoon; }
-bool shellMod(ItemType t) { return t == ItemType::Tip || t == ItemType::Even || t == ItemType::PInf || t == ItemType::Guide; }
+bool shellMod(ItemType t) { return t == ItemType::Tip || t == ItemType::Even || t == ItemType::PInf || t == ItemType::Spiral || t == ItemType::Guide; }
 bool groupHasGuides(const Scene& sc, const Item& g) {
   for (int id : g.children) { const Item* c = sc.item(id); if (c && (c->type == ItemType::Guide || (c->type == ItemType::Group && groupHasGuides(sc, *c)))) return true; }
   return false;
@@ -118,7 +144,11 @@ void OutlinerView::begin() {
   rows_.clear(); boxes_.clear(); links_.clear(); y_ = 4; hover_ = -1; dropRow_ = -1; hoverLink_ = -1;
   for (QWidget* w : widgets_) { w->hide(); w->deleteLater(); }
   widgets_.clear();
-  if (edit_) { edit_->hide(); edit_->deleteLater(); edit_ = nullptr; }
+  // (the rename box taken out of edit_ first: hiding it may end the rename, which clears edit_ itself)
+  if (QLineEdit* ed = edit_) { edit_ = nullptr; ed->hide(); ed->deleteLater(); }
+  // (a press kept by its row's index: the rows are made anew — a click still waiting is dropped; an eye drag or a box goes on)
+  if (!pr_.eye && !pr_.box) pr_.on = false;
+  pr_.row = -1;
 }
 
 OutlinerView::Row& OutlinerView::add(int x0, int x1, int h) {
@@ -287,8 +317,9 @@ void OutlinerView::mouseMoveEvent(QMouseEvent* e) {
       int kind = R->drag, id = R->id; pr_.on = false;
       std::vector<int> ids = kind == 1 && dragIds ? dragIds(id) : std::vector<int>{id};
       QStringList s; for (int x : ids) s << QString::number(x);
-      auto* md = new QMimeData; md->setData(MIME, QString("%1:%2").arg(kind).arg(s.join(',')).toUtf8());
-      auto* d = new QDrag(this); d->setMimeData(md); d->exec(Qt::MoveAction);
+      auto* md = new ItemsMime; md->setData(MIME, QString("%1:%2").arg(kind).arg(s.join(',')).toUtf8());
+      if (kind == 1 && exportItems) { md->setData(kPidMime, QByteArray::number(QCoreApplication::applicationPid())); auto ex = exportItems; md->make = [ex, ids] { return ex(ids); }; }
+      auto* d = new QDrag(this); d->setMimeData(md); d->exec(Qt::MoveAction | Qt::CopyAction, Qt::MoveAction);
       return;
     }
     pr_.box = true;
@@ -333,9 +364,10 @@ void OutlinerView::mouseDoubleClickEvent(QMouseEvent* e) {
 
 void OutlinerView::contextMenuEvent(QContextMenuEvent* e) {
   if (pie && ui::Keymap::get().pieMouse("main", ui::Keymap::buttonOf(Qt::RightButton), ui::Keymap::modsOf(e->modifiers()))) return;   // (the pie opened on the press)
-  int i = rowAt(e->pos()); if (i < 0) return;
-  const Cell* c = cellAt(rows_[size_t(i)], e->pos());
-  if (c && c->rclick) { Click f = c->rclick; f(e->modifiers()); }
+  int i = rowAt(e->pos());
+  const Cell* c = i >= 0 ? cellAt(rows_[size_t(i)], e->pos()) : nullptr;
+  if (c && c->rclick) { Click f = c->rclick; f(e->modifiers()); return; }
+  if (pie) pie(e->globalPos());                      // (a plain RMB anywhere else: the outliner's pie, as in the viewport)
 }
 
 void OutlinerView::leaveEvent(QEvent*) { if (hover_ >= 0) { hover_ = -1; update(); } }
@@ -362,9 +394,12 @@ void OutlinerView::resizeEvent(QResizeEvent* e) {
   if (width() != lastW_) { lastW_ = width(); if (resized) QTimer::singleShot(0, this, [this] { if (resized) resized(); }); }
 }
 
-void OutlinerView::dragEnterEvent(QDragEnterEvent* e) { if (e->mimeData()->hasFormat(MIME)) e->acceptProposedAction(); }
+// (rows dragged from another HairHarpy: not this outliner's to move — left to the window, which brings the items into this project)
+static bool foreignDrag(const QMimeData* m) { return m->hasFormat(kPidMime) && m->data(kPidMime).toLongLong() != QCoreApplication::applicationPid(); }
+void OutlinerView::dragEnterEvent(QDragEnterEvent* e) { if (foreignDrag(e->mimeData())) { e->ignore(); return; } if (e->mimeData()->hasFormat(MIME)) e->acceptProposedAction(); }
 
 void OutlinerView::dragMoveEvent(QDragMoveEvent* e) {
+  if (foreignDrag(e->mimeData())) { e->ignore(); return; }
   QString s = QString::fromUtf8(e->mimeData()->data(MIME)); int kind = s.section(':', 0, 0).toInt();
   int dragged = s.section(':', 1).section(',', 0, 0).toInt();
   QPoint m = e->position().toPoint(); int i = rowAt(m);
@@ -383,6 +418,7 @@ void OutlinerView::dragMoveEvent(QDragMoveEvent* e) {
 void OutlinerView::dragLeaveEvent(QDragLeaveEvent*) { dropRow_ = -1; dropZone_.clear(); update(); }
 
 void OutlinerView::dropEvent(QDropEvent* e) {
+  if (foreignDrag(e->mimeData())) { e->ignore(); return; }
   QString s = QString::fromUtf8(e->mimeData()->data(MIME)); int kind = s.section(':', 0, 0).toInt();
   std::vector<int> ids; for (const QString& x : s.section(':', 1).split(',', Qt::SkipEmptyParts)) ids.push_back(x.toInt());
   int target = dropRow_ >= 0 ? rows_[size_t(dropRow_)].id : -1; QString zone = dropZone_;
@@ -471,6 +507,7 @@ Outliner::Outliner(Viewport* vp, Scene* sc, QWidget* parent) : QWidget(parent), 
       else moveItems(ids, target, zone == "into" || zone == "before" || zone == "after" ? zone : "root");
     };
     v->dragIds = [this](int id) { auto t = topSelected(); return t.empty() ? std::vector<int>{id} : t; };
+    v->exportItems = [this](const std::vector<int>& ids) { return exportItems ? exportItems(ids) : QByteArray(); };
     v->linkMade = [this](int from, int to) { linkCocoon(from, to); };
     v->linkClicked = [this](int from, int to, Qt::KeyboardModifiers m) { if (m & Qt::AltModifier) unlinkCocoon(from, to); else ui::toast(tr("Alt + click on the line — break the link")); };
     v->linkTip = [this](int from, int to) { const Item *k = sc_->item(from), *t = sc_->item(to); return tr("🔗 %1 takes the loops of %2 where it crosses it\nAlt + click — break the link").arg(k ? k->name : QString(), t ? t->name : QString()); };
@@ -481,7 +518,7 @@ Outliner::Outliner(Viewport* vp, Scene* sc, QWidget* parent) : QWidget(parent), 
 void Outliner::setWidths(int olw, int ccw, bool save) {
   olw_ = std::clamp(olw, 120, 700); ccw_ = std::clamp(ccw, 160, 900);
   sceneScroll_->setFixedWidth(olw_); ccol_->setFixedWidth(ccw_ + 1);
-  const bool one = sc_->room == "topo";
+  const bool one = sc_->room != "hair";
   setFixedWidth(one ? olw_ + 1 : olw_ + ccw_ + 2);
   if (save) { QSettings st; st.setValue("outliner/olw", olw_); st.setValue("outliner/ccw", ccw_); }
   if (auto* g = findChild<QWidget*>("g1")) { g->setGeometry(olw_ - 3, 0, 6, height()); g->raise(); }
@@ -508,7 +545,7 @@ QString Outliner::sideOf(const Item* it) const {
         if (c->type == ItemType::Group ? sideOf(c) == t : c->ring < 0 && c->type != ItemType::Cocoon && c->type != ItemType::Crown && sideOf(c) == t) return true; }
       return false;
     };
-    if (!has("curves") && !has("scene") && sc_->room == "topo") return "scene";   // (an empty group in the Topology room: a group for meshes)
+    if (!has("curves") && !has("scene") && sc_->room != "hair") return "scene";   // (an empty group in the Topology room: a group for meshes)
     return has("curves") || !has("scene") ? "curves" : "scene";
   }
   return sceneType(it->type) ? "scene" : "curves";
@@ -525,7 +562,7 @@ bool Outliner::shows(const Item& it, Side side) {
     kinds_[g.id] = k; return k;
   };
   auto k = kinds(it);
-  if (!k.first && !k.second && !sceneGroup(&it) && sc_->room == "topo") return side == Side::Scene;   // (empty in the Topology room: a group for meshes)
+  if (!k.first && !k.second && !sceneGroup(&it) && sc_->room != "hair") return side == Side::Scene;   // (empty in the Topology room: a group for meshes)
   return side == Side::Scene ? (sceneGroup(&it) || k.first) : (!sceneGroup(&it) && (k.second || !k.first));
 }
 
@@ -548,9 +585,24 @@ void Outliner::itemRow(OutlinerView::Row& r, const Item& it, int depth) {
   ico.text = it.type == ItemType::Guide && it.raw.value("kind").toString() == "disc" ? "◎" : it.type == ItemType::XMod ? xkindIcon(it.raw.value("kind").toString()) : itemTypeIcon(it.type);
   if (it.type == ItemType::Mesh && rawB(it, "pending")) ico.text = "◇";
   if ((it.type == ItemType::Group && rawB(it, "braidGroup")) || it.type == ItemType::Braid) { static QPixmap bp = ui::image("tool_braid").scaled(16, 16, Qt::KeepAspectRatio, Qt::SmoothTransformation); ico.text.clear(); ico.pix = bp; ico.op = 1; }   // (a braid and its folder: the braid icon)
+  // (a Topology modifier group: the modifier's own icon, not a plain group's)
+  if (it.type == ItemType::Group && (it.raw.value("subdiv").isObject() || it.raw.value("vsym").isObject())) {
+    static QPixmap sdp = ui::image("ol_subdiv").scaled(16, 16, Qt::KeepAspectRatio, Qt::SmoothTransformation), syp = ui::image("ol_vsym").scaled(16, 16, Qt::KeepAspectRatio, Qt::SmoothTransformation);   // (flat glyphs with no tile, as Cinema 4D draws its objects: the tool icons' dark tile vanished at 16 px)
+    ico.text.clear(); ico.pix = it.raw.value("subdiv").isObject() ? sdp : syp; ico.op = 1; }
   r.name.text = it.name;
+  if (rawB(it, "noPaint")) { Cell np; np.w = -1; np.op = 0.85; np.text = r.r.width() >= 300 ? "NoPainted" : QString::fromUtf8("⊘");   /* (a narrow outliner: the sign alone — the name keeps its room) */ np.color = QColor(0xd0, 0x8a, 0x5a); np.tip = tr("NoPainted: this object (a folder — everything in it) is left out of the Paint room — not shown there, not in its lists. RMB in the outliner — take the label off"); r.right.push_back(np); }
   r.name.tip = it.name + "\n" + (it.junc ? tr("Service curve — shown only while selected") : group ? tr("Double-click — select everything inside · F2 — rename") : tr("Double-click or F2 — rename"));
+  const bool shellMod = it.type == ItemType::Tip || it.type == ItemType::Even || it.type == ItemType::PInf || it.type == ItemType::Spiral || it.type == ItemType::Guide;
+  if (shellMod) r.name.tip = it.name + "\n" + tr("Double-click — select it and take its brush (Shell modifiers) · F2 — rename");
   r.name.dbl = [this, id, group](Qt::KeyboardModifiers) {
+    // (a shell modifier: selected, the Shell modifiers tool on its tab — a painted one with its brush in hand)
+    if (const Item* x = sc_->item(id); x && (x->type == ItemType::Tip || x->type == ItemType::Even || x->type == ItemType::PInf || x->type == ItemType::Spiral || x->type == ItemType::Guide)) {
+      const QString tab = x->type == ItemType::PInf ? "pinf" : x->type == ItemType::Spiral ? "spiral" : x->type == ItemType::Guide ? (x->raw.value("kind").toString() == "disc" ? "disc" : "line") : "tip";
+      vp_->setSelectedItems({}); vp_->setSelectedItems({id});
+      vp_->tipBrush.on = tab == "tip"; vp_->pinfBrush.on = tab == "pinf"; vp_->spiralBrush.on = tab == "spiral"; vp_->shTab = tab;
+      if (vp_->tool() != "guide") vp_->setTool("guide");
+      vp_->shellChanged(); emit vp_->brushChanged();
+      return; }
     if (!group) { startRename(id); return; }
     std::vector<int> out; std::function<void(const Item&)> walk = [&](const Item& g) { for (int c : g.children) if (const Item* x = sc_->item(c); x && x->ring < 0) { if (x->type == ItemType::Group) walk(*x); else out.push_back(c); } };
     const Item* g = sc_->item(id); if (!g) return; walk(*g);
@@ -560,12 +612,30 @@ void Outliner::itemRow(OutlinerView::Row& r, const Item& it, int depth) {
   r.left.push_back(ar); if (!it.junc) r.left.push_back(ico);
 
   auto selectOnly = [this, id](Qt::KeyboardModifiers) { vp_->setSelectedItems({}); vp_->setSelectedItems({id}); };
+  // (a group of meshes only — no curves, walls, cocoons in it: the hair's switches (curves shown, colour, symmetry) mean nothing to
+  // it; 20.11, the author: "why does a group of meshes show the curves and the hair's symmetry?")
+  const bool meshesOnly = group && !coll::isGroup(it) && [&] { bool any = false; std::function<bool(const Item&)> walk = [&](const Item& g) {
+      for (int c : g.children) { const Item* x = sc_->item(c); if (!x) continue;
+        if (x->type == ItemType::Group) { if (!walk(*x)) return false; }
+        else if (x->type == ItemType::IMesh || x->type == ItemType::Mesh) any = true;
+        else if (x->type != ItemType::XMod) return false; }
+      return true; };
+    return walk(it) && any; }();
   if (group) {
     const QJsonObject labels = it.raw.value("labels").toObject();
     bool looseOn = !(labels.contains("loose") && labels.value("loose") == QJsonValue(false)), hasLoose = false;
     for (int c : it.children) if (vp_->display().looseCurves.count(c)) hasLoose = true;
     if (looseOn && hasLoose) { Cell t; t.pix = tagPix(80, 1.8); t.op = 1; t.tip = tr("Free curves visible: curves joined to no NURBS surface and no modifier stay shown in the viewport even while the group isn't selected (on by default)") + tr(" — click: group properties"); t.click = selectOnly; r.right.push_back(t); }
-    if (!svcGroup(it)) {
+    // 🔒 a group of meshes (the Hair room): its meshes not picked in the viewport — only in the outliner (off by default; 20.11,
+    // the author: "a tag on the group of meshes — on, the meshes can't be selected in the hair scene")
+    if (meshesOnly && sc_->room == "hair") {
+      const bool lk = it.raw.value("selLock").toBool(false);
+      Cell lc; lc.pix = lockPixOf(lk).scaled(16, 16, Qt::KeepAspectRatio, Qt::SmoothTransformation); lc.op = lk ? 1 : 0.35;
+      lc.tip = lk ? tr("Locked — its meshes are not picked in the viewport (only here) · click — unlock") : tr("Unlocked — its meshes are picked in the viewport · click — lock");
+      lc.click = [this, id, lk](Qt::KeyboardModifiers) { edit([&](Scene& s) { if (Item* g = s.item(id)) g->raw.insert("selLock", !lk); }); ui::toast(lk ? tr("Meshes unlocked: picked in the viewport") : tr("Meshes locked: picked only in the outliner")); };
+      r.right.push_back(lc);
+    }
+    if (!svcGroup(it) && !(meshesOnly && sc_->room == "hair")) {
       QString mode = it.raw.value("guides").toString("auto"); if (mode != "show" && mode != "hide") mode = "auto";
       Cell gm; gm.text = mode == "show" ? "∿" : mode == "hide" ? "⌀" : "A";
       gm.tip = (mode == "show" ? tr("Curves & anchors: always shown") : mode == "hide" ? tr("Curves & anchors: hidden") : tr("Curves & anchors: Auto (shown only while working inside this group)")) + tr(" — click to switch");
@@ -577,7 +647,7 @@ void Outliner::itemRow(OutlinerView::Row& r, const Item& it, int depth) {
           if (m & Qt::ShiftModifier) { std::vector<int> d; descendants(s, *g, d); for (int x : d) if (Item* c = s.item(x); c && c->type == ItemType::Group && !svcGroup(*c)) c->raw.insert("guides", nx); }
         });
       };
-      if (sc_->room != "topo") r.right.push_back(gm);   // (the Topology room: groups of meshes — no curves to show / hide)
+      if (sc_->room == "hair") r.right.push_back(gm);   // (the Topology room: groups of meshes — no curves to show / hide)
       Cell sw; sw.swatchCell = true; sw.op = 1; sw.swatchOn = !it.color.isEmpty(); if (sw.swatchOn) sw.swatch = QColor(it.color);
       sw.tip = tr("Group colour (double-click or RMB — reset). A parent group's colour covers its sub-groups");
       auto reset = [this, id] { const Item* g = sc_->item(id); if (g && !g->color.isEmpty()) edit([id](Scene& s) { s.item(id)->color.clear(); }); };
@@ -599,7 +669,7 @@ void Outliner::itemRow(OutlinerView::Row& r, const Item& it, int depth) {
       sy.pix = so ? on : off; sy.op = so ? 1 : 0.3;
       sy.tip = (so ? tr("Symmetry ON (%1) — a live mirrored copy of everything inside").arg(sym.value("axis").toString("x").toUpper()) : tr("Symmetry OFF")) + tr(" — click to switch; the axis and Apply — in the group's settings");
       sy.click = [this, id](Qt::KeyboardModifiers) { edit([id](Scene& s) { Item* g = s.item(id); QJsonObject o = g->raw.value("sym").toObject(); if (!o.contains("axis")) o.insert("axis", "x"); o.insert("on", !o.value("on").toBool()); g->raw.insert("sym", o); }, true); };
-      if (sc_->room != "topo") r.right.push_back(sy);   // (the Hair room's)
+      if (sc_->room == "hair") r.right.push_back(sy);   // (the Hair room's)
     }
   }
   if (it.type == ItemType::Surface) {
@@ -625,22 +695,29 @@ void Outliner::itemRow(OutlinerView::Row& r, const Item& it, int depth) {
     };
     r.right.push_back(pw);
   }
-  // ⛨ on an imported mesh (and on the Imported group — all its meshes): drawn curves stick to it like to the head
-  if (it.type == ItemType::IMesh || (group && rawB(it, "importGroup"))) {
-    std::vector<int> ms; if (it.type == ItemType::IMesh) ms = {id}; else for (const Item* m : ofType(*sc_, ItemType::IMesh)) if (sc_->isDescendant(m->id, id)) ms.push_back(m->id);
-    bool on = !ms.empty(); for (int m : ms) if (!rawB(*sc_->item(m), "collide")) on = false;
+  // Head Collision: ⛨ its collision on / off, 🔒 its objects picked in the viewport or not (on by default)
+  if (coll::isGroup(it)) {
     static const QPixmap collOn = ui::image("collision").scaled(16, 16, Qt::KeepAspectRatio, Qt::SmoothTransformation), collOff = grey(collOn);
+    const bool on = !rawB(it, "collOff"), lk = it.raw.value("selLock").toBool(true);
+    r.left.back().text.clear(); r.left.back().pix = collOn; r.left.back().op = 1;   // (its icon: the collision's)
     Cell cb; cb.pix = on ? collOn : collOff; cb.op = on ? 1 : 0.45;
-    cb.tip = (on ? tr("Collision ON — drawn curves stick to ") : tr("Collision OFF — click: drawn curves stick to ")) + (it.type == ItemType::IMesh ? tr("this mesh") : tr("every mesh in this group")) + tr(" like to the head and don't pass through it (also while hidden)");
-    cb.click = [this, ms, on](Qt::KeyboardModifiers) {
-      if (ms.empty()) return;
-      edit([&](Scene& s) { for (int m : ms) s.item(m)->raw.insert("collide", !on); });
-      ui::toast(tr("Collision %1: %2").arg(on ? tr("off") : tr("on")).arg(ms.size() == 1 ? sc_->item(ms[0])->name : tr("%1 meshes").arg(ms.size())));
-    };
+    cb.tip = on ? tr("Collision ON — drawn curves lie on these objects and keep off them (hidden too) · click — off") : tr("Collision OFF — the objects have no effect on the curves · click — on");
+    cb.click = [this, id, on](Qt::KeyboardModifiers) { edit([&](Scene& s) { s.item(id)->raw.insert("collOff", on); }); ui::toast(on ? tr("Head Collision: off") : tr("Head Collision: on")); };
     r.right.push_back(cb);
+    Cell lc; lc.pix = lockPixOf(lk).scaled(16, 16, Qt::KeepAspectRatio, Qt::SmoothTransformation); lc.op = lk ? 1 : 0.6;
+    lc.tip = lk ? tr("Locked — its objects are not picked in the viewport (only here) · click — unlock") : tr("Unlocked — its objects are picked in the viewport · click — lock");
+    lc.click = [this, id, lk](Qt::KeyboardModifiers) { edit([&](Scene& s) { s.item(id)->raw.insert("selLock", !lk); }); };
+    r.right.push_back(lc);
   }
-  if (it.type == ItemType::IMesh && looks::hasUV(it)) lookCells(r.right, {id}, id);
-  if (it.type == ItemType::IMesh && sc_->room == "topo" && rawB(it, "tref")) {   // (a reference: picked only here, in the outliner)
+  if (it.type == ItemType::IMesh && it.headTag) { static QPixmap cp = ui::image("collision").scaled(16, 16, Qt::KeepAspectRatio, Qt::SmoothTransformation); r.left.back().text.clear(); r.left.back().pix = cp; r.left.back().op = 0.85; }
+  if (it.type == ItemType::IMesh && looks::hasUV(it) && !it.headTag) lookCells(r.right, {id}, id);
+  if (it.type == ItemType::IMesh && sc_->room == "hair") {   // (HEAD: the mesh / collision object stays shown with Shift+H's isolation — the head's place now)
+    const bool hm = it.raw.value("headMark").toBool(it.headTag);
+    Cell hc; hc.text = "HEAD"; hc.tagBox = true; hc.w = -1; hc.tagFg = QColor(0xf0, 0xd2, 0x8c); hc.tagBorder = QColor(0x8a, 0x70, 0x3a); hc.tagBg = QColor(0x3a, 0x30, 0x1c); hc.op = hm ? 1 : 0.3;
+    hc.tip = hm ? tr("Tagged Head — it stays shown when the selection is isolated with Shift+H · click — untag") : tr("Not tagged Head · click — tag it: it stays shown when the selection is isolated with Shift+H");
+    hc.click = [this, id, hm](Qt::KeyboardModifiers) { edit([&](Scene& s) { if (Item* x = s.item(id)) x->raw.insert("headMark", !hm); }); ui::toast(hm ? tr("Head tag off") : tr("Tagged Head: kept with Shift+H")); };
+    r.right.push_back(hc); }
+  if (it.type == ItemType::IMesh && sc_->room != "hair" && rawB(it, "tref")) {   // (a reference: picked only here, in the outliner)
     Cell rf; rf.text = "REF"; rf.tagBox = true; rf.w = -1; rf.tagFg = QColor(0x9f, 0xc4, 0xff); rf.tagBorder = QColor(0x4a, 0x6a, 0x9a); rf.tagBg = QColor(0x22, 0x2c, 0x3a); rf.op = 1;
     rf.tip = tr("A reference: it can't be picked in the viewport (only here, in the outliner); its settings — Use as reference"); r.right.push_back(rf); }
   if (!it.junc) {
@@ -649,7 +726,7 @@ void Outliner::itemRow(OutlinerView::Row& r, const Item& it, int depth) {
     r.right.push_back(eye);
   }
   r.click = [this, id](Qt::KeyboardModifiers m) { vp_->selectItem(id, m & (Qt::ShiftModifier | Qt::ControlModifier)); };
-  r.drag = it.type == ItemType::Head ? 0 : 1; r.drop = it.type == ItemType::Head ? 0 : 1; r.group = group || it.type == ItemType::IMesh;   // (an object: a symmetry group goes into it)
+  r.drag = it.type == ItemType::Head || coll::isGroup(it) ? 0 : 1; r.drop = it.type == ItemType::Head ? 0 : 1; r.group = group || it.type == ItemType::IMesh;   // (an object: a symmetry group goes into it)
 }
 
 // ▦ textures on / off (double-click — the texture window), ◐ shaded / ○ flat (unlit): of a mesh with UVs, of the head's
@@ -702,9 +779,9 @@ void Outliner::walk(const std::vector<int>& ids, int depth, bool inGroup, Outlin
   std::vector<std::vector<const Item*>*> cols = js.empty() ? std::vector<std::vector<const Item*>*>{&cs, &ss} : std::vector<std::vector<const Item*>*>{&cs, &js, &ss};
   for (int id : ids) {
     const Item* it = sc_->item(id); if (!it) continue;
+    if (vp_->hairPreviewItem(id)) continue;                  // (the Topology room: the Hair room's hair is in the HairPreview folder only)
     if (it->ring >= 0 || it->type == ItemType::Cocoon || it->type == ItemType::Crown) continue;   // (the cocoons, the crowns: their own sections)
-    const bool one = sc_->room == "topo";                       // (the Topology room: one tree — everything on the left)
-    if (it->type == ItemType::IMesh && it->headTag && !one) continue;                                     // (the head's meshes: the Head row)
+    const bool one = sc_->room != "hair";                       // (the Topology room: one tree — everything on the left)
     if (it->type == ItemType::XMod && it->raw.contains("mesh") && !it->raw.value("mesh").isNull()) { const Item* m = sc_->item(it->raw.value("mesh").toInt()); if (m && m->headTag && !one) continue;
       if (one && it->raw.value("kind").toString() == "xform") continue; }   // (Topology: a mesh's Transform lives in its settings)
     if (!one && !shows(*it, side)) continue;
@@ -736,7 +813,7 @@ void Outliner::walk(const std::vector<int>& ids, int depth, bool inGroup, Outlin
         if (it->raw.value("view").toString() == "list") {
           auto* box = new QWidget; auto* h = new QHBoxLayout(box); h->setContentsMargins(10, 2, 6, 2);
           auto* bt = new QPushButton(tr("⎇ Scheme")); bt->setToolTip(tr("Show this group as a scheme")); bt->setStyleSheet("QPushButton{padding:1px 8px;font-size:11px}"); bt->setFocusPolicy(Qt::NoFocus);
-          int gid = it->id; connect(bt, &QPushButton::clicked, this, [this, gid] { if (Item* g = sc_->item(gid)) g->raw.insert("view", QJsonValue()); QTimer::singleShot(0, this, [this] { rebuild(); }); });
+          int gid = it->id; connect(bt, &QPushButton::clicked, this, [this, gid] { vp_->runEdit([gid](Scene& s, Selection&, const CurveCache&) { if (Item* g = s.item(gid)) g->raw.insert("view", QJsonValue()); return QString(); }, false); QTimer::singleShot(0, this, [this] { rebuild(); }); });
           h->addWidget(bt); h->addStretch(1); box->setFixedHeight(26);
           v->addWidget(box, depth * 14 + 6, W - 3);
         } else {
@@ -755,6 +832,8 @@ void Outliner::walk(const std::vector<int>& ids, int depth, bool inGroup, Outlin
 
 void Outliner::sections(OutlinerView* v, int W) {
   using Cell = OutlinerView::Cell;
+  // (the project's UV Sets are not listed here — the UV Editor's bar shows them, 2026-11-22)
+  if (sc_->room != "hair") return;                              // (the crowns, braids, cocoons: the Hair room's sections)
   // the crowns: their own folder, above the cocoons' section
   auto cr = ofType(*sc_, ItemType::Crown);
   v->next(6);
@@ -817,7 +896,7 @@ void Outliner::sections(OutlinerView* v, int W) {
   if (!cocoonsFolded_) cocoonRows(v, W);
 }
 
-int Outliner::paneWidth() const { return sc_->room == "topo" ? olw_ + 1 : olw_ + ccw_ + 2; }
+int Outliner::paneWidth() const { return sc_->room != "hair" ? olw_ + 1 : olw_ + ccw_ + 2; }
 
 void Outliner::toggleCocoons() { cocoonsFolded_ = !cocoonsFolded_; rebuild(); }
 
@@ -901,11 +980,11 @@ void Outliner::cocoonRows(OutlinerView* v, int W) {
       mr.flags = (vp_->isItemSelected(mid) ? OutlinerView::Sel : linkRel ? OutlinerView::Rel : 0) | (!m->visible || (m->type == ItemType::Guide && rawB(*m, "off")) ? OutlinerView::Hid : 0);
       mr.pad = 4 + (depth + 1) * 12;
       Cell a0; a0.w = 12; Cell mi; mi.op = 0.85;
-      mi.text = m->type == ItemType::Tip ? "▤" : m->type == ItemType::Even ? "☰" : m->type == ItemType::PInf ? "⇅" : m->raw.value("kind").toString() == "disc" ? "◎" : "┼";
+      mi.text = m->type == ItemType::Tip ? "▤" : m->type == ItemType::Even ? "☰" : m->type == ItemType::PInf ? "⇅" : m->type == ItemType::Spiral ? "➰" : m->raw.value("kind").toString() == "disc" ? "◎" : "┼";
       mr.left = {a0, mi};
       mr.name.text = m->name;
       mr.name.tip = (m->type == ItemType::Tip ? tr("Density — more / fewer rings where painted") : m->type == ItemType::Even ? tr("Even loops — removed, does nothing (delete it)")
-                   : m->type == ItemType::PInf ? tr("Parent influence — the parent's pull weakened (red) / added (green) where painted")
+                   : m->type == ItemType::Spiral ? tr("Spiral — the cocoon is taken for a coil where painted: its loops go by turns") : m->type == ItemType::PInf ? tr("Parent influence — the parent's pull weakened (red) / added (green) where painted")
                    : m->raw.value("kind").toString() == "disc" ? tr("NURBS disc — a ring lies on it") : tr("Guide line — a ring lies along it")) + tr("\nDouble-click or F2 — rename");
       mr.name.dbl = [this, mid](Qt::KeyboardModifiers) { startRename(mid); };
       if (!peers.empty()) {
@@ -935,13 +1014,62 @@ void Outliner::cocoonRows(OutlinerView* v, int W) {
   for (const Item* k : roots) walkK(*k, 0);
 }
 
+// the Topology room: the Hair room's hair as one folder at the very top — HairPreview — and in it its folders and lock
+// folders as they are in Hair (each marked with a lock icon). A lock folder is one object: picked, hidden, moved with the
+// gizmo, brushed (the changes are Hair's too). Nothing goes in, nothing comes out — there are no other options.
+void Outliner::hairPreviewRows(OutlinerView* v, int W) {
+  using Cell = OutlinerView::Cell;
+  if (!vp_->hairPreviewAny()) return;
+  static const QPixmap lockPix = ui::image("room_hair").scaled(16, 16, Qt::KeepAspectRatio, Qt::SmoothTransformation);
+  std::vector<int> roots;
+  for (int r : sc_->roots) if (vp_->hairPreviewItem(r)) if (const Item* it = sc_->item(r); it && it->type == ItemType::Group && !svcGroup(*it)) roots.push_back(r);
+  if (roots.empty()) return;
+  bool anyOn = false; for (int r : roots) if (sc_->item(r)->visible) anyOn = true;
+  const auto subFolders = [this](const Item& g) { std::vector<int> o; for (int c : g.children) if (const Item* x = sc_->item(c); x && x->type == ItemType::Group && !svcGroup(*x)) o.push_back(c); return o; };
+  auto& r = v->add(0, W); r.id = -9;
+  r.flags = anyOn ? 0 : OutlinerView::Hid;
+  Cell ar; ar.w = 12; ar.text = hairPreviewOpen_ ? "▾" : "▸"; ar.color = MUT; ar.op = 1;
+  ar.click = [this](Qt::KeyboardModifiers) { hairPreviewOpen_ = !hairPreviewOpen_; rebuild(); };
+  Cell ico; ico.pix = lockPix; ico.op = 1;
+  r.left = {ar, ico};
+  r.name.text = tr("HairPreview");
+  r.name.tip = tr("The Hair room's hair, not yet turned into meshes: the folders and lock folders as they are there. A lock folder is one object — pick it, hide it, move it with the gizmo, deform it with the brush; the changes are the Hair room's too. Nothing goes in or out");
+  Cell eye; eye.pix = ui::eyePix(anyOn); eye.tip = tr("Hide / show all the hair");
+  eye.click = [this, roots, anyOn](Qt::KeyboardModifiers) { edit([&](Scene& s) { for (int id : roots) { if (Item* x = s.item(id)) { x->visible = !anyOn; std::vector<int> d; descendants(s, *x, d); for (int c : d) if (Item* ci = s.item(c); ci && ci->type == ItemType::Group) ci->visible = !anyOn; } } }, true); };
+  r.right.push_back(eye);
+  r.click = [this, roots](Qt::KeyboardModifiers) { vp_->setSelectedItems({}); vp_->setSelectedItems(roots); };
+  v->next(27);
+  if (!hairPreviewOpen_) return;
+  std::function<void(int, int)> walkF = [&](int id, int depth) {
+    const Item* g = sc_->item(id); if (!g) return;
+    const std::vector<int> subs = subFolders(*g);
+    auto& row = v->add(0, W); row.id = id;
+    row.flags = (vp_->isItemSelected(id) ? OutlinerView::Sel : hl_.count(id) ? OutlinerView::ChildSel : 0) | (sc_->isVisible(*g) ? 0 : OutlinerView::Hid);
+    row.pad = 4 + (depth + 1) * 14;
+    Cell a; a.w = 12; a.text = subs.empty() ? "" : (g->expanded ? "▾" : "▸"); a.color = MUT; a.op = 1;
+    if (!subs.empty()) a.click = [this, id](Qt::KeyboardModifiers) { if (Item* x = sc_->item(id)) x->expanded = !x->expanded; rebuild(); };
+    Cell ic; ic.pix = lockPix; ic.op = 0.85;
+    row.left = {a, ic};
+    row.name.text = g->name; row.name.tip = g->name;
+    Cell ey; ey.eye = true; ey.pix = ui::eyePix(g->visible); ey.tip = tr("Hide / show (H). Shift + drag over the eyes — the same for every row passed");
+    ey.click = [this, id](Qt::KeyboardModifiers) { edit([id](Scene& s) { if (Item* x = s.item(id)) x->visible = !x->visible; }, true); };
+    row.right.push_back(ey);
+    row.click = [this, id](Qt::KeyboardModifiers m) { vp_->selectItem(id, m & (Qt::ShiftModifier | Qt::ControlModifier)); };
+    row.drag = 0; row.drop = 0; row.group = false;
+    v->next(27);
+    if (g->expanded) for (int s : subs) walkF(s, depth + 1);
+  };
+  for (int id : roots) walkF(id, 0);
+  v->next(6);
+}
+
 // ---- renderOutliner ----
 void Outliner::rebuild() {
   if (building_) return;
   building_ = true;
   vp_->setHoverCurves({});                               // (the schemes drawn anew — no leave from the old ones)
   // fixed top: the imported model, the finished hair ('Meshes'), the guides; the rest keeps its order
-  auto rank = [this](int id) { const Item* it = sc_->item(id); return it && rawB(*it, "importGroup") ? -1 : it && rawB(*it, "meshesGroup") ? 0 : it && rawB(*it, "guidesGroup") ? 1 : 2; };
+  auto rank = [this](int id) { const Item* it = sc_->item(id); return it && rawB(*it, "collGroup") ? -2 : it && rawB(*it, "importGroup") ? -1 : it && rawB(*it, "meshesGroup") ? 0 : it && rawB(*it, "guidesGroup") ? 1 : 2; };
   std::stable_sort(sc_->roots.begin(), sc_->roots.end(), [&](int a, int b) { return rank(a) < rank(b); });
   kinds_.clear(); hl_.clear(); rel_.clear();
   // groups holding something selected; related rows (the walls of a selected curve, the two curves of a selected wall)
@@ -954,13 +1082,14 @@ void Outliner::rebuild() {
     if (it->type == ItemType::Curve) for (auto& [sid, s] : sc_->items) if (s.type == ItemType::Surface && (s.a == id || s.b == id)) rel_.insert(sid);
     if (it->type == ItemType::Surface) { rel_.insert(it->a); rel_.insert(it->b); } }
   int W1 = sceneV_->width(), W2 = curvesV_->width();
-  const bool one = sc_->room == "topo";
+  const bool one = sc_->room != "hair";
   if (ccol_->isHidden() != one) { ccol_->setVisible(!one); setWidths(olw_, ccw_, false); }
   sceneV_->begin();
-  if (!one) headRow(sceneV_, W1);
+  if (one) hairPreviewRows(sceneV_, W1);
   walk(sc_->roots, 0, false, sceneV_, Side::Scene, W1);
   if (!one) sections(sceneV_, W1);
   if (one && sceneV_->y() <= 4) { auto& r = sceneV_->add(0, W1, 40); r.flags = OutlinerView::Hint; r.name.text = tr("No meshes yet — import one (+)"); sceneV_->next(40); }
+  if (sc_->room == "topo") sections(sceneV_, W1);               // (the Topology room: its UV Sets section only)
   sceneV_->finish();
   curvesV_->begin();
   walk(sc_->roots, 0, false, curvesV_, Side::Curves, W2);
@@ -975,6 +1104,7 @@ std::vector<int> Outliner::topSelected() const {
   walk(sc_->roots);
   std::vector<int> out;
   for (int id : order) {
+    if (vp_->hairPreviewItem(id)) continue;
     if (!vp_->isItemSelected(id)) continue;
     bool top = true; for (const Item* p = parentOf(*sc_, sc_->item(id)); p; p = parentOf(*sc_, p)) if (vp_->isItemSelected(p->id)) top = false;
     if (top) out.push_back(id);
@@ -983,11 +1113,34 @@ std::vector<int> Outliner::topSelected() const {
 }
 
 void Outliner::moveItems(std::vector<int> ids, int target, const QString& zone) {
+  if (vp_->hairPreviewItem(target)) { ui::toast(tr("Nothing goes into the HairPreview")); rebuild(); return; }
+  ids.erase(std::remove_if(ids.begin(), ids.end(), [this](int id) { return vp_->hairPreviewItem(id); }), ids.end());   // (and nothing comes out of it)
   ids.erase(std::remove_if(ids.begin(), ids.end(), [&](int id) { const Item* it = sc_->item(id); return id == target || !it || it->type == ItemType::Head; }), ids.end());
   if (ids.empty()) { rebuild(); return; }
   int np = -1;
   if (zone != "root") { const Item* t = sc_->item(target); if (!t) return; np = zone == "into" ? t->id : t->parent; }
   if (np >= 0) for (int id : ids) if (sc_->isDescendant(np, id)) { ui::toast(tr("Cannot put a group inside itself")); rebuild(); return; }
+  // (Head Collision keeps its place, and what is in it stays in it; a mesh dropped into it — asked: a collision object made
+  // of it, a copy (the mesh itself stays where it was), or nothing)
+  if (const int cg = coll::group(*sc_); cg >= 0) {
+    const bool to = np >= 0 && sc_->isDescendant(np, cg);
+    std::vector<int> meshes;
+    for (int id : ids) {
+      const bool from = sc_->isDescendant(id, cg);
+      if (id == cg || (from && !to)) { ui::toast(tr("Head Collision's objects stay in it")); rebuild(); return; }
+      if (to && !from) { const Item* it = sc_->item(id);
+        if (it && it->poly && (it->type == ItemType::IMesh || it->type == ItemType::Mesh)) meshes.push_back(id);
+        else { ui::toast(tr("Only meshes go into Head Collision — as collision objects made of them")); rebuild(); return; } }
+    }
+    if (!meshes.empty()) {
+      rebuild();                                                  // (the dragged rows back where they were, whatever is answered)
+      const QString what = meshes.size() == 1 ? tr("\"%1\"").arg(sc_->item(meshes[0])->name) : tr("these %1 meshes").arg(meshes.size());
+      const auto a = QMessageBox::question(this, tr("Head Collision"), tr("Create a collision object from %1?\n\nA copy goes into Head Collision; the mesh itself stays where it was.").arg(what),
+                                           QMessageBox::Yes | QMessageBox::No, QMessageBox::Yes);
+      if (a == QMessageBox::Yes) { Viewport* vp = vp_; QTimer::singleShot(0, vp, [vp, meshes] { vp->collCreateFrom(meshes); }); }
+      return;
+    }
+  }
   // (into an object: the scene's things — objects, groups (a symmetry group then mirrors about the object's gizmo); they go
   // with it when it is moved)
   if (const Item* pm = np >= 0 ? sc_->item(np) : nullptr; pm && pm->type == ItemType::IMesh)
@@ -1051,7 +1204,7 @@ std::vector<int> Outliner::followers(const std::vector<int>& ids) const {
 // group where the first of them was; their service curves and walls along. The Topology room: the meshes, in Meshes
 void Outliner::groupSelection() {
   std::vector<int> top; for (int id : topSelected()) { const Item* it = sc_->item(id);
-    if (it && it->type != ItemType::Head && !(it->type == ItemType::Group && (rawB(*it, "meshesGroup") || rawB(*it, "guidesGroup")))) top.push_back(id); }
+    if (it && it->type != ItemType::Head && !coll::inGroup(*sc_, id) && !(it->type == ItemType::Group && (rawB(*it, "meshesGroup") || rawB(*it, "guidesGroup")))) top.push_back(id); }
   if (top.empty()) { ui::toast(tr("Select what to group first (in the outliner or the viewport)")); return; }
   const QString side = sideOf(sc_->item(top[0]));
   std::vector<int> ids; for (int id : top) if (sideOf(sc_->item(id)) == side) ids.push_back(id);
@@ -1059,7 +1212,7 @@ void Outliner::groupSelection() {
   int par = sc_->item(ids[0])->parent;
   for (int id : ids) if (sc_->item(id)->parent != par) { par = -1; break; }
   if (par >= 0 && sideOf(sc_->item(par)) != side) par = -1;
-  const bool topo = sc_->room == "topo";
+  const bool topo = sc_->room != "hair";
   int gid = -1; const int first = ids[0];
   edit([&](Scene& s) {
     if (par < 0 && topo) par = meshesGroup(s);
@@ -1127,7 +1280,7 @@ bool Outliner::unlinkCocoon(int from, int to) {
 }
 
 void Outliner::parentSelection() {
-  std::vector<int> order; for (int id : vp_->selection().items) if (sc_->item(id)) order.push_back(id);
+  std::vector<int> order; for (int id : vp_->selection().items) if (sc_->item(id) && !vp_->hairPreviewItem(id)) order.push_back(id);
   if (order.size() < 2) { ui::toast(tr("Select the objects, then the new parent (a group or a cocoon) last")); return; }
   const Item* target = sc_->item(order.back());
   std::vector<int> rest(order.begin(), order.end() - 1);

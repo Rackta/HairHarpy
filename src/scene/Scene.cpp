@@ -16,6 +16,7 @@ const TypeInfo TYPES[] = {
   {"shell", ItemType::Shell, "Proxy shell", "◎"}, {"even", ItemType::Even, "Even loops", "≡"},
   {"pinf", ItemType::PInf, "Parent influence", "⇅"}, {"cocoon", ItemType::Cocoon, "Cocoon", "◍"},
   {"head", ItemType::Head, "Head", "☺"},         {"braid", ItemType::Braid, "Braid", "⌇"},
+  {"spiral", ItemType::Spiral, "Spiral", "➰"},
 };
 }  // namespace
 
@@ -38,7 +39,7 @@ QString itemTypeIcon(ItemType t) {
 
 void Scene::clear() {
   items.clear(); anchors.clear(); roots.clear(); fileRaw = {}; camera = {}; curvesAt.clear(); path.clear(); revision++;
-  refPlanes.clear(); refBoard = {}; nextRefId = 1;
+  refPlanes.clear(); refBoard = {}; nextRefId = 1; refSketches.clear(); nextCanvasId = 1; refMarkers.clear(); nextMarkerId = 1; refMarkersShown = true; refMarkRev++;
 }
 
 const std::vector<int>& Scene::childrenOf(int parentId) const {
@@ -51,14 +52,27 @@ const std::vector<int>& Scene::childrenOf(int parentId) const {
 // isolation: everything but the kept items (and optionally the head) hidden; a group's isolation keeps all inside it
 bool Scene::isoKept(const Item& it) const {
   if (!iso || it.type == ItemType::Group) return true;
-  if (it.type == ItemType::Head || (it.type == ItemType::IMesh && it.headTag && room == "hair")) return iso->head;
+  if (it.type == ItemType::Head) return iso->head;
+  // (the Hair room: a mesh or a collision object tagged Head in the outliner stays with an isolation + head — Shift+H; 19.11, there is
+  //  no head item any more, the tag stands for it. A collision object counts as tagged until the tag is switched off)
+  if (iso->head && it.type == ItemType::IMesh && room == "hair" && it.raw.value(QLatin1String("headMark")).toBool(it.headTag)) return true;
   return iso->keep.count(it.id) || (iso->group >= 0 && isDescendant(it.id, iso->group));
 }
 
+// the Paint room: an object marked NoPainted (itself or its folder) is not there at all; one hidden there (pHid — the room's own
+// eye, the other rooms don't see it) is not shown
 bool Scene::isVisible(const Item& it) const {
+  if (!isVisibleBase(it)) return false;
+  if (room == QLatin1String("paint")) for (const Item* p = &it; p; p = p->parent >= 0 ? item(p->parent) : nullptr) if (p->raw.value(QLatin1String("pHid")).toBool()) return false;
+  return true;
+}
+bool Scene::noPaint(const Item& it) const {
+  for (const Item* p = &it; p; p = p->parent >= 0 ? item(p->parent) : nullptr) if (p->raw.value(QLatin1String("noPaint")).toBool()) return true;
+  return false;
+}
+bool Scene::isVisibleBase(const Item& it) const {
   if (!isoKept(it)) return false;
-  // (a mesh of the head: its own eye only — its folder isn't listed in the Hair room; the Head row shows / hides it)
-  if (it.type == ItemType::IMesh && it.headTag && room == "hair") return it.visible;
+  if (room == QLatin1String("paint") && noPaint(it)) return false;
   for (const Item* p = &it; p; p = p->parent >= 0 ? item(p->parent) : nullptr) if (!p->visible) return false;
   return true;
 }
@@ -71,7 +85,7 @@ bool Scene::isDescendant(int id, int ancestor) const {
 QString Scene::tintOf(const Item& it) const {
   QString c;
   for (const Item* p = it.parent >= 0 ? item(it.parent) : nullptr; p; p = p->parent >= 0 ? item(p->parent) : nullptr) {
-    bool service = p->raw.value("guidesGroup").toBool() || p->raw.value("meshesGroup").toBool() || p->raw.value("importGroup").toBool();
+    bool service = p->raw.value("guidesGroup").toBool() || p->raw.value("meshesGroup").toBool() || p->raw.value("importGroup").toBool() || p->raw.value("collGroup").toBool();
     if (!p->color.isEmpty() && !service) c = p->color;
   }
   return c;
@@ -115,11 +129,25 @@ void Scene::removeFromParent(int id) {
 }
 
 void Scene::reindex() {
+  // (the Head Collision group's objects: headTag — what the collision, the crown and the scale go by; none in the other rooms)
+  int cg = -1; for (int r : roots) if (const Item* g = item(r); g && g->type == ItemType::Group && g->raw.value(QLatin1String("collGroup")).toBool()) { cg = r; break; }
+  for (auto& [id, it] : items) it.headTag = cg >= 0 && it.poly && (it.type == ItemType::IMesh || it.type == ItemType::Mesh) && isDescendant(id, cg);
   curvesAt.clear();
   for (const Item* c : curves()) for (int a : c->anchors) {
     auto& v = curvesAt[a];
     if (v.empty() || v.back() != c->id) v.push_back(c->id);   // (in file order, once per curve)
   }
+}
+
+void plainMesh(Item& it) {
+  if (it.type != ItemType::Mesh || it.raw.value("pending").toBool()) return;
+  it.type = ItemType::IMesh; it.typeStr = QStringLiteral("imesh");
+  if (it.poly) {
+    if (it.poly->groupNames.empty() || it.poly->faceGroup.size() != size_t(it.poly->faceCount())) { auto p = std::make_shared<PolyMesh>(*it.poly); p->groupNames = {it.name}; p->faceGroup.assign(size_t(p->faceCount()), 0); it.poly = p; }
+    it.base = it.poly;
+  }
+  it.raw.remove("data"); it.raw.remove("pending");
+  it.raw.insert("src", QJsonObject{{"ext", "pmesh"}, {"live", true}});
 }
 
 }  // namespace hm

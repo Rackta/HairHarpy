@@ -34,7 +34,14 @@ void Viewport::runEdit(const std::function<QString(Scene&, Selection&, const Cur
 // a mesh's collision (raw coll { type, d, mesh }): its own geometry lifted by d (the default, 2 mm), a capsule round it
 // (lifted by d too) or another mesh standing for it (a low proxy, hidden or not). The head collides while shown, a mesh
 // with ⛨ on even hidden
-double Viewport::collOffset(const Item& it) { const QJsonObject c = it.raw.value("coll").toObject(); return std::max(0.0, c.value("d").toDouble(0.2)); }
+// (not set: 2 mm in a scene in centimetres, but never over 1 % of the object's size — 20.11: a new project's PolySphere / Head
+// is 1 unit across, and 0.2 put the curves a fifth of the head off it: the collision bigger than the shown object)
+double Viewport::collOffset(const Item& it) {
+  const QJsonObject c = it.raw.value("coll").toObject();
+  if (c.contains("d")) return std::max(0.0, c.value("d").toDouble(0.2));
+  double big = 0; if (it.poly) { const Vec3 s = it.poly->bounds().size(); big = std::max({s.x, s.y, s.z}); }
+  return big > 0 ? std::min(0.2, big * 0.01) : 0.2;
+}
 QString Viewport::collType(const Item& it) { const QString t = it.raw.value("coll").toObject().value("type").toString("offset"); return t == "capsule" || t == "custom" ? t : QString("offset"); }
 
 // a capsule round the mesh: along its longest spread (the points' main axis), round enough to hold every point; kept
@@ -114,33 +121,24 @@ int Viewport::makeCapsuleItem(int owner, bool refit) {
   return cap;
 }
 
-// the collision shapes: the head's (while shown) and those of the meshes with ⛨ on — each as its type says; off: the lift
-// off each one (by the mesh the shape stands for)
+// the collision shapes: the objects of Head Collision (hidden too) while its collision is on; off: the lift off each one.
+// (withHead false — the straight way between two drawn points: no shapes, as the head never added points there)
 std::vector<PickMesh> Viewport::collisionMeshes(bool withHead, std::map<int, double>& off) const {
   std::vector<PickMesh> list;
+  if (!withHead || room() != "hair" || !coll::active(*scene_)) return list;
   for (auto& [id, it] : scene_->items) {
-    if (!it.poly) continue;
-    const bool head = (it.headTag || it.type == ItemType::Head) && scene_->isVisible(it), collide = it.raw.value("collide").toBool();
-    if (!(withHead && head) && !collide) continue;
-    const QString type = collType(it); off[id] = collOffset(it);
+    if (!it.poly || !it.headTag) continue;
+    off[id] = collOffset(it);
     PickMesh pm; pm.itemId = id;
-    if (type == "capsule") {
-      if (const int cap = capsuleItem(id); cap >= 0) {               // (placed by hand: where the gizmo put it)
-        auto& w = capWorld_[cap]; w = capsuleWorld(cap); const PolyMesh& cp = *scene_->item(cap)->poly; pm.pos = &w;
-        for (int f = 0; f < cp.faceCount(); f++) { int s0 = cp.faceStart[f], e0 = cp.faceStart[f + 1]; for (int k = s0 + 1; k < e0 - 1; k++) { pm.tris.push_back(uint32_t(cp.faceVerts[s0])); pm.tris.push_back(uint32_t(cp.faceVerts[k])); pm.tris.push_back(uint32_t(cp.faceVerts[k + 1])); } }
-        for (auto& q : w) pm.box.expand(q); list.push_back(std::move(pm)); continue; }
-      const CapMesh& C = capsuleOf(id); if (C.pos.empty()) continue; pm.pos = &C.pos; pm.trisRef = &C.tris; pm.box = C.bx; list.push_back(std::move(pm)); continue; }
-    const Item* src = &it;
-    if (type == "custom") { const Item* o = scene_->item(it.raw.value("coll").toObject().value("mesh").toInt(-1)); if (o && o->poly && o != &it) src = o; }
-    const PolyMesh& p = *src->poly; pm.pos = &p.pos; pm.box = p.bounds();
+    const PolyMesh& p = *it.poly; pm.pos = &p.pos; pm.box = p.bounds();
     for (int f = 0; f < p.faceCount(); f++) { int s = p.faceStart[f], e = p.faceStart[f + 1]; for (int k = s + 1; k < e - 1; k++) { pm.tris.push_back(uint32_t(p.faceVerts[s])); pm.tris.push_back(uint32_t(p.faceVerts[k])); pm.tris.push_back(uint32_t(p.faceVerts[k + 1])); } }
     list.push_back(std::move(pm));
   }
   return list;
 }
 
-// a point on the head (or on an imported mesh with Collision on — even hidden), lifted off its collision shape toward
-// the side the ray came from; else on the plane facing the camera through the last point (the pivot)
+// a point on a Head Collision object (even hidden), lifted off it toward the side the ray came from; else on the plane
+// facing the camera through the last point (the pivot)
 std::optional<Vec3> Viewport::placePoint(const QPointF& m) const {
   std::map<int, double> off; const auto list = collisionMeshes(true, off);
   Ray r = ray(m);
@@ -183,13 +181,22 @@ void Viewport::addDrawPoint(const QPointF& m) {
       c->raw.insert("rib", rb); c->hasRib = true;
     }
   }
+  const size_t first = c->anchors.size();
   if (!c->anchors.empty()) for (const Vec3& q : collideBetween(scene_->anchor(c->anchors.back())->pos, *p)) c->anchors.push_back(scene_->addAnchor(q).id);
   Anchor& a = scene_->addAnchor(*p); c->anchors.push_back(a.id);
+  // Snap on: the new points onto the reference meshes too, not only the dragged ones (placePoint lifts them off what the ray hits)
+  if (hairSnap && room() == "hair") snapAnchors(std::vector<int>(c->anchors.begin() + long(first), c->anchors.end()));
   // a flat lock: the width — the circle's radius at that place (started from anchors: the root's width)
   if (rib::isRib(*c)) {
     QJsonObject rb = c->raw.value("rib").toObject(), k = rb.value("k").toObject(); auto e = rib::ribEnds(*scene_, *c);
     double w = 0; if (!e.empty()) { auto d = rib::trunkDir(*scene_, e); w = rib::ribRoot(*scene_, e, d ? d : std::optional<Vec3>(camDir())).w0; } else w = ribR * worldPerPixelAt(*p);
-    k.insert(QString::number(a.id), QJsonObject{{"w", w}, {"r", 0}}); rb.insert("k", k); c->raw.insert("rib", rb);
+    k.insert(QString::number(a.id), QJsonObject{{"w", w}, {"r", 0}});
+    // (its first point placed against the way its root was given — the curves it starts from bend up there: the root turned the
+    // other way, so the lock leaves toward its point with no kink; the Flat lock's ⤴ Root direction changes it — 20.11)
+    if (!e.empty() && first == 1 && !rb.contains("rootDir")) if (auto f = c->ovr.find(c->anchors[0]); f != c->ovr.end() && f->second.out) {
+      const Vec3 to = a.pos - scene_->anchor(c->anchors[0])->pos;
+      if (f->second.out->dot(to) < 0) { f->second.out = *f->second.out * -1.0; rb.insert("rootDir", "flip"); } }
+    rb.insert("k", k); c->raw.insert("rib", rb);
   }
   scene_->reindex(); scene_->revision++;
   pendingCurves_.insert(c->id); onSelChange(); requestUpdate();
@@ -212,7 +219,7 @@ void Viewport::finishDrawing() {
 
 std::optional<Vec3> Viewport::liftOffHead(const Vec3& mid, double span) const {
   std::vector<PickMesh> list; Box3 hb;
-  for (auto& [id, it] : scene_->items) if (it.headTag && it.poly && scene_->isVisible(it)) {
+  if (coll::active(*scene_)) for (auto& [id, it] : scene_->items) if (it.headTag && it.poly) {
     PickMesh pm; pm.itemId = id; pm.pos = &it.poly->pos; const auto& p = *it.poly;
     for (int f = 0; f < p.faceCount(); f++) { int s = p.faceStart[size_t(f)], e = p.faceStart[size_t(f + 1)]; for (int k = s + 1; k < e - 1; k++) { pm.tris.push_back(uint32_t(p.faceVerts[size_t(s)])); pm.tris.push_back(uint32_t(p.faceVerts[size_t(k)])); pm.tris.push_back(uint32_t(p.faceVerts[size_t(k + 1)])); } }
     pm.box = p.bounds(); hb.unite(pm.box); list.push_back(std::move(pm));
@@ -231,6 +238,7 @@ bool Viewport::escape() {
   if (drawing_ >= 0) { finishDrawing(); setTool("cursor"); return true; }
   if (tool_ == "draw") { setTool("cursor"); return true; }
   if (tool_ == "edge" && !edges.list.empty()) { clearEdges(); return true; }
+  if (!spots_.empty() && !wfix_) { clearWeldSpots(); return true; }   // (Check connections' pins: gone — no auto-fix under review)
   return false;
 }
 
@@ -242,6 +250,9 @@ void Viewport::deleteSelected() {
   }
   if (!sel_.anchors.empty()) { deleteAnchors(sel_.anchors, false); return; }
   if (sel_.items.empty()) return;
+  if (const int cg = coll::group(*scene_); cg >= 0 && sel_.hasItem(cg)) {   // (Head Collision itself stays — its objects may go)
+    sel_.items.erase(std::remove(sel_.items.begin(), sel_.items.end(), cg), sel_.items.end());
+    if (sel_.items.empty()) { ui::toast(tr("Head Collision stays — select its objects to delete them")); onSelChange(); return; } }
   edit::deleteItems(*scene_, hair_.curves, sel_);
   if (drawing_ >= 0 && !scene_->item(drawing_)) drawing_ = -1;
   afterEdit(true);
@@ -322,7 +333,12 @@ int Viewport::workingGroup() const {
 
 void Viewport::toggleIsolate(bool withHead) {
   if (soloOff()) return;
-  if (scene_->iso && !scene_->iso->solo) { scene_->iso.reset(); sceneChanged(false); emit sceneEdited(); return; }
+  // (the same key again — everything back; the other one (Ctrl+H ↔ Shift+H) — the isolation switches over: the HEAD meshes added /
+  // left out, the kept items as they are — 20.11, the author: "why do Ctrl+H and Shift+H work the same?")
+  if (scene_->iso && !scene_->iso->solo) {
+    if (scene_->iso->group < 0 && scene_->iso->head != withHead) { scene_->iso->head = withHead; sceneChanged(false); emit sceneEdited();
+      ui::toast(withHead ? tr("Isolated + the meshes tagged HEAD") : tr("Isolated — the HEAD meshes left out")); if (withHead) warnNoHead(); return; }
+    scene_->iso.reset(); sceneChanged(false); emit sceneEdited(); return; }
   Scene::Isolation iso; iso.head = withHead;
   std::function<void(int)> add = [&](int id) {
     const Item* it = scene_->item(id); if (!it || iso.keep.count(id)) return; iso.keep.insert(id);
@@ -337,6 +353,15 @@ void Viewport::toggleIsolate(bool withHead) {
   for (int a : sel_.anchors) for (int c : edit::curvesWith(*scene_, a)) add(c);
   if (iso.keep.empty()) { ui::toast(tr("Select something to isolate")); return; }
   scene_->iso = iso; sceneChanged(false); emit sceneEdited();
+  if (withHead) warnNoHead();
+}
+
+// (Shift+H keeps the meshes tagged HEAD — none of them shown: it works as Ctrl+H; said so, and where the tag is)
+void Viewport::warnNoHead() {
+  for (const auto& [id, it] : scene_->items) if (it.type == ItemType::IMesh && it.visible && it.raw.value("headMark").toBool(it.headTag)) {
+    bool shown = true; for (const Item* p = scene_->item(it.parent); p; p = scene_->item(p->parent)) if (!p->visible) shown = false;
+    if (shown) return; }
+  ui::toast(tr("No shown mesh is tagged HEAD, so Shift+H keeps only the selection — tag the model's meshes with HEAD in the outliner"));
 }
 
 void Viewport::toggleIsolateGroup() {
@@ -345,7 +370,7 @@ void Viewport::toggleIsolateGroup() {
   int g = workingGroup(); if (g < 0) { ui::toast(tr("Select something inside a group (or the group itself)")); return; }
   Scene::Isolation iso; iso.group = g; scene_->iso = iso;
   sceneChanged(false); emit sceneEdited();
-  ui::toast(tr("Only \"%1\" is shown — Ctrl+Shift+H again to show everything").arg(scene_->item(g)->name));
+  ui::toast(tr("Only \"%1\" is shown — Ctrl+Shift+H again or Ctrl+X: everything").arg(scene_->item(g)->name));
 }
 
 // ---- ◎ Solo: the group you work in is the only one shown; select something in another group — it switches to that one;

@@ -19,12 +19,22 @@ namespace {
 const CurveSampling* smp(const CurveCache& cc, int id) { auto it = cc.find(id); return it == cc.end() || it->second.p.size() < 2 ? nullptr : &it->second; }
 std::vector<PickMesh> headMeshes(const Scene& sc) {
   std::vector<PickMesh> out;
-  for (auto& [id, it] : sc.items) if (it.headTag && it.poly && sc.isVisible(it)) {
+  for (auto& [id, it] : sc.items) if (it.headTag && it.poly) {   // (Head Collision's objects — hidden too)
     PickMesh pm; pm.itemId = id; pm.pos = &it.poly->pos; pm.box = it.poly->bounds();
     for (int f = 0; f < it.poly->faceCount(); f++) { int s = it.poly->faceStart[f], e = it.poly->faceStart[f + 1]; for (int q = s + 1; q < e - 1; q++) { pm.tris.push_back(it.poly->faceVerts[s]); pm.tris.push_back(it.poly->faceVerts[q]); pm.tris.push_back(it.poly->faceVerts[q + 1]); } }
     out.push_back(std::move(pm));
   }
   return out;
+}
+// Head Collision's middle and size — what the crown is fitted on (the head objects are gone: the scene's own middle and size
+// take in every imported mesh — a body, a scene — and a symmetric crown was mirrored about the model's middle, not the head's)
+std::pair<Vec3, double> collFrame(const Scene& sc, const Vec3& cen0, double scale0) {
+  // (kept by the scene's revision: asked at every frame a symmetric crown is kept in step, a sculpted head has ~10⁶ points)
+  static const Scene* lastSc = nullptr; static int lastRev = -1; static Box3 lastB;
+  if (lastSc != &sc || lastRev != sc.revision) { lastB = Box3(); for (auto& [id, it] : sc.items) if (it.headTag && it.poly) for (const Vec3& p : it.poly->pos) lastB.expand(p); lastSc = &sc; lastRev = sc.revision; }
+  const Box3& b = lastB;
+  if (b.empty()) return {cen0, scale0};
+  return {b.center(), std::max(b.size().length(), 1e-9)};
 }
 }  // namespace
 
@@ -32,7 +42,7 @@ crown::HeadHit Viewport::headHitFn() const {
   // (through each head's BVH — the crown and its continuation cast thousands of rays: one by one over a sculpted head's
   // ~900 000 triangles that was minutes)
   auto bvhs = std::make_shared<std::vector<std::shared_ptr<const topo::Bvh>>>();
-  for (auto& [id, it] : scene_->items) if (it.headTag && it.poly && scene_->isVisible(it)) if (auto b = bvhOf(id, false)) bvhs->push_back(b);
+  for (auto& [id, it] : scene_->items) if (it.headTag && it.poly) if (auto b = bvhOf(id, false)) bvhs->push_back(b);
   double far = cam_.sceneScale * 20;
   auto cast = [bvhs](const Vec3& o, const Vec3& n) -> std::optional<Vec3> {
     double bt = 1e300; for (const auto& b : *bvhs) if (auto h = b->ray(o, n, bt)) bt = h->first;
@@ -47,22 +57,17 @@ crown::HeadHit Viewport::headHitFn() const {
 }
 
 void Viewport::createCrownAt(const std::optional<QPointF>& m) {
-  // (no mesh marked as the head: the crown would be fitted round the whole model — a body, a scene — far too big)
-  bool head = false; for (auto& [id, it] : scene_->items) if ((it.headTag || it.type == ItemType::Head) && it.poly) head = true;
-  if (!head) { ui::toast(tr("Mark the head first: select the head mesh — ☺ Head in its settings. The crown is fitted on the head")); return; }
+  // (nothing in Head Collision: the crown would be fitted round the whole model — a body, a scene — far too big)
+  bool head = false; for (auto& [id, it] : scene_->items) if (it.headTag && it.poly) head = true;
+  if (!head) { ui::toast(tr("Head Collision is empty: the crown is fitted on its objects — add one there first")); return; }
   std::optional<Vec3> target, normal;
   if (m) {
     auto hm = headMeshes(*scene_); auto h = hm.empty() ? std::nullopt : raycast(ray(*m), hm);
     if (!h) { ui::toast(tr("Click on the head (or press Create in the panel)")); return; }
     target = h->point; normal = h->normal;
   }
-  auto hit = headHitFn(); Vec3 cen = cam_.sceneCenter; double scale = cam_.sceneScale; bool sym = crownSym, bangs = crownBangs;
-  // (the head's collision a capsule — placed by hand or fitted: the crown from its top)
-  std::vector<Vec3> coll;
-  for (auto& [id, it] : scene_->items) if ((it.headTag || it.type == ItemType::Head) && it.poly && scene_->isVisible(it) && collType(it) == "capsule") {
-    if (const int cap = capsuleItem(id); cap >= 0) coll = capsuleWorld(cap); else coll = capsuleOf(id).pos;
-    if (!coll.empty()) break;
-  }
+  auto hit = headHitFn(); const auto cf = collFrame(*scene_, cam_.sceneCenter, cam_.sceneScale); const Vec3 cen = cf.first; const double scale = cf.second; bool sym = crownSym, bangs = crownBangs;
+  std::vector<Vec3> coll;                                       // (no capsule any more: the crown from the collision objects themselves)
   int made = -1;
   ui::ThinkScope th(crownCont ? tr("Making the crown and its continuation — fitted on the head") : tr("Making the crown — fitted on the head"), 0); th.now();   // (on a heavy head — seconds)
   runEdit([&](Scene& s, Selection& sl, const CurveCache&) { QString msg; made = crown::createCrown(s, target, normal, hit, cen, scale, sym, sl, &msg, coll.empty() ? nullptr : &coll, bangs); return msg; }, true);
@@ -78,7 +83,7 @@ void Viewport::crownContinue(int k) {
 
 void Viewport::crownSymAsk(int k, const QPoint& global) {
   ui::PieSpec s; s.title = tr("Make the crown symmetric");
-  double cx = cam_.sceneCenter.x, scale = cam_.sceneScale;
+  const auto cf = collFrame(*scene_, cam_.sceneCenter, cam_.sceneScale); const double cx = cf.first.x, scale = cf.second;
   for (int master : {1, -1}) {
     ui::PieItem it; it.label = master > 0 ? tr("⇋ Left (+X) → Right (−X)") : tr("⇋ Right (−X) → Left (+X)");
     it.act = [this, k, master, cx, scale] { runEdit([&](Scene& sc, Selection& sl, const CurveCache& cc) { CurveCache c2 = cc; return crown::makeSymmetric(sc, c2, k, master, cx, scale, &sl); }, true); };
@@ -124,7 +129,7 @@ void Viewport::crownFrame() {
     bool any = false; for (auto& [id, a] : scene_->anchors) if (a.raw.value("at").isObject()) { any = true; break; }
     if (!any) return;
   }
-  auto m1 = crown::symSync(*scene_, crownSymLast_, cam_.sceneCenter.x);
+  auto m1 = crown::symSync(*scene_, crownSymLast_, collFrame(*scene_, cam_.sceneCenter, cam_.sceneScale).first.x);   // (mirrored about the head's middle)
   if (!m1.empty()) { auto t = curvesTouching(*scene_, m1); pendingCurves_.insert(t.begin(), t.end()); }
   QString msg;
   auto m2 = crown::updateAttachments(*scene_, hair_.curves, attLast_, cam_.sceneScale, &msg);
@@ -205,7 +210,12 @@ QString Viewport::autoAttachEnds(int curve) {
       if (auto h = nearestOnScreen(P, S->p, s.x, s.y); h && h->d < bd) { bd = h->d; bestC = k->id; }
     }
     if (bestA >= 0 && bestA != a && std::find(c->anchors.begin(), c->anchors.end(), bestA) == c->anchors.end()) {   // (on a connector's anchor: that one shared)
-      (end ? c->anchors.back() : c->anchors.front()) = bestA; scene_->anchors.erase(a); n++; continue; }
+      (end ? c->anchors.back() : c->anchors.front()) = bestA;
+      // (what the curve kept at the end's anchor — its handle, a flat lock's width / turn there — goes with it to the shared one)
+      if (auto o = c->ovr.find(a); o != c->ovr.end()) { const HandleOverride h = o->second; c->ovr.erase(a); if (!c->ovr.count(bestA)) c->ovr[bestA] = h; }
+      if (c->raw.value("rib").isObject()) { QJsonObject rb = c->raw.value("rib").toObject(), k = rb.value("k").toObject(); const QString ka = QString::number(a), kb = QString::number(bestA);
+        if (k.contains(ka)) { if (!k.contains(kb)) k.insert(kb, k.value(ka)); k.remove(ka); rb.insert("k", k); c->raw.insert("rib", rb); } }
+      scene_->anchors.erase(a); n++; continue; }
     if (bestC >= 0) { crown::connectToConnector(*scene_, hair_.curves, a, bestC); n++; }
   }
   if (!n) return {};

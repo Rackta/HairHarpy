@@ -168,11 +168,12 @@ public:
     // ＋ New project: the room it starts in — the band across the top
     auto* rooms = new QFrame; rooms->setObjectName("frooms"); auto* rv = new QVBoxLayout(rooms); rv->setContentsMargins(12, 40, 12, 18); rv->setSpacing(2); v->addWidget(rooms); band_ = rooms;
     auto* t = new QLabel(QObject::tr("New project — choose the room to start in")); t->setAlignment(Qt::AlignCenter); t->setStyleSheet("color:#e0e0e0;font-size:14px;font-weight:600"); rv->addWidget(t);
-    auto* st = new QLabel(QObject::tr("Both rooms are in every project — switch between them any time from the top bar")); st->setAlignment(Qt::AlignCenter); st->setStyleSheet("color:#8a8a8a;font-size:11px"); rv->addWidget(st);
+    auto* st = new QLabel(QObject::tr("All rooms are in every project — switch between them any time from the top bar")); st->setAlignment(Qt::AlignCenter); st->setStyleSheet("color:#8a8a8a;font-size:11px"); rv->addWidget(st);
     auto* row = new QHBoxLayout; row->setSpacing(24); row->addStretch(1); rv->addSpacing(6); rv->addLayout(row);
     auto pick = [this](const QString& room) { return [this, room] { if (host_.newProject) host_.newProject(room); }; };
     row->addWidget(new RoomTile(":/img/room_hair.png", QObject::tr("Hair Room"), QObject::tr("Curves, walls, cocoons and crowns — stylized hair built over the head and converted to geometry"), pick("hair")));
     row->addWidget(new RoomTile(":/img/room_topo.png", QObject::tr("Topology Room"), QObject::tr("Meshes: retopology over a high-poly model, vertex normals, topology clean-up, UV"), pick("topo")));
+    row->addWidget(new RoomTile(":/img/room_paint.png", QObject::tr("Paint Room"), QObject::tr("Hand-painting flow maps, normal maps and more. Using AI generators."), pick("paint")));
     row->addStretch(1);
     auto* x = new QPushButton("✕", rooms); x->setObjectName("fclose"); x->setFixedSize(30, 30); x->setCursor(Qt::PointingHandCursor); x->setToolTip(QObject::tr("Close (Esc)"));
     QObject::connect(x, &QPushButton::clicked, this, [this] { close(); }); closeBtn_ = x;
@@ -190,8 +191,13 @@ public:
     scroll_ = new QScrollArea; scroll_->setObjectName("fscroll"); scroll_->setWidgetResizable(true); scroll_->setFrameShape(QFrame::NoFrame); v->addSpacing(14);
     auto* sw = new QHBoxLayout; sw->setContentsMargins(10, 0, 10, 0); sw->addWidget(scroll_); v->addLayout(sw, 1);
     if (parent) parent->installEventFilter(this);
+    // (the start: the main window is maximised / laid out late — it may stall — so whatever events came or not, the page is brought to its inside every 100 ms while it is up)
+    { auto* tm = new QTimer(this); tm->setInterval(100); QObject::connect(tm, &QTimer::timeout, this, [this] { if (!isVisible()) return; QWidget* p = parentWidget(); if (!p) return;
+        const QRect r(p->mapToGlobal(QPoint(0, 0)), p->size()); if (geometry() != r) fit(); }); tm->start(); }
   }
-  void show(const QString& tab) { if (!tab.isEmpty() && tab != "new") tab_ = tab; build(); fit(); QDialog::show(); raise(); activateWindow(); }
+  void show(const QString& tab) { if (!tab.isEmpty() && tab != "new") tab_ = tab; build(); fit(); QDialog::show(); raise(); activateWindow();
+    // (at the start the main window is still being maximised / laid out: fit again once it has settled)
+    for (int ms : {0, 150, 500, 1500}) QTimer::singleShot(ms, this, [this] { if (isVisible()) fit(); }); }
   // (over the main window's inside, wherever it is)
   void fit() { QWidget* p = parentWidget(); if (!p) { resize(1200, 860); return; }
     const QRect r(p->mapToGlobal(QPoint(0, 0)), p->size()); setGeometry(r); if (closeBtn_) closeBtn_->move(r.width() - 40, 8); }
@@ -258,10 +264,11 @@ public:
     } else if (tab_ == "autosave") {
       auto* b = bar(); auto* s = new QPushButton(QObject::tr("⏱ Autosave settings…")); QObject::connect(s, &QPushButton::clicked, this, [this] { if (host_.autosaveSettings) host_.autosaveSettings(); render(); }); b->addWidget(s);
       AutosaveSettings a = autosaveSettings();
-      b->addWidget(fhint(QObject::tr("The newest 5 copies in \"%1\". Opening one doesn't change it — save the project to keep it.").arg(a.dir)), 1);
+      b->addWidget(fhint(QObject::tr("Every copy in \"%1\", the newest first. Opening one doesn't change it — save the project to keep it.").arg(a.dir)), 1);
       QFileInfoList fl = QDir(a.dir).entryInfoList({"*_autosave_*.hairmesh", "*_autosave_*.json"}, QDir::Files, QDir::Time);
       if (fl.isEmpty()) v->addWidget(fhint(QObject::tr("No autosaves in the folder yet.")));
-      else { auto* g = grid(); for (int i = 0; i < std::min<int>(5, int(fl.size())); i++) { QString p = fl[i].absoluteFilePath(), n = fl[i].fileName();
+      else { auto* g = grid(); for (int i = 0; i < int(fl.size()); i++) {   // (all of them: the copies kept on purpose, of every project — the page scrolls)
+          QString p = fl[i].absoluteFilePath(), n = fl[i].fileName();
           put(g, card(fileThumb(p), n, fmtTime(fl[i].lastModified().toMSecsSinceEpoch()), [this, p, n] {
             QString name = QString(n).remove(QRegularExpression("_autosave_\\d+\\.(hairmesh|json)$", QRegularExpression::CaseInsensitiveOption)) + ".hairmesh";
             if (host_.openCopy && host_.openCopy(p, name, true)) { close(); ui::toast(QObject::tr("Opened the autosave %1 — save it to keep it").arg(n)); } })); } }

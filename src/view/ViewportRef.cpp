@@ -57,9 +57,19 @@ bool Viewport::refPress(const QPointF& m) {
 void Viewport::refMove(const QPointF& m) {
   if (!refCube) return;
   auto h = planeHit(ray(m), rd_.p0, rd_.n); if (!h) return;
-  if (drag_ == Drag::RefTop) { refCube->height = std::max(refCube->size * 0.02, rd_.h0 + h->y - rd_.p0.y); ui::hud(tr("Loop step: %1").arg(fmtLen(refCube->height))); emit brushChanged(); }
+  if (drag_ == Drag::RefTop) { refCube->height = std::max(refCube->size * 0.02, rd_.h0 + h->y - rd_.p0.y); ui::hud(tr("Loop step: %1").arg(fmtLen(refCube->height))); emit brushChanged(); refApplyStep(false); }
   else if (rd_.hit0) refCube->base = rd_.start + (*h - *rd_.hit0);
   overlayRev_++; requestUpdate();
+}
+
+// the cube's height is the loop step while it is dragged — the loops follow live (at most every 60 ms: a heavy head of hair
+// rebuilds its cocoons each time); final: the last height applied and the drag made one undo step
+void Viewport::refApplyStep(bool final) {
+  if (!refCube) return;
+  if (final) { refStepPending_ = false; setConv("step", refCube->height, true); return; }
+  if (refStepPending_) return;
+  refStepPending_ = true;
+  QTimer::singleShot(60, this, [this] { if (!refStepPending_) return; refStepPending_ = false; if (refCube) setConv("step", refCube->height, false); });
 }
 
 double Viewport::pickWorld(const QPointF& m) const {

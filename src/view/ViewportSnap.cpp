@@ -6,6 +6,7 @@
 #include "scene/MeshMods.h"
 #include "view/SceneGeometry.h"
 #include "view/Viewport.h"
+#include "ui/Pie.h"
 #include <QSettings>
 #include <cmath>
 #include <map>
@@ -26,19 +27,37 @@ void Viewport::setViewGrid(const QString& view, const ViewGrid& g) {
   const QString k = gridKey(view); gridsCache()[k] = g; QSettings st; st.setValue("grid/" + k + "/on", g.on); st.setValue("grid/" + k + "/step", g.step);
   staticRev_++; requestUpdate();
 }
-double Viewport::floorY() const {
+double Viewport::floorY(const Floor& floor) const {
   const Box3 b = scene_->bounds(); const double hh = b.empty() ? 1 : std::max(1e-9, b.size().y);
   return (floor.zero ? 0 : (b.empty() ? 0 : b.min.y)) + floor.dy * hh;
 }
 
+void Viewport::setSnapHold(char key, bool down) {
+  const char was = snapHold_; if (down) snapHold_ = key; else if (snapHold_ == key) snapHold_ = 0;
+  if (was == snapHold_) return;
+  if (!esnapOn() && esnapHit_) esnapHit_.reset();
+  overlayRev_++; requestUpdate(); emit snapHoldChanged();
+  if (down) ui::hud(key == 'x' ? tr("Snap to the grid (X held)") : tr("Snap to vertices (V held)"), 900);
+}
+
+// an orthographic view's grid has no edge: drawn over what is on the screen, its step grown tenfold while the lines would be
+// closer than ~8 px (the snap uses the same step, so it lands on the lines seen)
+double Viewport::gridStepNow(const Camera& cam, double step) const {
+  step = std::max(step, 1e-6); if (!cam.ortho() || cam.view == "ortho") return step;
+  const double ext = cam.worldPerPixel() * double(std::max(cam.width, cam.height));
+  for (int i = 0; i < 12 && ext / step > 160; i++) step *= 10;
+  return step;
+}
+
 std::optional<Vec3> Viewport::elemSnap(const QPointF& mp, int m, const std::set<int>& moving, const Vec3& from) {
   (void)from;
-  const QString mode = tset.esnapMode; const Ray R = ray(mp);
-  if (mode == "grid") {                                         // (the view's grid: the node nearest where the pointer is on its plane)
-    const ViewGrid g = viewGrid(cam_.view); if (!g.on) return std::nullopt;
+  const QString mode = esnapModeNow(); const Ray R = ray(mp);
+  if (mode == "grid") {                                         // (the view's grid — or, not shown, the floor's own: the node nearest where the pointer is on its plane)
+    const ViewGrid g = viewGrid(cam_.view);
     const bool wallZ = cam_.view == "front" || cam_.view == "back", wallX = cam_.view == "left" || cam_.view == "right";
     const Vec3 n = wallZ ? Vec3(0, 0, 1) : wallX ? Vec3(1, 0, 0) : Vec3(0, 1, 0); const Vec3 o = wallZ || wallX ? Vec3() : Vec3(0, floorY(), 0);
-    auto h = planeHit(R, o, n); if (!h) return std::nullopt; Vec3 p = *h; const double s = g.step;
+    auto h = planeHit(R, o, n); if (!h) return std::nullopt; Vec3 p = *h;
+    const double s = gridStepNow(cam_, g.on || wallZ || wallX ? g.step : cam_.sceneScale * 0.25);   // (the floor's lines: scale × 8 in 32 steps)
     if (!wallX) p.x = std::round(p.x / s) * s; if (!wallZ) p.z = std::round(p.z / s) * s; if (wallZ || wallX) p.y = std::round(p.y / s) * s;
     return p;
   }
@@ -79,16 +98,18 @@ std::optional<Vec3> Viewport::elemSnap(const QPointF& mp, int m, const std::set<
 
 namespace hm {
 void Viewport::esnapOverlay(std::vector<Overlay>& out) const {
-  if (room() != "topo" || !tset.esnap) return;
+  if (room() != "topo" || !esnapOn()) return;
+  const QString emode = esnapModeNow();
   Projector P = projector(); const QColor hot(0xff, 0xa0, 0x30), dim(0xc0, 0xc8, 0xd0);
   auto ring = [&](double x, double y, double r, const QColor& c) { Overlay o; o.color = c; o.closed = true; for (int i = 0; i < 20; i++) { const double a = 2 * M_PI * i / 20; o.pts.push_back({x + r * std::cos(a), y + r * std::sin(a)}); } out.push_back(o); };
   // (while a drag goes: what it could take near the pointer — the vertices, or the edges, of the shown meshes)
   const bool penDrag = drag_ == Drag::Topo && td_.type == 20 && tt_.drag == 1;   // (PolyPen dragging its vertices)
-  if (drag_ == Drag::Topo && (td_.type == 3 || penDrag) && (tset.esnapMode == "vert" || tset.esnapMode == "edge")) {
-    const std::vector<int>& V = penDrag ? tt_.verts : td_.verts; const int mm = penDrag ? tt_.m : td_.m; const std::set<int> mv(V.begin(), V.end()); const double R = 160; int shown = 0;
+  const bool gizDrag = drag_ == Drag::Gizmo && tgz_.on && gz_.mode == Gizmo::Mode::Move;   // (the gizmo moving picked vertices)
+  if (((drag_ == Drag::Topo && (td_.type == 3 || penDrag)) || gizDrag) && (emode == "vert" || emode == "edge")) {
+    const std::vector<int>& V = gizDrag ? tgz_.verts : penDrag ? tt_.verts : td_.verts; const int mm = gizDrag ? tgz_.m : penDrag ? tt_.m : td_.m; const std::set<int> mv(V.begin(), V.end()); const double R = 160; int shown = 0;
     std::vector<int> ids = topoMeshes(); for (auto& [id, it] : scene_->items) if (it.type == ItemType::IMesh && it.poly && it.raw.value("tref").toBool() && scene_->isVisible(it)) ids.push_back(id);
     for (int id : ids) { const Item* it = scene_->item(id); if (!it || !it->poly || it->poly->faceCount() > 300000) continue; const PolyMesh& S = *it->poly;
-      if (tset.esnapMode == "vert") { for (size_t v = 0; v < S.pos.size() && shown < 600; v++) { if (id == mm && mv.count(int(v))) continue; const ScreenPt s = P.toScreen(S.pos[v]);
+      if (emode == "vert") { for (size_t v = 0; v < S.pos.size() && shown < 600; v++) { if (id == mm && mv.count(int(v))) continue; const ScreenPt s = P.toScreen(S.pos[v]);
           if (s.z >= 1 || std::hypot(s.x - mouse_.x(), s.y - mouse_.y()) > R) continue; Overlay o; o.color = dim; o.closed = true; o.pts = {{s.x - 2, s.y - 2}, {s.x + 2, s.y - 2}, {s.x + 2, s.y + 2}, {s.x - 2, s.y + 2}}; out.push_back(o); shown++; } }
       else for (int f = 0; f < S.faceCount() && shown < 600; f++) { const int s0 = S.faceStart[size_t(f)], e0 = S.faceStart[size_t(f) + 1];
           for (int k = s0; k < e0; k++) { const int a = S.faceVerts[size_t(k)], b = S.faceVerts[size_t(k + 1 < e0 ? k + 1 : s0)]; if (id == mm && (mv.count(a) || mv.count(b))) continue;

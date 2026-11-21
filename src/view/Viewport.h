@@ -15,10 +15,12 @@
 #include <unordered_map>
 #include "scene/AutoFix.h"
 #include "scene/Convert.h"
+#include "scene/Collision.h"
 #include "scene/Crown.h"
 #include "scene/Lobes.h"
 #include "scene/LockExtrude.h"
 #include "scene/MeshCurves.h"
+#include "scene/LockLines.h"
 #include "scene/Rib.h"
 #include "scene/WallTools.h"
 #include "scene/MeshMods.h"
@@ -33,6 +35,7 @@
 #include "view/Camera.h"
 #include "view/Gizmo.h"
 #include "view/Picking.h"
+#include "paint/PaintDoc.h"
 #include <QColor>
 #include <QDateTime>
 #include <QJsonObject>
@@ -47,10 +50,13 @@ class QFileSystemWatcher;
 namespace hm {
 // (profiling: HM_PROF set — what took how long, appended to %TEMP%/hm_prof.txt)
 void prof(const char* what, qint64 ms);
+std::function<void(const char* what, qint64 ms)>& profHook();   // (every timed scope of 2 ms and more — the session's record sums them)
 struct ProfScope { const char* w; qint64 t0; explicit ProfScope(const char* what); ~ProfScope(); };
 namespace ui { class ThinkScope; }
 struct SideGuard;                                        // (ViewportTopoTools.cpp: a reference's side the built mesh lies on)
 
+extern bool g_lineAnyWall;   // (a check: a laid line takes the nearest wall whichever way it faces — the old way)
+extern bool brushFreesHandles;   // (a check: off — the Brush keeps the frozen handles, as before 21.11)
 class Viewport : public QVulkanWindow {
   Q_OBJECT
 public:
@@ -70,16 +76,52 @@ public:
   std::vector<int> shownPanes() const;
   QRect paneRect(int i) const;                          // logical px in the viewport
   const Camera& paneCamera(int i) const { return i == act_ ? cam_ : panes_[size_t(i)]; }
+  Camera& paneCam(int i) { return i == act_ ? cam_ : panes_[size_t(i & 3)]; }   // (another pane's camera moved without making it the active one: the reference canvas's split)
+  // the windows as they are (every camera, the active one, split or not, the layout) — taken and put back whole (the reference canvas's split)
+  struct PaneState { std::array<Camera, 4> cams; int act = 0, solo = 0; bool split = false; QString layout; };
+  PaneState paneState() const;
+  void setPaneState(const PaneState& s);
   void setPaneView(int i, const QString& v);
   void swapPanes(int i, int j);
   void backToSingle(int pane);                          // one window again: this one, with its camera
+  // the Paint room's views (ViewportViews.cpp): a window showing a visibility set (the project's: a name + the items whose eye is
+  // off — the main view shows the scene as it is), its camera following the main view's; views in a window of their own
+  struct PaneVis { QString set; bool sync = false; };
+  const PaneVis& paneVis(int i) const { return paneVis_[size_t(i & 3)]; }
+  void setPaneVis(int i, const PaneVis& v);
+  QStringList visSetNames() const;
+  QString visSetSave(const QString& name);              // the scene's eyes → a set ("" — a new one, named by itself) → its name
+  void visSetShow(const QString& name);                 // a set → the scene's eyes
+  void visSetRename(const QString& from, const QString& to);
+  void visSetDelete(const QString& name);
+  std::optional<std::set<int>> paneHid(int i) const;    // what the window's set hides (nullopt — the scene as it is)
+  bool shownWith(const std::optional<std::set<int>>& hid, const Item& it) const;
+  bool shownAnywhere(const Item& it) const;             // drawn by any window
+  bool paneFilters() const;                             // a window in use shows a set
+  int mainPane() const;                                 // the main view: the first window of the main viewport
+  std::vector<int> panesInUse() const;                  // the main viewport's windows and the view window's
+  std::vector<int> detachedPanes() const;               // the windows shown in the view window (none — it is closed)
+  void syncPaneCams();
+  // the view window: the last 1 – 2 of the four windows drawn into a picture of their own, shown in a window apart (another screen);
+  // their place in the viewport's coordinates is far beside it (detachedOrigin) — the window's mouse comes in already moved there
+  int detached() const { return detN_; }
+  bool paneDetached(int i) const { return detN_ > 0 && i >= 4 - detN_ && i < 4; }
+  bool detachedStacked() const { return detStack_; }
+  QSize detachedSize() const { return detSize_; }
+  QPoint detachedOrigin() const { return QPoint(100000, 0); }
+  void setDetached(int n, QWidget* host = nullptr);     // how many views the view window shows (0 — closed); host: the widget showing them
+  void setDetachedLook(const QSize& logical, bool stacked);
+  void migrateDetached();                               // the view window's views into the main viewport's split screen
+  void viewEvent(QEvent* e);                            // the view window's mouse / wheel (positions in the viewport's coordinates)
+  void viewHover(bool in);
+  std::function<void(const QImage&)> detachedFrame;     // (the renderer: the view window's picture of this frame)
   int paneW() const { return std::max(1, paneRect(act_).width()); }
   int paneH() const { return std::max(1, paneRect(act_).height()); }
   QPoint toGlobal(const QPointF& m) const;              // a point of the active pane → the screen
   QPointF fromGlobal(const QPoint& g) const;
   void snapToNearestView();                             // (Shift while orbiting: the nearest standard view)
   void viewFromAxis(int axis, int sign);                // the view axes' click: look along that axis (animated)
-  QString paneLabel(int i) const;
+  QString paneLabel(int i) const; mutable QByteArray uvInfoKey_; mutable QString uvInfoVal_;
   // reference planes (ViewportRefs.cpp): the one active in the 🖼 menu — the gizmo works on it (its pivot unlocked: on
   // the pivot only); Ctrl+Alt+drag moves its picture; selecting anything in the scene lets it go
   RefPlane* refPlane(int id);
@@ -88,35 +130,50 @@ public:
   bool refPivEdit() const { return refPivEdit_; }
   void setRefPivEdit(bool on);
   void refPlanesEdited(bool commitNow);                 // (a change from the menu: drawn again; commitNow — an undo step)
-  int refRevision() const { return refRev_; }
   const Camera& refHomeCamera(const RefPlane& rp) const;   // the pane the plane rests in (its view's, else the active one)
   std::function<void()> onFileDrag;
   std::function<void()> beforeHeavy;                     // (the main window's recovery copy, before a heavy operation)
   // the floor (a view preference, not the project's): height offset (a share of the model's height), opacity, at the
-  // world origin, the world axes' opacity
-  struct Floor { double dy = 0, op = 1, ax = 0.6; bool zero = false; } floor;
+  // world origin (the default — off: under the model, at its lowest point; the user's choice), the world axes' opacity
+  struct Floor { double dy = 0, op = 1, ax = 0.6; bool zero = true; } floor;   // (the active pane's; each pane keeps its own)
+  const Floor& paneFloor(int i) const { return i == act_ ? floor : paneFloors_[size_t(i & 3)]; }
+  void setPaneFloor(int i, const Floor& f);
+  void resetPanes(bool atStart = false);
+  Floor paneFloors_[4];
   struct ViewGrid { bool on = false; double step = 1; };   // (a view's snapping grid: shown, its step — scene units)
   ViewGrid viewGrid(const QString& view) const; void setViewGrid(const QString& view, const ViewGrid& g);
-  double floorY() const;                                // (the floor's height as it is drawn)
+  double floorY() const { return floorY(floor); }
+  double floorY(const Floor& f) const;                                // (the floor's height as it is drawn)
   // the element snap: where the element taken hold of (at from) goes with the pointer at mp — a vertex, a point of an edge,
   // of a polygon of the shown meshes (not the moving vertices of mesh m), or the view's grid; none — nothing near
   std::optional<Vec3> elemSnap(const QPointF& mp, int m, const std::set<int>& moving, const Vec3& from);
+  // X held: the snap onto the grid (the floor's, the view's), V held: onto the vertices — on while the key is down, whatever the Snap button says
+  void setSnapHold(char key, bool down);
+  bool esnapOn() const { return tset.esnap || snapHold_ != 0; }
+  QString esnapModeNow() const { return snapHold_ == 'x' ? QString("grid") : snapHold_ == 'v' ? QString("vert") : tset.esnapMode; }
+  double gridStepNow(const Camera& cam, double step) const;   // (the grid's step as drawn: an orthographic view zoomed out takes every tenth line)
 
-  std::optional<Vec3> esnapHit_;                          // (the element snap's target now — drawn)
+  std::optional<Vec3> esnapHit_;                         // (the element snap's target now — drawn)
   void setFloor(const Floor& f);                      // (files dragged over the viewport: the main window's drop boxes)
   HairState& hair() { return hair_; }
   const Selection& selection() const { return sel_; }
+  bool hairPreviewItem(int id) const { return hpvItems_.count(id) > 0; }   // (the Topology room: an item of the Hair room shown as the HairPreview folder — select, hide, move, brush only)
+  bool hairPreviewAny() const { return !hpvItems_.empty(); }
+  bool hairBrushSel() const { if (room() != "topo") return false; for (int id : sel_.items) if (hpvItems_.count(id)) return true; return false; }
   const DisplayState& display() const { return ds_; }
   const std::vector<ShownAnchor>& shownAnchors() const { return anchors_; }
   bool isItemSelected(int id) const { return sel_.hasItem(id); }
   int snapCurve() const { return ad_.snap; }
   struct Overlay { std::vector<std::pair<double, double>> pts; QColor color; bool closed; };   // (logical px)
   std::vector<Overlay> overlays() const;
+  void uvMarkOverlay(std::vector<Overlay>& out) const;   // (the UV shells' markers: a pack group's frame with G and its number, Sym beside a symmetric-pack shell)
   void uvPinOverlay(std::vector<Overlay>& out) const;   // (the UV Puppet's pins: a needle and a round head each, in screen pixels)
   void uvGizmoOverlay(std::vector<Overlay>& out) const; // (the UV Editor's Move / Rotate / Scale gizmo at the selection's pivot, in screen pixels)
   bool uvGizmoOn() const;                                // (shown: the UV mode, a component selection, the Move / Rotate / Scale tool)
   int uvGizmoHit(const QPointF& mp) const;              // (its handle under the pointer: 0 none, 1 U, 2 V, 3 the middle, 4 the ring)
   std::array<double, 2> uvGizmoPivot() const;           // (the selection's box middle)
+  QPointF uvPxOf(double u, double v) const { return uvToPx(u, v); }   // (a UV point on the screen — checks)
+  int testLoop(int e, bool stopSeam) { const bool was = tset.loopStopSeam; tset.loopStopSeam = stopSeam; TopoPick r; r.m = topoMesh(); r.e = e; const int n = r.m >= 0 ? int(tLoopOf(r.m, r, QPointF(), false).size()) : -1; tset.loopStopSeam = was; return n; }   // (the edge loop through e — checks)
   QPointF uvGizmoPx() const { const auto p = uvGizmoPivot(); return uvToPx(p[0], p[1]); }   // (where it is on the screen — checks)
   std::array<double, 4> uvFramePx() const { const auto b = const_cast<Viewport*>(this)->uvSelBox(); if (!b) return {0, 0, 0, 0}; const QPointF a = uvToPx((*b)[0], (*b)[3]), c = uvToPx((*b)[2], (*b)[1]); return {a.x(), a.y(), c.x(), c.y()}; }   // (the frame: left, top, right, bottom px — checks)
   double worldPerPixelAt(const Vec3& p) const;          // (the size of a screen pixel at p — scene units)
@@ -134,8 +191,10 @@ public:
   void commitLive(bool topology = false);
   void selectItem(int id, bool add);                     // a click (Shift / Ctrl — add / take off)
   void sceneChanged(bool reframe);                       // after a load (reframe) / a visibility change
-  void frameSelection();
+  void setWorld();                                       // (every camera told what the scene holds — its flat views outside all of it)
+  void frameSelection(bool allPanes = false);   // (allPanes: every view onto it — what came in from another project)
   std::optional<Vec3> pickPoint(const QPointF& windowPos) const;   // (checks: the surface under a point of the window)
+  std::pair<int, int> pickMeshFace(const QPointF& windowPos) const;   // (an imported mesh's polygon under a point of the window — { mesh, its base polygon }, −1 — none: a texture dropped there)
   void fitToBox(const Box3& box);                        // a new model framed (fitToBox: the scale, centre, a reset view)
   void setViewMode(const QString& v);
   void undo();
@@ -169,6 +228,13 @@ public:
   int createPrimitive(const QString& type);              // the "+" menu: a primitive (scene/Primitives) at the camera's pivot — selected
   void primSet(int id, const QString& key, double v, bool commitNow);   // a primitive's setting: the mesh made again (commitNow — an undo step)
   void primConvert(int id);                              // the primitive a plain polygonal mesh (its settings dropped)
+  // Head Collision (the Hair room): a copy of a mesh into the group; a new object there; an object's shape — a primitive
+  // ("psphere", "pcube" …) or "mesh:<id>" (a copy of that mesh). Each an undo step; → the object's id
+  int collCreateFrom(int mesh);
+  std::vector<int> collCreateFrom(const std::vector<int>& meshes);   // (several at once: one undo step)
+  int collAdd(const QString& shape);
+  void collSetShape(int id, const QString& shape);       // (… or "preset:head" — a model kept in the program)
+  void collPresetSet(int id, double size, bool commitNow);   // (a preset object's Size: made again)
   const lockex::Params& lockExParams() const { return lx_.P; }
   bool lockExActive() const { return lx_.on; }
   void lockExSet(const lockex::Params& P);               // (the panel's settings: the extrusion made again with them)
@@ -178,7 +244,6 @@ public:
   void setGizmoLocal(bool on);
   bool gizmoLocal() const { return gzLocal_; }
   void setAxisLock(int k, bool locked);
-  bool axisLocked(int k) const { return gz_.lock[k]; }
   void updateGizmo();
   std::vector<Gizmo::Line> gizmoLines() const;
   std::optional<QPointF> gizmoScreen() const;            // (checks: where the gizmo's centre is on screen)
@@ -193,8 +258,8 @@ public:
   // ◍ Shell modifiers (the 'guide' tool, ViewportShell.cpp): the tab — Density / Parent influence (painted along a
   // cocoon), Line / NURBS disc (guides); the brushes' state; what they go on (shellTargets)
   QString shTab = "tip";
-  struct ShellBrush { bool on = false; double strength = 1; } tipBrush, pinfBrush;
-  QJsonObject tipDefaults{{"dens", 1.5}, {"v", 2}}, pinfDefaults{{"str", 1}};
+  struct ShellBrush { bool on = false; double strength = 1; } tipBrush, pinfBrush, spiralBrush;
+  QJsonObject tipDefaults{{"dens", 1.5}, {"v", 2}}, pinfDefaults{{"str", 1}}, spiralDefaults{{"loops", 8}, {"phase", 0}};
   bool shellBrushActive() const;                         // the Density / Influence brush paints (a modifier of it on a cocoon)
   void shellChanged() { overlayRev_++; requestUpdate(); }  // (the tab / a brush switched: what is shown)
   std::vector<int> shellTargets() const;
@@ -226,8 +291,194 @@ public:
   struct RefCube { Vec3 base; double size = 1, height = 1; };
   std::optional<RefCube> refCube;
   void toggleReference();
-  void setRefHeight(double h) { if (refCube) { refCube->height = h; overlayRev_++; requestUpdate(); } }
+  void setRefHeight(double h) { if (refCube) { refCube->height = h; overlayRev_++; requestUpdate(); refApplyStep(true); } }   // (typed: the loops follow at once)
+  void refApplyStep(bool final);                         // (the cube's height as the loop step — live while dragged, final: an undo step)
+  bool refStepPending_ = false;
   bool mergePick = false;
+  // the Paint room's brush on the model (ViewportPaint.cpp): on — the left button over a mesh paints; paintInput — the canvas's brush:
+  // phase 0 press / 1 move / 2 release / 3 off the model, the texture point (0…1 across and down), invert (Ctrl: erase)
+  bool paintOnModel = false; std::function<void(int, const QPointF&, bool)> paintInput;
+  // the pen on the model: tabletEvent only notes its pressure and tip (the mouse events Qt makes of it still drive the brush) — what the
+  // brush reads at a press / move: the pressure of a pen touching now (1 — the mouse, a pen event gone stale, or a line laid by a tool)
+  float paintPressureNow() const;
+  bool paintPenNow() const;                              // (the stroke is the pen's: its pressure is read)
+  bool paintEraserTip() const;                           // (the pen turned over: the brush erases, as Ctrl)
+  // RMB drag over the viewport with a painting tool in hand (as in 3D-Coat): sideways — the brush's size, up / down — its opacity;
+  // phase 0 pressed, 1 moved (the drag from the press, screen px), 2 let go. The ring stays where the drag began
+  std::function<void(int, const QPointF&)> paintAdjust;
+  std::function<void(double)> paintWheelSize;               // (the wheel over the model: the brush's size by so many notches)
+  bool paintAdjHard() const { return paintAdjHard_; }      // (the drag sets the hardness up / down too - the Photoshop / Substance controls)
+  std::function<void(const QPointF&)> paintAltPick;                     // (Alt + click over the model - the Photoshop / Substance controls: the colour under the pointer)
+  std::function<void(const QPointF&)> paintPickLayer;    // (Ctrl + Shift + click on the model: the layer that has paint there becomes the active one — the texture point, 0…1)
+  // Steady Stroke on the model (the brush's, 0…1): the brush follows the pointer on a string that share of the ring's diameter × 2
+  // long (as 3D-Coat's Steady Stroke 1.8 — 0.9 here), catching up with the pointer when the stroke ends; 0 — off
+  std::function<double()> paintSteadyPx;
+  double paintRingRadiusPx() const;                      // (the brush's ring on the screen now)
+  // the Paint room's own visibility and locks (ViewportPaint.cpp) — kept with the items, seen by that room only: an object's eye (pHid),
+  // its hidden polygons (pHidF), its lock (pLock: the brush leaves it alone) and its locked polygons (pLockF); NoPainted — the object is
+  // not in the room at all. A polygroup's and a visibility set's eye / lock work on their polygons. Nothing of it is an undo step
+  // H / Shift+H / Ctrl+H / Ctrl+Shift+H / Ctrl+X in the Hair and Topology rooms — the Paint room's rules (view/ViewportVis.cpp):
+  // op: hide | only | hideObj | onlyObj | showAll; on the selection, else on what is under the pointer (setMouseAt first)
+  QString visKey(const QString& op);
+  std::set<int> hairHid_;                                // (the Hair room's items H hid: Ctrl+X shows them again)
+  bool tKeyUnder(const QString& op);                     // (the Topology room: H and its kin on what is under the pointer — hide | hideObj | only | onlyObj | showAll)
+  QString tKeyWhy_;                                      // (checks: why the keys were not taken)
+  std::set<int> tHidByKey_;                              // (the objects Ctrl+H hid there: Ctrl+X shows them again)
+  int meshUnder(const QPointF& m) const;                 // the room's mesh under a window point (−1: none)
+  void rollView(double deg);                             // the view turned round its own axis (clockwise on the screen; 0 — upright again)
+  bool pvIsMesh(const Item& it) const;                   // a mesh the room lists (not NoPainted)
+  std::vector<int> pvMeshes() const;                     // … in the outliner's order
+  void pvSetNoPaint(const std::vector<int>& ids, bool on);
+  bool pvShown(int id) const; bool pvLocked(int id) const; bool pvPartHidden(int id) const;
+  void pvSetShown(const std::vector<int>& ids, bool on); void pvSetLocked(const std::vector<int>& ids, bool on);
+  void pvSolo(const std::vector<int>& ids, bool lock);   // only these shown (lock: only these unlocked); again — all
+  struct PvGroup { int g = -1; QString name; int faces = 0; bool shown = true, locked = false; };
+  std::vector<PvGroup> pvGroups(int m) const;
+  void pvGroupSet(int m, const std::vector<int>& gs, bool lock, bool on);   // (eye: on — shown; lock: on — locked)
+  void pvGroupSolo(int m, int g, bool lock);
+  struct PvSet { QString key, name; int kind = 0; bool shown = true, locked = false; };   // kind: 0 — Default, 1 — a UV set, 2 — the user's
+  std::vector<PvSet> pvSets() const;
+  void pvSetApply(const QString& key);                   // only the set shown
+  void pvSetToggle(const QString& key, bool lock, bool on);
+  void pvSetSoloLock(const QString& key);
+  QString pvKey(const QString& op);                      // hide | hideObj | only | onlyObj | showAll — at the pointer (H and its kin) → what was done
+  std::vector<char> pvBlocked(const Item& it) const;     // the mesh's polygons the brush may not touch (its base's numbers; empty — none)
+  QImage pvAllowMask(const QString& set, int w, int h) const;   // the texels the brush may not touch black (null — it may touch all)
+  // the room's tools (the left column's: a line, a curve, a shape, the selection, the topological symmetry, the text): the left button
+  // and the pointer handed to them (phase 0 press, 1 move, 2 release, 4 — the pointer moved with no button; true — taken), the keys
+  // (Enter, Esc, Backspace), what they draw over the model; a stroke of the brush laid along a line of the screen
+  std::function<bool(int, const QPointF&, Qt::KeyboardModifiers)> paintToolInput;
+  std::function<bool(int)> paintToolKey;
+  std::function<void(std::vector<Overlay>&)> paintToolOverlay;
+  // (width: the brush's size multiplied along the line, by how far along it the point is, 0…1 — a line that narrows towards its ends;
+  // with a width the dabs are laid in the texture, not projected: the projection has one size for the whole stroke)
+  void paintStrokeAlong(const std::vector<QPointF>& pts, const std::function<double(double)>& width = {});
+  // a line through points of the surface itself: each a place on a mesh (where it was clicked — the camera may turn between two clicks).
+  // Between two of them the surface is followed — looked for along the normals from the straight line that joins them — so the line goes
+  // round a sleeve whatever the camera shows when it is laid
+  struct PaintAnchor { Vec3 p, n; int item = -1; };
+  std::optional<PaintAnchor> paintAnchorAt(const QPointF& m) const;
+  std::optional<QPointF> paintAnchorScreen(const PaintAnchor& a) const;   // (where it is on the screen now; nullopt — behind the camera)
+  void paintStrokeThrough(const std::vector<PaintAnchor>& pts, const std::function<double(double)>& width = {});
+  // (a check: a closed line laid by points on the surface round a limb — the vertices whose x lies between a and b of the mesh's x range —
+  // as a hand turning the camera between clicks lays it; out: the ring's middle, axis and radius)
+  QString testWrapLine(int item, double a, double b, int n, Vec3* c = nullptr, Vec3* axis = nullptr, double* r = nullptr, const Vec3* near = nullptr);
+  int testThickTube(double R, double thick);   // (a check: a tube with a thickness round the pivot, its two walls' UVs apart)
+  QString testOpenSides(int item, const std::vector<Vec3>& pts, const std::vector<Vec3>& nrm);   // (a check: of these surface points, how many see open space along +n, along −n only, or neither — walled in on both sides)
+  QString testWrapLineAt(const QPointF& m, double frac, int n, Vec3* c = nullptr, Vec3* axis = nullptr, double* r = nullptr);   // (the same round the part under a window point: the vertices within frac of the mesh's size)
+  void paintOverlayChanged() { overlayRev_++; requestUpdate(); }
+  // the polygons selected in the room (a mesh → its base's polygons): H and its kin work on them, they can be locked
+  struct PvFace { int mesh = -1, face = -1; };
+  // the Paint room's selection walks — the Topology room's own tools on the polygons: "loop" / "ring" (tLoopOf: the polygon loop across the
+  // edge the pointer is nearer, or the other way), "fill" (the polygons joined to it up to a UV seam or the selection's border), "part",
+  // "group", "face" — the base's polygons. pvHKind — what H hides under the pointer (one of these; "part" by default)
+  std::vector<int> pvWalkAt(const QPointF& m, int mesh, int baseFace, const QString& kind) const;
+  std::map<int, std::vector<int>> pvMirrored(int mesh, const std::vector<int>& baseFaces) const;   // (with the symmetry on: the polygons that mirror these - of any painted mesh)
+  // the walk under the pointer shown before the click (the Topology room's colours: Loop / Ring — yellow, Fill — orange)
+  void pvHoverAt(const QPointF& m, const QString& kind);
+  std::map<int, std::vector<int>> pvHover_; QColor pvHoverC_;
+  // the UV islands of the set painted, at the texture's size (built once per set / size / scene change; the islands of every mesh of the
+  // room, hidden ones too)
+  const paint::IslandMap& paintIslands(const QString& set, int w, int h) const;
+  const std::vector<QPolygonF>& paintUvWire() const { return islandsWire_; }   // (the polygons in texture px — made with the islands)
+  // the link between the model and the texture: the brush's place on the model sent to the texture (paintHoverUv: the texture point, 0…1;
+  // nullopt — off the model) and the texture pointer's place shown on the model (paintRemoteAt: a cyan ring there)
+  std::function<void(std::optional<QPointF>)> paintHoverUv;
+  void paintRemoteAt(std::optional<QPointF> uv, double radiusPx);
+  bool paintLocateAt(const QPointF& uv);                 // (L over the texture: the camera turned to look at that point of the model)
+  bool paintWire = false;                                // (W in the Paint room: the wire over any display)
+  QString pvHKind = "part";
+  mutable paint::IslandMap islands_; mutable QString islandsKey_; mutable std::vector<QPolygonF> islandsWire_;
+  std::optional<QPointF> paintRemote_; double paintRemoteR_ = 8;
+  PvFace pvFaceAt(const QPointF& m) const;
+  PvFace pvFaceAtUv(const QPointF& uv) const;          // (the polygon a point of the texture lies on — seen or not)
+  std::vector<QPointF> paintMirrorsUvAt(const QPointF& m) const;   // (Symmetry on: the mirrors of the surface point under a window point, in the texture; off — none)
+  std::map<int, std::set<int>> pvSel;
+  void pvSelPick(const QPointF& m, const QString& kind, int op);
+  void pvSelClear(); int pvSelCount() const; void pvSelLock(bool on);
+  void pvOverlay(std::vector<Overlay>& out) const;
+  // the topological symmetry: the red and the blue polygon marked, the pairs of polygons walked from them — each pair's corners in the texture
+  struct PvTopoSym { int mesh = -1, red = -1, blue = -1; } pvTs;
+  // (the red and the blue polygon marked apart — the same polygon of two alike parts: how the blue part is taken to lie —
+  // 0: whichever fits (a copy or a mirror copy), 1: mirrored, 2: the same way round)
+  int pvTsWay = 0;
+  QString pvTsPick(const QPointF& m, bool blue);
+  struct PvTsPair { std::vector<QPointF> red, blue; };
+  std::vector<PvTsPair> pvTsPairs(const QString& set, QString* err) const;
+  mutable bool pvTsOdd_ = false; mutable QString pvTsStat_;                              // (checks: how the walk went)
+  qint64 pvKeyNow() const { return qint64(pvRev_) * 1000003 + qint64(scene_->revision); }
+  qint64 pvGeomRev() const { return qint64(scene_->revision) * 1000003 + uvRev_; }   // (the scene's shapes and UVs — not the room's hiding: the live gradients' texel maps follow it)
+  bool pvFaceBlocked(const Item& it, int polyFace) const;
+  std::optional<QPointF> paintUvAt(const QPointF& m) const;
+  std::optional<QPointF> paintUvOfHit(const RayHit& hit, double* texelsPerUnit = nullptr) const;   // (texelsPerUnit: how many texels of the painted texture a scene unit of that triangle holds)
+  std::vector<QPointF> paintMirrorsUv(const RayHit& hit) const;   // (Symmetry: the same point under each mirror / turn of the symmetry, in the texture)
+  std::optional<RayHit> paintHitOfUv(const QPointF& uv) const;    // (a point of the texture → the surface it lies on)
+  std::function<void(const std::vector<QPointF>&)> paintMirror;   // (told before each point of a stroke: where its mirrors lie in the texture)
+  void resetView();                                       // the camera back where a new project has it
+  // a brush sized on the screen (its Size — screen px on the model, the same wherever the UV is stretched): the texels a screen pixel
+  // covers under the stroke; the brush's ring over the model
+  bool paintSizeScreen = true, paintRing = true; float paintRingPx = 64; QSize paintTexSize;
+  bool paintThrough = false;                              // (the brush paints the walls behind too: the ring doubled, amber)
+  float paintScaleNow() const { return (paintSizeScreen ? paintScale_ : 1.f) * (penLine_ ? lineScale_ : 1.f); }
+  float lineScale_ = 1;                                    // (a tool's line being laid: its width here, of the brush's size)
+  void paintScaleUpdate(const QPointF& m, const QPointF& uv);
+  void paintRingOverlay(std::vector<Overlay>& out) const;
+
+  struct PvGeom { int w = 0, h = 0; std::vector<float> n, p; };   // (per texel: the surface's normal and place, 3 floats each)
+  const PvGeom& pvBakeGeom(const QString& set, int w, int h) const;
+  // the scalp (the cap the locks grow from): polygons marked by the room's selection (item raw "pScalp"). Its nearness in a UV set's
+  // texture: per texel 0…255, 255 on the scalp, falling to 0 at `reach` (scene units) away, by the square of the distance left; 0 —
+  // no texel there. null: no scalp marked
+  int pvSetScalp(bool on);                               // (the selected polygons marked / unmarked → how many are the scalp now)
+  bool pvHasScalp() const;
+  QStringList pvScalpSets() const;                       // (the UV sets the scalp's polygons lie in)
+  QImage pvScalpNear(const QString& set, int w, int h, double reach) const;
+  Box3 pvSceneBox() const;                               // (the painted meshes' bounds)
+  double pvSceneSize() const;                            // (the painted meshes' size across — a reach given as its share)
+  // the room's manager window (PaintLeft — its model preview and its own undo history): the room's visibility, locks and polygon
+  // selection read and put back whole (PvVis); a base mesh and its hidden / locked polygons; a Loop / Ring across a given side of a
+  // polygon (the preview picks the side by its own camera); the selection set from outside; per base polygon the painted map's colour
+  std::shared_ptr<const PolyMesh> pvBase(int id) const;
+  std::vector<char> pvFaceFlags(int id, bool lock) const;
+  struct PvVis { std::map<int, std::array<QJsonValue, 4>> raw; std::map<int, std::set<int>> sel; bool operator==(const PvVis&) const = default; };
+  PvVis pvVisState() const;
+  void pvVisRestore(const PvVis& v);
+  std::vector<int> pvLoopAt(int mesh, int baseFace, int corner, bool ring) const;
+  void pvSelSet(const std::map<int, std::vector<int>>& faces, int op);   // (op 0 — only these, 1 — added, 2 — taken off; the symmetry's twins with them)
+  std::vector<QRgb> pvFaceColours(int id) const;         // (0 — no colour there)
+  struct PvProj { int mesh = -1, face = -1, mirror = 0; std::vector<QPointF> uv, scr; };   // (mirror: 0 — as it is; n — seen through the symmetry's n-th mirror)
+  std::vector<PvProj> pvFacesIn(const QRectF& box, const QString& set, bool needUv, bool mirrors = false, bool hiddenToo = false) const;   // (hiddenToo: the ones behind others as well — a shape that goes through)
+  const std::vector<Affine>& pvSymT(const Item& it) const;
+  // What the camera sees, for the projected brush — made once per view (the camera, the scene, the room's visibility), not at every
+  // dab: every paintable polygon's corners on the screen with their UV in its own UV set, a picture of the nearest surface at every
+  // window pixel (the depth and which polygon it is), the polygons by the screen cells their boxes touch. A texel is painted where
+  // nothing lies in front of it — texel by texel, so a polygon half behind another takes the paint on the half that is seen, and a
+  // big polygon only partly under the brush takes it there
+  struct PvView {
+    struct F { int mesh = -1, face = -1, mirror = 0, set = -1; std::vector<QPointF> uv, scr; std::vector<float> z; QRectF box; float facing = 1; };   // (facing: |cos| of the angle between the polygon and the line to the eye — 1 head-on, 0 edge-on)
+    std::vector<F> faces; std::vector<QString> sets;      // (F::set — which of sets; −1 — the project's single texture)
+    int W = 0, H = 0, cell = 48, gw = 0, gh = 0; float eps = 0;
+    std::vector<float> depth; std::vector<int> id;         // (per window pixel: the distance of the nearest surface, the polygon there — −1: none, −2: one that can't be painted)
+    std::vector<std::vector<int>> grid;
+    bool seen(int face, const QPointF& sp, float z) const;
+    float frontAt(const QPointF& sp) const;               // (the nearest surface's distance within a pixel round it — 1e30: none)
+    void facesIn(const QRect& r, std::vector<int>& out) const;
+    QByteArray key; int ms = 0;                              // (ms: how long it took to make - checks)
+  };
+  const PvView& pvView() const;
+  QByteArray pvViewKey() const;                            // (what the view is made for: the camera, the window, the scene, the visibility)
+  mutable QString pvFacesWhy_;                             // (checks)
+  std::function<bool(int, const QPointF&, bool)> paintProj;   // (projection painting: a stroke on the model laid on the screen — phase 0 press → true: taken, 1 move, 2 release)   // the polygons the camera sees with their middle in the rectangle
+  void pvSelArea(const QRectF& box, const std::function<bool(const QPointF&)>& inside, int op);
+  std::vector<int> pvFacesOfKind(const PvFace& h, const QString& kind) const;
+  std::vector<PvProj> pvFaceUvs(int mesh, const std::vector<int>& faces, const QString& set) const;
+  void paintMirrorAt(const QPointF& m);
+  bool paintDragging() const { return paintDrag_; }
+  QPointF paintTexNow() const { return paintTex_; }       // (the stroke's point being told: 0…1 in the texture)
+  std::function<void()> paintStrokeEnd;
+  QString paintDisp = "std";                              // how the room shows the model: std | flat (no light) | normal (the normal map)
+  void setPaintDisp(const QString& k);
+  void paintViewChanged() { staticRev_++; requestUpdate(); }   // (the map shown on the meshes switched on / off, its UV set changed)
   double pickR = 12;
   void setMergePick(bool on);
   double pickWorld(const QPointF& m) const;              // (the circle's diameter in the scene's units there)
@@ -261,6 +512,9 @@ public:
   int convertibleMesh() const;                           // the selected imported / converted mesh, else the edges' mesh
   void edgesToCurves();
   void meshToCurves(int mesh);
+  // Lock lines (the 'lockfix' tool, ViewportLockLines.cpp): the lock's curves found on its mesh — polypaint / hard edges / creases
+  locklines::Opt llOpt; bool llCocoon = false, llBulge = true, llRing = true;   // (Bulge: the walls between the curves bulged to follow the mesh)
+  void lockLinesRun(int mesh);
   struct EdgeSeg { Vec3 a, b; bool hover; };
   std::vector<EdgeSeg> edgeLines() const;                // the selected edges (and the one under the pointer)
 
@@ -276,8 +530,9 @@ public:
   void hairItemsFor(Scene& out) const;                   // (saving from another room: the Hair room's items, Meshes as now)
   QString topoMode = "object";
   QString lastEditMode_ = "vert";                         // (the edit mode last used — PolyPen goes back to it from Object)
-  struct TSel { int id = -1; std::set<int> f, e, v; int last = -1; int ver = 0; const PolyMesh* B = nullptr; };
+  struct TSel { int id = -1; std::set<int> f, e, v; int last = -1; int ver = 0; const PolyMesh* B = nullptr; std::map<int, std::set<int>> eSide; };   // (eSide: an edge picked in the UV Editor → the polygons of the sides it was picked on; no entry — every side)
   const TSel& topoSel() const { return tsel_; }
+  bool uvObjScope() const;
   // (uv: the UV mode; keepUv: Preserve UVs; selTool — what a drag of the Select Cursor does: cursor (paints the selection),
   // rect, lasso; fill / outline — a click selects a region / an open outline; selThrough — the hidden side too)
   int mirrorWeldAns = -1;                               // (tests: Mirror's weld question answered — 1 yes, 0 no)
@@ -294,9 +549,9 @@ public:
   void symApply(const SymSet& S, std::vector<Vec3>& P, const std::vector<int>& moved, const std::vector<Vec3>& base) const;
   struct SymCache { QByteArray key; SymSet S; }; mutable SymCache symCache_;
   void symChanged();                                     // (a setting changed: found again, drawn again, kept)
-  struct TSet { bool snap = false, sym = false, uv = false, keepUv = false, selThrough = false; QString selTool = "cursor";
+  struct TSet { bool snap = false, sym = false, uv = false, keepUv = false, selThrough = false; QString selTool = "cursor"; QString fillMode = "normal";   /* "normal" or a mix joined by +: shell hard crease group */
                 bool esnap = false; QString esnapMode = "vert"; double esnapPx = 14;   // (the element snap: what is dragged — the element taken hold of — onto a vertex / an edge / a polygon / the view's grid within esnapPx)
-                bool loopStopSel = false, loopStopNgon = false, loopStopTri = false, soft = false; double softR = 2; QString softMode = "surface";
+                bool loopStopSel = false, loopStopNgon = false, loopStopTri = false, loopStopSeam = false, loopStopCrease = false, soft = false; double softR = 2; QString softMode = "surface";
                 // (the gizmo's axes: world, local, normal, camera, custom; the move brush: screen, surface, topo — the
                 // object under its centre / the selection only; its smoothing strength; relax: the stars kept even)
                 QString gzOrient = "world", brushMode = "screen"; double brushStr = 0.5; bool relaxStars = true; bool brushAll = false;   // (brushAll: every visible mesh under it — else only the active one)
@@ -304,6 +559,7 @@ public:
                 QString gzWhat = "all"; bool gzSlide = false;   // (the gizmo moves the selection as one / each component about its own centre (and normal); Move slides along the edges — in parallel)
                 QString brushKind = "move"; } tset;                // (what LMB does with the brush: move / smooth / relax / inflate / shrink)
   void setGzOrient(const QString& o);
+  QString gzBakeCustom();                                // (Custom → Local: the gizmo put by Alt + drag kept in what is picked — a group's point and axes, a mesh's pivot and axes; one undo step)
   // the mesh's own gizmo (Object mode): its place and axes kept in its Transform (p.cx…: the pivot, p.gq: the axes as a turn of
   // the mesh's own) — Alt + drag, Align; Bake makes them the mesh's own axes
   Quat gizmoAxes() const { return gzFrame(); }
@@ -314,16 +570,18 @@ public:
   // ---- the Inspector's highlights (ViewportInspect.cpp): on every shown mesh, both rooms ----
   // (planarTol: how bent a polygon must be to be lit — 0 any bend, 1 only the worst: a corner off its plane by up to half
   // its longest side)
-  struct Insp { bool ngons = false, open = false, nonPlanar = false, nonManifold = false, interior = false, hard = false, doubles = false; double planarTol = 0.06;
-                bool any() const { return ngons || open || nonPlanar || nonManifold || interior || hard || doubles; } } insp;
+  struct Insp { bool ngons = false, open = false, nonPlanar = false, nonManifold = false, interior = false, hard = false, doubles = false, asym = false; double planarTol = 0.06;   // (asym: the polygons whose corners have no mirror twin — the Symmetry settings' first mirror)
+                bool any() const { return ngons || open || nonPlanar || nonManifold || interior || hard || doubles || asym; } } insp;
   void loadInspect();
   void inspChanged();                                    // (kept, drawn anew)
   struct InspC { const PolyMesh* key = nullptr; const PolyMesh* shown = nullptr; double tol = -1; int heavy = 0;   // (heavy: which slow checks were made — 1 the double walls, 2 the interior)
-                std::vector<int> ngons, nonPlanar, open, nonMan, interior, hard, doubles; std::vector<Vec3> interiorPts; };
+                std::vector<int> ngons, nonPlanar, open, nonMan, interior, hard, doubles, asym; std::vector<Vec3> interiorPts, asymPts; };
   mutable std::map<int, InspC> inspC_;
   const InspC& inspOf(int m) const;
   // ---- the Maranspector in the Hair room (ViewportInspectHair.cpp) ----
-  struct HInsp { bool near = false, twisted = false, degen = false; double twistDeg = 30; } hinsp;
+  struct HInsp { bool near = false, twisted = false, degen = false, clip = false; double twistDeg = 30; } hinsp;
+  struct SelfClips { std::vector<Vec3> segs, tris; int n = 0; std::set<std::pair<int, int>> walls; std::vector<std::array<double, 8>> dbg; };   // (a lock clipping through itself: the crossing lines, the triangles on them)
+  const SelfClips& selfClips() const;                    // (ViewportInspectHair.cpp — kept until the scene changes)
   void loadHairInspect();
   void hinspChanged();
   double weldDistance() const;                           // (Auto weld points: set, else a quarter of the loop step)
@@ -334,11 +592,12 @@ public:
   // (side: Symmetry on — the side of X the stroke is on; a vertex across it with a pair is left to the mirror)
   struct TBM { std::vector<Vec3> base, nrm; Affine M, Mi; std::vector<int> vs; std::vector<double> w; std::shared_ptr<const topo::Bvh> surf; std::vector<int> pairs; std::vector<std::array<float, 2>> uv0; int side = 0;
                bool offSide(int v) const { return side && size_t(v) < pairs.size() && pairs[size_t(v)] >= 0 && pairs[size_t(v)] != v && base[size_t(v)].x * side < -1e-9; } };
-  struct TBrushDrag { int kind = 0; Vec3 hit0, n, nC; QPointF p0; double Rw = 0; std::map<int, TBM> meshes; bool moved = false; } tb_;
-  void tbPress(const QPointF& mp, bool shift, bool ctrl, int kind = -1, double radPx = 0, int only = -1);   // (kind / radius / mesh forced: PolyPen's RMB smoothing)
+  struct TBrushDrag { int kind = 0; Vec3 hit0, n, nC; QPointF p0; double Rw = 0; std::map<int, TBM> meshes; bool moved = false; bool alongN = false; } tb_;
+  // (kind / radius / mesh forced: PolyPen's RMB smoothing; alongN — RMB: the stroke's moves along the normals: Move — each vertex
+  // along its own normal, Smooth / Relax — only the part along the normal: the bumps flattened, nothing slides along the surface)
+  void tbPress(const QPointF& mp, bool shift, bool ctrl, int kind = -1, double radPx = 0, int only = -1, bool alongN = false);
   void tbMove(const QPointF& mp);
   void tbRelease();
-  void tbModePie(const QPoint& global);                  // RMB: the brush's mode (move / smooth / relax / inflate / shrink)
   // ---- the modelling tools (ViewportTopoTools.cpp): tpen — PolyPen, tloop — Loop, tknife — Knife, tchain — Smooth
   // EdgeChain, tweld — Weld, tplane — Plane Cut, tbevel — Bevel / Extrude, tinset — Inset, tbridge — Bridge; their
   // settings (kept between runs: topo/model), what they draw, the last edit made again when its settings change ----
@@ -361,6 +620,8 @@ public:
     bool fixWeld = true, fixDoubles = true, fixManifold = true, fixOrient = true;   // (FixMesh: its steps — points in one place welded, doubled walls out, non-manifold sides split, each part turned one way)
     bool optMidSide = false;                             // (Optimize: the vertices in the middle of a side taken out too)
     QString optMode = "safe";                            // (Optimize: safe — no weld that makes edges of three polygons; merge — every weld, the inner walls it makes taken out)
+    QString chainAnchor = "free";                        // (Smooth EdgeChain: how a dragged anchor moves — free: in the view's plane; surface: laid on the mesh under the pointer)
+    int subdLevels = 1; bool subdSmooth = false;         // (the Subdivide tool: how many times, simple (false) or smooth (Catmull–Clark's places))
     int mirAxis = 0, mirCount = 6; QString mirType = "mirror"; bool mirReplace = false, mirNormals = true, mirLocal = false;   // (mirReplace: the copy in place of the other side's region; mirNormals: the corners' own normals mirrored onto the copy)
     // (Mirror / the virtual symmetry: axis X Y Z, mirror / radial / radialMirror / radialHalf, copies)
     double normLen = 1;                                  // (the Normals tool: the shown normals' length, × a 20th of the mesh's size)
@@ -431,17 +692,17 @@ public:
   std::vector<QString> lobeNames(int m) const; int lobeActive(int m) const;
   const std::vector<int>& lobeLabels(int m);             // (each polygon's lobe — decoded once per change)
   std::vector<int> lobeCounts(int m);                    // (each lobe's polygons, by its number)
-  void lobeSetActive(int k); QString lobeNew(); QString lobeDelete(int k); void lobeRename(int k, const QString& name); QString lobeClear();
+  void lobeSetActive(int k); QString lobeNew(); QString lobeDelete(int k); QString lobeClear();
   const std::vector<lobes::LobeMap>& lobeMaps(int m);   // (each lobe laid onto a square — made again when the lobes change)
   int lobeSource() const;                                // (the mesh being built: the picked one, not the high-poly; else the last)
   bool lobeFlipped(int m, int k) const; void lobeFlip(int k);   // (lobe k's copy turned round)
   void lobeGhostBuild(); QString lobeGhostInfo(); QString lobeApply();
-  QString testLobeCrev(double q); QString testLobeTemplate(int src, int k); QString testNearVerts(int m, double px); QString testMirrorNormals(int m); QString testMirrorHalf(); QString testReplace(double x, double r); QString testMoveSel(const Vec3& d); QString lastReplaceInfo_; QString testPenFill(const Vec3& a, const Vec3& at); QString testFreePoint(const QPointF& mp);   // (tests: screen points)
+  QString testShell(); QString testUvSelfSym(double du, double dv); QString testLobeCrev(double q); QString testLobeTemplate(int src, int k); QString testNearVerts(int m, double px); QString testMirrorNormals(int m); QString testMirrorHalf(); QString testPenSym(const QString& what, int a, int b); QString testReplace(double x, double r); QString testMoveSel(const Vec3& d); QString lastReplaceInfo_; QString testPenFill(const Vec3& a, const Vec3& at); QString testFreePoint(const QPointF& mp);   // (tests: screen points)
   struct TTPt { int v = -1, ea = -1, eb = -1, anchor = -1; double t = 0; Vec3 w; };   // (a vertex / on the edge ea–eb at t / an anchor / free at w)
   void loadModelPrefs();
   void saveModelPrefs() const;
   bool isModelTool() const;
-  bool selectsAsCursor() const { return tool_ == "cursor" || tool_ == "tbridge" || tool_ == "tchain" || tool_ == "tweld" || tool_ == "tshaper" || tool_ == "tslide" || tool_ == "tnormals" || tool_ == "toptimize" || tool_ == "tmirror" || tool_ == "tfixmesh"; }   // (the tools that select as the Select Cursor — its selection kind, its Ctrl)
+  bool selectsAsCursor() const { return tool_ == "cursor" || tool_ == "tbridge" || tool_ == "tchain" || tool_ == "tweld" || tool_ == "tshaper" || tool_ == "tslide" || tool_ == "tnormals" || tool_ == "toptimize" || tool_ == "tmirror" || tool_ == "tfixmesh" || tool_ == "tmodgroups" || tool_ == "tsubdiv"; }   // (the tools that select as the Select Cursor — its selection kind, its Ctrl)
   bool topoToolPress(QMouseEvent* e);
   bool topoToolMove(const QPointF& mp, Qt::KeyboardModifiers mods);
   void modifiersChanged();                               // (Shift / Ctrl pressed or let go: the tool's preview at the pointer made anew — no move needed)
@@ -459,8 +720,12 @@ public:
   QString penDeleteAnchors();
   int penAnchorCount() const { return int(tt_.anchors.size()); }
   bool chainActive() const { return tt_.ec.m >= 0; }
+  int knifeCurves() const { return int(tt_.kc.size()); }   // (the knife's curves drawn and not cut yet)
+  const double& chainSimp() const { return tt_.ec.simp; }   // (the Smooth slider's value: how far the anchors have been reduced)
   QString chainCreate();
   QString chainApply(bool commitIt);
+  void chainSimplify(double s);                           // (Smooth slider: fewer and fewer anchors, sliding along the curve, down to the two ends)
+  QString chainSmoothCurve();                            // the curve itself smoothed one pass (each anchor towards its neighbours, the ends stay), the edges follow — repeat for more
   QString knifeCut();
   void kSave() { tt_.kUndo.push_back({tt_.kc, tt_.kcur}); tt_.kRedo.clear(); }   // (the knife curves before a change: Ctrl+Z brings them back)
   bool kUndoRedo(bool redo);
@@ -485,6 +750,11 @@ public:
   QString tMirrorMesh();                                 // a copy by the axis / round it (the side found by itself), the seam welded
   QString vsymCreate(const QString& type);               // the selected meshes into a group with a virtual symmetry (a preview)
   QString vsymApply(int group);                          // the group's symmetry made real geometry
+  QString tSubdivide();                                  // the Subdivide tool: the selected polygons (none — the whole mesh) split into quads for good
+  QString subdivCreate();                              // the selected meshes into a new Subdivision group (the modifier groups tool)
+  QString subdivApply(int group);                        // the group's subdivision made real geometry of its meshes (the group stays, empty of the modifier)
+  QString subdivReconstruct(int group);                  // the group's meshes one level down, the difference kept as level 1's detail
+  int subdivGroupOf(int item) const;                     // (the Subdivision group holding it — −1)
   QString tNormalsSmooth();                              // the selected polygons smooth (one normal per vertex), hard at their border
   QString tNormalsSet(const QString& dir);                 // the selected vertices' normals one direction: +x … -z, cam (toward the camera), one (their average)
   QString tNormalsFromBack();                          // the selected edges' vertices: the normal of the back wall round them (the polygons turned away from the camera)
@@ -514,7 +784,6 @@ public:
   void saveTopoPrefs() const;
   int topoMesh() const;                                  // the active mesh (−1)
   std::vector<int> topoMeshes() const;                   // shown imported meshes, not references
-  bool topoHeavy(int m) const;
   void setTopoMode(const QString& k, bool quiet = false);
   char tKey() const { return topoMode == "poly" ? 'f' : topoMode == "edge" ? 'e' : 'v'; }
   void tselApply(int m, const std::vector<int>& list, const QString& op, char key = 0, bool sym = true);
@@ -557,14 +826,20 @@ public:
   QString visApply(int m, const QString& hid);          // a visibility layer shown: its hidden polygons hidden (empty — the whole model); one undo step
   QString visSelect(int m, const QString& hid);         // a visibility layer's polygons (those it shows) selected
   QString tHideSel();                                    // H: the selected polygons hidden (not the mesh)
+  bool tHasCompSel() const { return topoMode != "object" && !tselMeshes().empty(); }   // (polygons / edges / vertices selected on some mesh)
   QString tUnhideAll();                                  // every hidden polygon / polygroup of the room shown
   bool anyHidden() const;
+  bool fillHas(const QString& k) const;
+  void setFillMode(const QString& k);                   // Fill's mode (normal / shell / hard / crease / group): the hover preview made again
+  std::vector<int> fillRegionCalc(int m, int f, bool inv) const;
+  // (the last region found, kept while nothing it hangs on changes: the pointer moving inside it takes it as it is — recording Dress_3,
+  // 01:47: Fill by UV shell hovering over a 15k-polygon mesh, every new polygon under the pointer found the seams of the whole mesh again: 5 FPS)
+  mutable struct FillCache { int m = -1; const void* B = nullptr; QString mode, hid; int ver = -1, rev = -1; bool inv = false; char key = 0; std::vector<char> in; std::vector<int> region; } fillCache_;
   std::vector<int> fillRegion(int m, int f, bool inv = false) const;   // the polygons reached from f: up to a cut and the selection's frame (inv: the selected piece)
   bool topoClickTool(const QPointF& mp, bool shift, bool ctrl);
   std::vector<int> tPickable() const;
   std::set<int> tTouchedFaces(int m) const;              // the polygons the selection is on
   bool tIsolateSel();                                    // Ctrl+Shift+H in a component mode: only the selected shown / all back                    // the meshes a click can pick (a component mode: only the active one)   // Fill / Outline: a click (→ handled)
-  std::vector<int> rimLoop(int m, int e) const;          // the open outline through a rim edge
   int hardEdgeNear(int m, const QPointF& mp, double px = 12) const;   // the hard edge nearest the pointer on screen (Select Hard Edges)
   std::vector<int> hardLine(int m, int e) const;        // the line of hard edges through e: on through each vertex two hard edges meet at
   int rimEdgeNear(int m, const QPointF& mp, double px = 40) const;   // the mesh's border edge nearest the pointer on screen (Outline: no need to hit it exactly)
@@ -611,6 +886,7 @@ public:
     struct Tris { std::vector<Vec3> p; QColor c; float op = 0.3f; float lift = 0; };   // (lift: pulled this much nearer the camera — a proxy's triangles over the surface they stand for)
     struct Pts { std::vector<Vec3> p; std::vector<QColor> c; float size = 5; bool xray = false, noPdo = false; };   // (xray: over everything)
     std::vector<Lines> lines; std::vector<Tris> tris; std::vector<Pts> pts;
+    std::vector<int> edgesMore;                          // (the other selected meshes in a component mode: their wire too)
     int edgesOf = -1; QColor edgesC; float edgesW = 1;   // (every edge of this mesh: drawn from its own wire)
     int pointsOf = -1;                                   // (every vertex of this mesh: the renderer's buffer — the picked ones white)
   };
@@ -622,8 +898,9 @@ public:
   void hairSymApply(const HairSym& H);
   void hairSymPlanes(TopoDraw& D) const;
   void hairInspectDraw(TopoDraw& D) const;               // (the Hair room's highlights into the overlay)
+  mutable SelfClips clips_; mutable long long clipRev_ = -1;
   // (the Hair room's checks on: they follow every change of the hair — the anchors dragged, the walls built anew)
-  long long hairInspKey() const { return room() == "hair" && (hinsp.near || hinsp.twisted || hinsp.degen) ? (long long)scene_->revision * 1000003LL + overlayRev_ : 0; }
+  long long hairInspKey() const { return room() == "hair" && (hinsp.near || hinsp.twisted || hinsp.degen || hinsp.clip) ? (long long)scene_->revision * 1000003LL + overlayRev_ : 0; }
   bool topoTwoTone(int id) const;                        // (the active mesh in a component mode)
   double topoOpacity(int id) const;                      // (the selected meshes: Display → Opacity)
   double topoPdo(int id) const;                          // (the selected meshes: PDO, a share of the distance)
@@ -633,12 +910,12 @@ public:
   // the UV Editor (a window in the 'uv' view): the active mesh's UV (and the other selected meshes' — dim), picked and
   // moved by the mode (polygons, edges, UV points), Alt / MMB pan, Alt+RMB / the wheel zoom; the edits (seams, Unfold,
   // Pack, turns) — each one undo step. Preserve UVs (tset.keepUv): moved vertices keep their place in the texture
-  struct UvOpts { bool checker = false, c3d = false, s3d = false, tex = true, stretch = false; double dispOp = 0.6; bool rotate = true, strUp = true, boxMid = false, strSpread = true; int warpN = 3; double density = 64, pad = 0.01, angle = 50, strAmt = 0.7; bool symUnfold = true, symTint = true, pivShells = false, diag = false, stretchAngle = false; double symAxis = 0.5; } uvo;   // (symUnfold: a shell lying across the mesh's X = 0 unfolded symmetric)   // (pivShells: the gizmo turns / scales each shell about its own middle) (the UV symmetry is the Topology one — tset.sym: the mirrored shells follow across U = symAxis; symTint: the −X mirror shells burgundy)   // (strAmt / strUp: Straighten — how far, upright; boxMid: the transform's place — the box's middle, else its corner)
+  struct UvOpts { int anch = 4; int packPasses = 1; bool packFinal = false; bool packEqual = false; bool packFree = false; bool checker = false, c3d = true, s3d = false, tex = true, stretch = false; double dispOp = 0.6; bool rotate = true, strUp = true, boxMid = false, strSpread = false; int warpN = 3; double density = 64, pad = 0.01, angle = 50, strAmt = 0.7; bool symUnfold = true, symTint = true, pivShells = false, diag = false, stretchAngle = false; double symAxis = 0.5; int rectMode = 1; QColor cSel{0xff, 0x9a, 0x2e}, cSeam{0xff, 0x5a, 0x4f}, cBorder{0x5f, 0xd3, 0xc4}, cWire{0xa8, 0xa8, 0xb4}, cPadOk{0x5a, 0xb4, 0xe8}, cPadBad{0xff, 0x30, 0x30}; } uvo;   // (symUnfold: a shell lying across the mesh's X = 0 unfolded symmetric)   // (pivShells: the gizmo turns / scales each shell about its own middle) (the UV symmetry is the Topology one — tset.sym: the mirrored shells follow across U = symAxis; symTint: the −X mirror shells burgundy)   // (strAmt / strUp: Straighten — how far, upright; boxMid: the transform's place — the box's middle, else its corner)
   bool uvMode() const { return room() == "topo" && tset.uv; }
   void setUvMode(bool on);
   void setPreserveUv(bool on);
   void saveUvPrefs() const;
-  int uvRevision() const { return uvRev_; }
+  void saveUvColors() const; void loadUvColors();        // (the UV Editor's colours: kept in the settings)
   void uvChanged() { uvRev_++; staticRev_++; topoRev_++; overlayRev_++; requestUpdate(); }   // (an option: drawn anew)
   bool uvShown(int id) const;                            // (its UV in the editor, its checker in 3D: the active mesh, the selected ones)
   bool uvDispShown(int id) const;                        // (the object's UV checker / stretch in 3D — in every mode: the active mesh, the selected ones)
@@ -665,7 +942,7 @@ public:
     struct Lines { std::vector<std::array<float, 2>> p; QColor c; float w = 1; };
     struct Tris { std::vector<std::array<float, 2>> p; std::vector<QColor> c; float op = 0.3f; };   // (a colour per triangle)
     struct Pts { std::vector<std::array<float, 2>> p; std::vector<QColor> c; float size = 5; };
-    std::vector<Lines> grid, lines; std::vector<Tris> tris; std::vector<Pts> pts; int texMesh = -1, texMat = -2; bool checker = false; float op = 1;   // (checker: the labelled checker under the UV — before the texture; op: its / the texture's opacity)   // (texMat: the picked UV Mat — its texture under the UV; −2 — the first one there is)
+    std::vector<Lines> grid, lines; std::vector<Tris> tris; std::vector<Pts> pts; std::vector<std::array<float, 2>> chk; int texMesh = -1, texMat = -2; bool checker = false; float op = 1;   // (checker: the labelled checker under the UV — before the texture; op: its / the texture's opacity)   // (texMat: the picked UV Mat — its texture under the UV; −2 — the first one there is)
   };
   const UvDraw& uvDraw();
   const QByteArray& uvDrawSig() const { return uvSig_; }
@@ -673,6 +950,7 @@ public:
   const QByteArray& uvHoverSig() const { return uvHovSig_; }
   QString uvStatus();                                    // shells, turned over, the tile filled
   QString uvMarkSeams(bool on);                          // the selected edges (polygons: their outline)
+  QString uvDropSeamsBetween(int nA, int nB);
   QString uvSew();                                       // the UV sewn along the selected edges: both sides' points brought together, no seam there
   QString uvSeamsByAngle(double deg);
   QString uvSeamsFromBorders();
@@ -683,10 +961,12 @@ public:
   QString uvSymmetrize();                                // Shift+Y: the selected side's UV put on its mirror (the mesh's X): across U = symAxis, a shell across the plane — its own middle
   std::vector<uv::Feature> uvFeaturesOf(int m) const;   // the face's features (lips, lids — raw "uvFeatures": [{a, b, c, s}]): their points face each other in UV
   QString uvFeatureKey(int mode);                        // L (0): the selected loop / the holes of the selected shells — open pairs; Shift+L (1) — closed (shut); Alt+L (2) — taken off
-  void setSymmetry(bool on);                              // the Topology room's Symmetry (Shift+X) — the UV Editor's too: on / off, saved, told
+  QString uvFeatureLid(bool upper);                      // the selected rim made the upper / the lower lid
+  QString uvSmoothChain(double amount);                  // Smooth Edge Chain (UV): the selected runs of edges drawn into a smooth curve
+  void setSymmetry(bool on);                              // the Topology room's Symmetry (Shift+S) — the UV Editor's too: on / off, saved, told
   // the UV Editor's hotkeys mode (ViewportUvKeys.cpp): C U O W, Alt+V / Alt+T / Alt+Shift+C; pins; the hover preview
   bool uvKeys = false;
-  char uvBrush = 0; double uvBrushR = 40, uvBrushK = 0.5;  // the UV brush on: 'r' Relax, 'p' Pin; its radius (screen px), the Relax's step
+  char uvBrush = 0; double uvBrushR = 40, uvBrushK = 0.5, uvBrushHard = 0;   /* (uvBrushHard: the Grab brush's hardness 0…1 — how wide its middle moves whole before the falloff) */  // the UV brush on: 'r' Relax, 'p' Pin; its radius (screen px), the Relax's step
   void setUvBrush(char kind);                            // (the same again — off)
   QString uvBrushTest(char kind, double u0, double v0, double u1, double v1, bool mod);   // (tests: a stroke from UV a to b)
   void uvTestHover(int f) { thov_ = {}; thov_.m = topoMesh(); thov_.f = f; topoRev_++; requestUpdate(); }   // (tests: the pointer over polygon f in 3D — the UV preview)
@@ -695,14 +975,27 @@ public:
   QString uvSeamKey();                                   // C: edges — seams; polygons — cut off into a shell of their own
   QString uvPinStraight(bool vertical);                  // Alt+V / Alt+T: straightened up / across and pinned
   QString uvUnpin();                                     // Alt+Shift+C
+  void uvPinsNormalize(int m, const PolyMesh& B, const topo::TTopo& T);   // (H ↔ V after a turn)
+  bool uvNormNext_ = false;                                               // (the next uvEdit is a turn by the user or a Pack: the constraints follow it)
+  QString uvPinKind(const QString& what);                // the constraints block: pin / angled / unh / unv / unall
+  std::function<std::vector<int>(int)> uvSideFinder(const PolyMesh& m, const topo::TTopo& T, const uv::Shells& S) const;   // (an edge → the polygon on the side of the shell the work is on)
+  mutable std::map<int, std::set<int>> uvEdgeSideTmp_;               // (edge → the polygon it was found on, in the UV Editor, by the last area pick)
+  bool uvSideOn(const TSel& s, int e, int f) const { const auto g = s.eSide.find(e); return g == s.eSide.end() || g->second.count(f) > 0; }
+  TSel uvOpSel() const;                                   // what an operation works on: the pick, with Symmetry on its mirror too (the pick itself stays one-sided)
+  std::map<int, std::set<int>> uvMirrorSides(int m, const TSel& s) const;   // the mirror of the edges' picked sides (an entry with no polygons: every side)
+  std::set<int> uvGhostPts() const;                       // the UV points mirroring the picked ones
+  std::set<std::pair<int, int>> uvSelPointSides(const TSel& s, const topo::TTopo& T, const uv::Shells& S) const;   // the picked places as (vertex, a polygon of its shell)  // (the selected edges → the shell side they were picked on in the UV Editor; valid for the selection version uvEdgeSideVer_)
+  std::vector<int> uvLoopOnSide(int el, int ek);   // the edge loop through el on the side of corner ek only (uvEdgeSideTmp_ filled)
+  void uvNoteSides(const std::vector<int>& edges, const QString& mode); void uvSidesOnShell(const topo::TTopo& T, const uv::Shells& S, const std::vector<int>& edges, int shell, const QString& mode);
   uv::Pins uvPinsOf(int m) const;
   const std::vector<std::array<float, 2>>& uvPreviewLines();   // (the shell under the pointer in 3D as Unwrap would lay it: line pairs)
   struct { const PolyMesh* B = nullptr; int stamp = -1, cur = -1; std::vector<int> shell, mc; std::vector<std::array<float, 2>> lines; } uvPrev_;   // (mc: the mirror corners — a symmetric unfold previewed so)
   QString uvOptimize();                                  // Optimize (RizomUV's): the selection's shells (none — all) relaxed as they lie — no seams cut, not packed
   QString uvToRizom(bool ask = false, bool launch = true);                   // the active mesh to RizomUV (an OBJ, its UV); its saves bring the UV back (ask: pick rizomuv.exe again)
   QString uvFromRizom(const QString& path);
-  QFileSystemWatcher* rzWatch_ = nullptr; int rzMesh_ = -1; qint64 rzStamp_ = 0; std::vector<int> rzTile_;   // (rzTile_: per polygon the RizomUV tile its UV Mat went to — its U that much along)
+  QFileSystemWatcher* rzWatch_ = nullptr; int rzMesh_ = -1; qint64 rzStamp_ = 0; std::vector<int> rzTile_; std::vector<std::array<int, 3>> rzParts_;   // (rzTile_: per polygon the RizomUV tile its UV Mat went to — its U that much along)
   QString uvPack(bool all);
+  QString uvPackMulti(bool all = true);                                   // every shell of the selected meshes into one tile
   QString uvTurn(int quarters);                          // (+1: a quarter turn anticlockwise)
   QString uvFlip(bool u);
   QString uvSelectShells();
@@ -720,11 +1013,15 @@ public:
   QString uvTfInfo();                                    // (tests: the Frame / Warp / Puppet state)
   QString uvSymCheck() const;                            // (tests: the moving corners' mirrors against their mirrored places)
   bool uvSymAxisFromSel();                               // (the axis through the selection's middle)
-  void uvSymApply(std::vector<std::array<float, 2>>& U) const;   // (the UV symmetry: the mirrored partners of the moving corners follow, across U = symAxis)
-  struct UvSymMap { const PolyMesh* B = nullptr; size_t n = 0; std::vector<int> part; }; mutable UvSymMap uvSymMap_;   // (each corner's mirror corner — by the mesh's X symmetry)
+  void uvSymApply(std::vector<std::array<float, 2>>& U, const std::vector<std::array<float, 2>>* start = nullptr) const;   // (the UV symmetry: the mirrored partners of the moving corners follow, across U = symAxis)
+  struct UvSymMap { const PolyMesh* B = nullptr; size_t n = 0; std::vector<int> part; std::vector<char> onPlane; };
+  mutable UvSymMap uvSymMap_;   // (onPlane: the corner's vertex is its own mirror - on the plane x = 0)   // (each corner's mirror corner — by the mesh's X symmetry)
   QString uvPuppetSynth(int fanAt);                      // (checks: a straight strip, pins at its ends and middle, the far end turned 60° round the middle; fanAt: a fan of thin triangles round the middle pin)                       // (checks: two pins at the ends, one turned 90° round the other — the edges' stretch, folded triangles)
   std::optional<std::array<double, 4>> uvSelBox();       // the selection's UV box (u0, v0, u1, v1) — none: nothing selected
+  QString uvScaleBy(double k);
+  bool uvMapAllPicked(const std::function<uv::UV(const uv::UV&)>& fn);   // one UV map put on every picked mesh's pick (false: one mesh picked only)                           // the selection scaled by k about its box's anchor (each shell about its own: uvo.pivShells)
   QString uvSetBox(double u, double v, double w, double h);   // the selection moved / sized to that box (u, v: its corner, or middle — uvo.boxMid)
+  QString uvStretchFill(); int uvGroupAt(const QPointF& mp) const;
   QString uvSnapEdge(const QString& side);              // left / right / top / bottom / centre / fit: the selection against the tile's edges, uvo.pad off them
   // lining up (ViewportUvAlign.cpp): the selection — UV points (Vertex / Edge mode) or whole shells (Polygon mode)
   QString uvAlign(const QString& side);                 // left / right / top / bottom / hmid / vmid: to the selection's edge / middle
@@ -750,7 +1047,9 @@ public:
   // each shell's own settings (raw "uvShellAttr": [{k: its anchor polygon's vertices, sorted; lock, noTurn, scale, group}]):
   // per polygon (all of a shell's alike); the selected shells' — lock / noturn (toggled), scale <x>, group (a new one), ungroup
   std::vector<uv::ShellAttr> uvShellAttrs(int m) const;
+  void uvAttrUpgrade(int m);                             // (settings saved with their anchor alone: given the spread polygons of the shell they hold now — before an edit)
   QString uvShellSet(const QString& what, double v = 0);
+  QString uvOverlapOnto(const std::vector<int>& src, int targetFace); QString uvOverlapSel(); void uvCopyShells(); QString uvPasteShells(); std::vector<int> uvClip_; int uvClipMesh_ = -1;
   // ▦ UV Sets and UV Mats (ViewportUvSets.cpp): a mesh's materials — UV Mats (each a set of polygons with its own texture:
   // the texture manager's sets) — grouped into UV Sets (raw "uvSets": [{ name, mats: [mat names; "" — Default] }]): the
   // mats of one set share the 0…1 tile, overlapping (a head, a body, the arms, the legs — each its own texture); no
@@ -761,28 +1060,61 @@ public:
   std::vector<UvMat> uvMats(int m) const;
   mutable std::map<int, std::pair<QByteArray, std::vector<UvMat>>> uvMatsC_;
   std::vector<UvSetL> uvSets(int m) const;
+  bool uvNone(int m) const;                              // (no UV at all, no sets: the panel lists no default set — the user makes them)
   mutable std::map<int, std::pair<QByteArray, std::vector<UvSetL>>> uvSetsC_;   // (uvSets / uvMats: made once per geometry and its lists)
   int uvSetOfMat(int m, int mat) const;
   struct UvPickS { int id = -1, set = -1, mat = -2; } uvPicked;
-  bool uvSetIso = false;                                 // (a picked UV Set isolated: only its shells shown in the UV Editor; else its polygons tinted, the rest shown too)
+  bool uvTiles = false;                                  // (All sets as tiles: every UV Set of the project at once, each in a tile of its own — to look at)
+  void setUvTiles(bool on); std::vector<QString> uvTileNames() const; std::array<double, 2> uvTileOrigin(int i, int n) const; int uvTileAt(const QPointF& mp) const;
+  void uvTilesFrame(); bool uvTilePick(const QPointF& mp); void uvTilesDraw(UvDraw& D); void uvTileLabels(std::vector<ViewLabel>& out) const;
+  bool uvSetIso = true;                                  // (a picked UV Set isolated: only its shells shown in the UV Editor; else its polygons tinted, the rest shown too)
   std::set<int> uvSetsOfSel(int m) const;                // the UV Sets the selected polygons lie in (their rows lit)
   QString uvSetFromShells(int set);                      // the selected shells (whole) into a new set (−1) or into that one   // (mat −2: none — the whole set, or everything)
   void uvPickSet(int m, int set);                        // (again — let go)
   void uvPickMat(int m, int mat);
   std::vector<char> uvHidden(const Item& it, const PolyMesh& B) const;   // hidden, or out of the picked set / mat
+  int uvWorkSet(int id, const PolyMesh& B) const;        // the UV Set worked in, as this mesh has it (by its name — picked on any of the meshes): its index; −1 the mesh hasn't it; −2 no set worked in
   std::vector<int> uvMatFaces(int m, const std::set<int>& mats) const;
   std::vector<std::vector<int>> uvMatGroups(int m) const;   // the shown polygons (the picked set / mat) by UV Mat — Pack all / Unfold all: each mat its own tile
   int uvSelectMats(int m, const std::set<int>& mats);    // their polygons selected (Polygon mode)
   // the texture a UV Set is laid out for (raw "uvTex": { set name — "": the mesh's own, no set: { w, h, pad } }): its size
   // in pixels (a rectangle too: the UV kept texel-square in it), the padding between the shells and off the edges in pixels
-  struct UvTex { int w = 2048, h = 2048; double pad = 8, td = 0; double asp() const { return double(h) / w; } };   // (td: the texel density wanted — texture pixels per scene unit (cm); 0 none)
-  UvTex uvTex(int m, int set = -2) const;               // (set −2: the picked one; −1: the mesh's own)
+  struct UvTex { int w = 2048, h = 2048; double pad = 8, td = 0; QString color, tex; double asp() const { return double(h) / w; } };   // (td: the texel density wanted — texture pixels per scene unit (cm); 0 none; color: the set's label '#rrggbb', empty — automatic; tex: "" — a colourless checker, "color" — a coloured one, else an image's path)
+  UvTex uvTex(int m, int set = -2) const;               // (set −2: the picked one — or the empty set lit; −1: the mesh's own)
+  QString uvWorkSet(int m) const;                       // (the set whose properties the mesh works by now — empty: its own)
+  UvTex uvSetProps(const QString& name) const;
+  void setUvSetSize(const QString& name, int w, int h);   // (a named set's texture size, the rest of its numbers kept — an undo step)           // (a named set's properties — the project's, raw "uvSetProps")
   uv::PackOpts uvPackOpts(int m) const;                  // (Pack / Unfold / Optimize: that texture — its size, its padding, turns allowed)
   QString uvSetTex(int m, const UvTex& t);               // (the picked set's — else the mesh's own; an undo step)
   bool uvShowPad = false;                                // (the padding round each shell drawn in the UV Editor)
+  // the materials library (the strip's UV Mats): every material of every mesh, by name; one dragged onto an object (all its
+  // polygons), the shells picked in the UV Editor, or an outliner row (a group: every mesh in it) is made a mat of that mesh
+  struct MatDef { QString name, color; char alpha = 0; std::array<PolyMesh::Map, 2> maps; int faces = 0; };   // (faces: how many polygons use it in all)
+  std::vector<MatDef> matLibrary() const;
+  // the project's UV Sets (raw "uvSetsFree" in the file: the empty ones that belong to no mesh yet)
+  std::vector<QString> uvFreeSets() const;
+  std::vector<QString> uvSetNamesAll() const;            // the free ones, then every mesh's
+  QString uvFreePicked;                                  // (the empty set lit in the window: ⇲ Add puts the selection into it)
+  QString uvSetNewFree(const QString& name = {});
+  void uvOutlineShell(int m, const std::vector<int>& faces);   // (the Polygon mode: the picked polygons' outline made seams — a shell of their own)
+  QString uvSetNewFrom(int m, const std::vector<int>& faces);   // (a new set of exactly these polygons — the project's name, no UV needed)
+  QString uvSetFreeDelete(const QString& name);
+  QString uvSetFreeRename(const QString& from, const QString& to);
+  QString uvSetPut(int m, const QString& name, const std::vector<int>& faces, bool move);   // (one undo step) move: out of the mesh's other sets
+  // polygons going into a set that are in another set already: what to do with them (the clash report asks)
+  //   Exclude — they stay out; MoveNew — out of the other sets, a new unwrap in this one; CopySame — they stay, the same UV copied in
+  //   (the plain Add); CopyNew — they stay with their UV, a new unwrap in this set. A mesh with no UV: the selected area is cut into a shell
+  //   and unfolded by the Add itself (ready shells are never unfolded again)
+  enum class SetClash { Exclude, MoveNew, CopySame, CopyNew };
+  struct SetClashInfo { int mesh = -1, n = 0; QStringList sets; };
+  SetClashInfo uvSetClash(const QString& name) const;     // the selected polygons that are in a set other than `name`: how many, which
+  QString uvSetPutPicked(const QString& name, bool move, SetClash mode = SetClash::CopySame);   // the picked objects / the selected shells into it
+  QString uvTestStrip();                                  // (checks: the selected mesh without any UV, sets or seams)
+  QString matAssign(int m, const std::vector<int>& faces, const MatDef& def);   // (faces empty: the whole mesh) one undo step
+  QString matDrop(const QPoint& global, const MatDef& def);                      // (dropped at a screen point: the UV Editor's shells, or the object under it)
   QString uvSetNew(int m, const std::vector<int>& faces = {}, const QString& name = {});   // a new set; the selected polygons (or these) go into it, under that name (none — "UV Set n")
   QString uvSetApply(int m, int set);                    // the selected polygons' mats into the set (a part of a mat: a new mat)
-  QString uvSetRename(int m, int set, const QString& name);
+  QString uvSetRename(int m, int set, const QString& name); bool uvRenameBatch_ = false;
   QString uvSetDelete(int m, int set);                   // its mats to the first other set
   QString uvMatNew(int m);                               // a new mat in the picked set (else the first); the selected polygons get it
   QString uvMatApply(int m, int mat);                    // the selected polygons get the mat
@@ -813,6 +1145,8 @@ public:
   double splitR = 30;
   void setPieHost(QWidget* w) { pieHost_ = w; }
   bool startFillAt(const QPoint& global);               // ◎ Detect the fill outline here (ViewportFill.cpp)
+  QString fillTitle;                                    // (the outline it found last — the tests read it)
+  QString fillTestNear(int id, int side, int select = 1);                // (tests: ViewportFill.cpp)
   // a pie item's preview: lines drawn over everything — A cyan (what is there), B orange (what the item does)
   void setPieViz(const std::vector<std::vector<Vec3>>& a, const std::vector<std::vector<Vec3>>& b) { pieVizA_ = a; pieVizB_ = b; overlayRev_++; requestUpdate(); }
   std::vector<int> snapSrc;                              // (⇶ Snap to path: the curves last copied with ⧉ SEL)
@@ -820,9 +1154,13 @@ public:
   bool lockSel = false;                                  // ⧉ Lock select: a click on a curve / wall picks every curve of its lock
   Box3 baseBox(const PolyMesh* B) const;                 // (a geometry's box — kept)
   struct BoxC { const PolyMesh* B; int rev, srev; size_t n; Box3 box; }; mutable std::vector<BoxC> boxCache_;                                      // (tests: where a step's time went)
-  bool hairSnap = false;                                 // (the Hair room's Snap: dragged anchors stick to the reference meshes)
+  bool hairSnap = false;                                 // (the Hair room's Snap: new and dragged anchors stick to the reference meshes)
   void snapAnchors(const std::vector<int>& list);
-  bool keyB = false;                                     // (B held: LMB drag — the selected anchors' smoothness)
+  // (the Paint room: the brush put down on a polygon of another UV set — that set shown and painted. ask: only told whether it would be)
+  std::function<bool(const QString& set, bool ask)> paintSetSwitch;
+  QString paintSetUnder(const QPointF& m) const;
+  bool keyRoll = false;                                 // (the Paint room, R held: LMB drag rolls the view)
+  bool keyB = false;                                    // (B held: LMB drag — the selected anchors' smoothness)
   // NURBS surface mode (ViewportSurfCut.cpp): the wall being cut, the cut's ends on its curves and its anchors on it
   bool surfCutting() const { return scut_.has_value(); }
   bool surfCutEdgeReady() const { return scut_ && !scut_->pts.empty() && (scut_->edge || scut_->start); }   // (anchors on the wall: Enter cuts — ends not on a curve carried to the edges)
@@ -865,12 +1203,14 @@ public:
   bool showColl = false;                                 // (the collision shapes shown — while the mesh's Collision block is open)
   static Item& newGroup(Scene& s, int parent, bool topoRoom);   // (an empty "Group N" at 0, 0, 0 — in the Hair room's Curves column a colour of its own)
   std::optional<Vec3> selectionCentre() const;           // (the selected vertices' / polygons' middle, else the picked objects' — the gizmo's place)
-  std::vector<int> mergeableMeshes() const;              // (the picked meshes that can be merged into one)
+  std::vector<int> mergeableMeshes() const;              // (the picked meshes that can be merged into one — a picked group stands for its meshes)
+  int mergeGroup() const;                                // (the first picked group, -1: none — the merged mesh is named after it and stands in its place)
   QString mergeMeshes(const std::vector<int>& ids, const Vec3& pivot, const std::optional<Quat>& axes = std::nullopt);   // (one mesh of them — world space, their polygroups kept — its pivot there, its gizmo's axes those given)
   // any edit of the scene: fn changes it (and the selection), → a message for the toast ("" — none; "!…" — nothing done)
   void runEdit(const std::function<QString(Scene&, Selection&, const CurveCache&)>& fn, bool topology = true);
   void toggleHide();                                     // H
   void toggleIsolate(bool withHead);                     // Ctrl+H / Shift+H
+  void warnNoHead();                                     // (Shift+H with no shown mesh tagged HEAD: said so)
   void toggleIsolateGroup();                             // Ctrl+Shift+H
   int workingGroup() const;
   // ◎ Solo: Ctrl+Shift+H that follows the selection (the group you work in is the only one shown); kept in the settings
@@ -901,11 +1241,18 @@ public:
   bool takeAllWalls() { bool b = allWalls_; allWalls_ = false; return b; }
   std::set<int> takeDirtyWalls() { std::set<int> s; s.swap(dirtyWalls_); return s; }
   bool takeRingsDirty() { bool b = ringsDirty_; ringsDirty_ = false; return b; }
+  void gpuReset() { allWalls_ = true; ringsDirty_ = true; }   // (the renderer's buffers made anew: the walls and rings uploaded again)
 
   bool showWire = false;
+  // (20.11: each view's own — the frame's ⬡ wireframe view: the meshes with a wire drawn as the wire alone; ▦ their wire over their
+  // polygons; set from the view settings, "paneWire"; Head Collision's objects never take either)
+  struct PaneWire { bool only = false, wire = false; bool operator==(const PaneWire& o) const { return only == o.only && wire == o.wire; } };
+  std::array<PaneWire, 4> paneWires{};
+  PaneWire paneWire(int i) const { return paneWires[size_t(i & 3)]; }
   int framesDrawn = 0, lodFrames = 0;                    // (checks: frames made, of them with a LOD shown)
   // the frame counter (the overlay's, top right): when the last frames were made, how long the last one took
-  void noteFrame(double ms) { lastFrameMs = ms; frameAt_[size_t(frameHead_++ % frameAt_.size())] = QDateTime::currentMSecsSinceEpoch(); }
+  void noteFrame(double ms) { lastFrameMs = ms; frameAt_[size_t(frameHead_++ % frameAt_.size())] = QDateTime::currentMSecsSinceEpoch(); if (frameHook) frameHook(ms); }
+  std::function<void(double ms)> frameHook;              // (a frame drawn and what it cost — the session's record: the frames of each second, the slowest)
   double lastFrameMs = 0;
   double fps() const {                                   // (over the last second of frames; 0 — none lately: the view rests)
     const qint64 now = QDateTime::currentMSecsSinceEpoch(); int n = 0; qint64 first = now;
@@ -946,6 +1293,7 @@ public:
 
 signals:
   void statusText(const QString& s);
+  void snapHoldChanged();                                // (V / X held or let go: the Snap button lights while the key is down)
   void viewChanged(const QString& view);
   void selectionChanged(const std::vector<int>& items);
   void sceneEdited();                                    // items came / went / were renamed: the outliner anew
@@ -953,10 +1301,13 @@ signals:
   void weldIssues(const std::vector<hm::WeldProblem>& problems, bool report);   // Check connections / Convert found these
   void pieRequested(const QPoint& global);               // Shift+RMB: the actions pie
   void opsPieRequested(const QPoint& global);            // Ctrl+RMB (the Topology room): the edits of the selected
+  void uvPieRequested(const QPoint& global);              // Ctrl+RMB in the UV Editor: what RMB does there
+  void uvConstraintPieRequested(const QPoint& global);   // Alt+C in the UV Editor: the pins / constraints pie
   void brushChanged();                                   // radius / hardness changed in the viewport
   void toolChanged(const QString& tool);
   void soloChanged(bool on);
   void topoState();                                      // (Topology: the mode, the selection, the picked polygroups changed)
+  void paintVisChanged();                                // (the Paint room: eyes, locks, sets, the NoPainted label)
   void roomChanged(const QString& room);
   void historyChanged();                                // (a step made, undone, jumped to or taken out)
   void historyOverwritten(int n, bool bySlider);                        // (an edit made back in the history: the n later steps gone)
@@ -966,6 +1317,7 @@ protected:
   void mouseReleaseEvent(QMouseEvent* e) override;
   void mouseMoveEvent(QMouseEvent* e) override;
   void wheelEvent(QWheelEvent* e) override;
+  void tabletEvent(QTabletEvent* e) override;
   void keyPressEvent(QKeyEvent* e) override;
   QPointF paneOrigin() const { return paneRect(act_).topLeft(); }
   void choosePane(const QPointF& windowPos);           // (no drag going on: the pane under the pointer becomes active)
@@ -975,11 +1327,15 @@ protected:
 private:
   struct AnchorDrag { std::vector<int> list; std::vector<Vec3> starts; Vec3 ref, n; std::optional<Vec3> startHit; bool moved = false, inserted = false; int snap = -1; };
   // (with the project's weld settings and marked places: weld, lockWeld, weldOk, weldSnap — undone as edits)
+  struct GzCustom { Quat q; Vec3 pivot; bool hasPivot = false; QByteArray key; };   // (Custom: the gizmo put by Alt + drag)
   struct Snapshot { std::map<int, Item> items; std::map<int, Anchor> anchors; std::vector<int> roots; Selection sel; QJsonObject weld; std::vector<RefPlane> refPlanes;
-                   TSel tsel; QString tmode; std::shared_ptr<const void> chain; std::shared_ptr<const void> patchUsed; QString label; bool weak = true; qint64 at = 0; };   // (label: what the step was — weak: guessed from the tool)   // (tsel, tmode: the Topology room's selection — undone too; chain: the Smooth EdgeChain curve as it was)
+                   TSel tsel; QString tmode; std::shared_ptr<const void> chain; std::shared_ptr<const void> patchUsed; QString label; bool weak = true; qint64 at = 0; GzCustom gz; std::map<int, TSel> tselX; };   // (gz: the Custom gizmo — undone with the step)   // (label: what the step was — weak: guessed from the tool)   // (tsel, tmode: the Topology room's selection — undone too; chain: the Smooth EdgeChain curve as it was)
   bool tselPending_ = false;
   void tselNote();                                       // a selection change: one undo step once the gesture is over
   void tselPush();
+  bool hselPending_ = false;
+  void hselNote();                                       // the Hair room: curves / walls / anchors picked or let go — one undo step once the gesture is over
+  void hselPush();
   bool pickWeldSpot(const QPointF& m);                   // RMB on a pin: its menu (Ignore / Weld again)
   std::vector<WeldProblem> spots_;
   int weldHot_ = -1;
@@ -992,8 +1348,9 @@ private:
   int hoverGroup_ = -1;
   mutable std::map<int, CapMesh> capCache_;
   mutable std::map<int, std::vector<Vec3>> capWorld_;      // (a placed capsule's points in the world — while the collision uses them)
-  bool inViewport_ = false;
+  bool inViewport_ = false; bool uvPicking_ = false;   /* (a pick in the UV Editor: with Symmetry on the mirror is only shown as picked, not picked) */
   std::vector<int> brushAnchors() const;
+  void releaseBrushed(const std::map<int, double>& weights);   // (ViewportBrush.cpp: the frozen handles a stroke bends let go — brushFreesHandles)
   std::optional<Vec3> brushCenter3D(const QPointF& m, const std::vector<int>& list) const;
   std::vector<std::pair<int, double>> brushCapture(const QPointF& m) const;
   double brushWeight(double d) const;
@@ -1004,8 +1361,13 @@ private:
   // the gizmo (ViewportGizmo.cpp)
   Gizmo gz_;
   std::array<Camera, 4> panes_; int act_ = 0, soloPane_ = 0; bool split_ = false; QString layout_ = "4";
+  PaneVis paneVis_[4];
+  int detN_ = 0; bool detStack_ = false; QSize detSize_{640, 480}; QWidget* detHost_ = nullptr;
+  void swapWholePanes(int i, int j);                     // (cameras, floors, visibility sets — the active one follows its window)
+  void fitActiveCam();
   void saveSplit() const;
   void loadSplit();
+  char snapHold_ = 0;                                    // ('x' grid / 'v' vertex held; 0 none)
   struct SnapOrbit { bool on = false; Vec3 pos; Quat quat; } snapOrbit_;
   int refPlane_ = -1, refRev_ = 0; bool refPivEdit_ = false;
   struct RpDrag { int id = -1; Vec3 n, ref, start; std::optional<Vec3> startHit; bool moved = false; M4 m0; Vec3 piv0; } rpd_;
@@ -1013,7 +1375,7 @@ private:
   void rpDragMove(const QPointF& m);
   QTimer* navAnim_ = nullptr;
   bool gzLocal_ = false;
-  struct GzCustom { Quat q; Vec3 pivot; bool hasPivot = false; QByteArray key; } gzCustom_;   // (Custom: the gizmo put by Alt + drag)
+  GzCustom gzCustom_;
   bool gdCustom_ = false;                                // (an Alt drag: the gizmo itself moved / turned, not the model)
   QByteArray gzKey() const;                              // (what the custom pivot belongs to: the selection now)
   Vec3 tSelNormal(int m) const;                          // the selection's average normal (world)
@@ -1023,7 +1385,7 @@ private:
   struct GzDrag { std::vector<int> list; std::vector<Vec3> starts; std::vector<int> meshes; std::vector<std::vector<Vec3>> meshStarts; std::vector<int> imeshes; std::vector<Affine> imStarts; std::vector<int> groups; std::vector<Vec3> gpStarts;
                   Affine lastM; int snap = -1; bool moved = false; };
   GzDrag gd_;
-  struct GzTargets { std::vector<int> anchors, meshes; Vec3 pivot; std::vector<int> imeshes; int refPlane = -1; int topo = -1; std::vector<int> verts; std::vector<int> groups; };   // (groups: those with a point of their own — it moves with them)
+  struct GzTargets { std::vector<int> anchors, meshes; Vec3 pivot; std::vector<int> imeshes; int refPlane = -1; int topo = -1; std::vector<int> verts; std::vector<int> groups; std::vector<std::pair<int, std::vector<int>>> extra; };   // (extra: the other selected meshes' picked vertices — edited with the active one)   // (groups: those with a point of their own — it moves with them)
   std::optional<GzTargets> gizmoTargets() const;
   Quat localFrame() const;
   void rotateOwnAxes(const Quat& D);
@@ -1052,6 +1414,15 @@ private:
   void lockExUpdate();
   // the Topology room (ViewportTopo.cpp)
   TSel tsel_; int topoRev_ = 1;
+  std::map<int, TSel> tselX_;                            // the other selected meshes' own component selections (multi-mesh editing): the active one's is tsel_
+  void tselActivate(int m);                              // m becomes the active one: the old tsel_ is put by (kept while both stay selected)
+  void tselPrune();                                      // selections of meshes no longer selected dropped
+  bool tselAny() const { return !tsel_.f.empty() || !tsel_.e.empty() || !tsel_.v.empty() || !tselX_.empty(); }
+  std::vector<int> tselTargets() const;                  // the meshes a component gesture works on: every selected mesh that can be edited (the active one first)
+  bool eachBusy_ = false;
+  bool uvMulti() const { const auto s = tselMeshes(); return s.size() > 1 || (s.empty() && tselTargets().size() > 1); }   // (several meshes to edit the UV of: with polygons picked on two or more, or objects picked and no polygons)
+  QString tEachMesh(const std::function<QString()>& op, bool every = false);   // an edit run on each mesh that has a selection in turn (that mesh active, its own picks) — several meshes edited at once
+  std::vector<int> tselMeshes() const;                   // every mesh with a component selection (the active one first)
   // the snap mask's proxy of a high-poly mesh (ViewportMaskProxy.cpp — the file's space): its triangles (faceGroup each),
   // their hierarchy, each polygon of the mesh → its proxy triangle
   struct MaskProxy { std::shared_ptr<PolyMesh> mesh; std::shared_ptr<topo::Bvh> bvh; std::vector<int> f2p, pSrc; };   // (pSrc: the polygon each triangle was made from)
@@ -1071,7 +1442,7 @@ private:
   Occluders meshOccluders(int m) const;                  // (the other shown meshes that may hide m)
   bool occludedBy(const Occluders& o, const Vec3& eye, const Vec3& p, double tol) const;   // (one of them between eye and p, more than tol before p)
   const std::vector<char>& pxMaskOf(int m, const MaskProxy& X) const;   // (the mesh's mask on its proxy — made once per mask)
-  struct TDrag { std::shared_ptr<const MaskProxy> px; std::vector<char> parr, parr0; std::vector<std::pair<int, std::shared_ptr<const topo::Bvh>>> occ; int type = 0; QString mode; double x0 = 0, y0 = 0; bool moved = false, empty = false, erase = false; int m = -1;
+  struct TDrag { struct More { int m = -1; std::vector<int> verts; std::vector<Vec3> base; Affine inv; }; std::vector<More> more; std::shared_ptr<const MaskProxy> px; std::vector<char> parr, parr0; std::vector<std::pair<int, std::shared_ptr<const topo::Bvh>>> occ; int type = 0; QString mode; double x0 = 0, y0 = 0; bool moved = false, empty = false, erase = false; int m = -1;
                  std::vector<int> list; std::vector<Affine> starts; Vec3 ref, n; std::optional<Vec3> hit0; Vec3 w;
                  std::vector<int> verts; std::vector<Vec3> base; std::vector<int> pairs; Affine inv; std::vector<char> arr; QPointF last; std::vector<std::array<float, 2>> uv0;
                  int handle = -1; Vec3 handleW;                  // (the element snap: the vertex taken hold of, where it was)
@@ -1092,9 +1463,10 @@ private:
     bool symNew = false;                                       // (the edit made polygons — with Symmetry on, their mirror made too)
     std::vector<int> symPairs;                                 // (PolyPen's drag with Symmetry on: each vertex's mirror pair)
     struct KCurve { std::vector<Vec3> a; bool line = false, closed = false; }; std::vector<KCurve> kc; int kcur = -1, kdc = -1, kda = -1;
-    std::vector<std::pair<std::vector<KCurve>, int>> kUndo, kRedo;   // (the knife's curves: their own undo / redo while drawn)
+    std::vector<std::pair<std::vector<KCurve>, int>> kUndo, kRedo; std::vector<KCurve> kcCut; int kcCutIdx = -1;   /* (the curves a cut was made from, and the history step of the cut: Ctrl+Z on it brings the curves back) */
+   // (the knife's curves: their own undo / redo while drawn)
     int wsrc = -1; std::vector<int> wsrcs; int wtgt = -1;            // (Weld: a drag from vertex wsrc (with the picked ones wsrcs) onto wtgt)
-    struct ECurve { int m = -1; std::vector<int> verts; bool closed = false; std::vector<Vec3> a, a0; std::vector<double> u; std::vector<Vec3> base; } ec; int eca = -1;
+    struct ECurve { int m = -1; std::vector<int> verts; bool closed = false; std::vector<Vec3> a, a0; std::vector<double> u; std::vector<Vec3> base; std::vector<Vec3> aBase, aSimp; double simp = 0; /* (Smooth: the anchors as they were before it, and the ones it made last) */ } ec; int eca = -1;
     QPointF p0, p1;
     QString lastOp; int lastM = -1; std::shared_ptr<PolyMesh> lastAfter; QJsonObject lastArgs; TSel lastSel;   // (lastSel: what the edit worked on)
     int rev = 0;
@@ -1116,6 +1488,7 @@ public:
   QString testLoop(int e, double t) { tt_.before.reset(); return loopApply(topoMesh(), e, t, false, 1, false); }   // (tests: a Loop cut through edge e)
   QString fillHolesInfo();
 private:
+  int penAnchorHist_ = -1;                              // (history step the last anchor was put on: Ctrl+Z takes the anchors back while no step came after them)
   mutable TTState tt_;                                   // (mutable: the pointer's polygon noted while picking)
   qint64 smoothShow_ = 0;                                // (PolyPen's smoothing circle shown a moment after the wheel)
   qint64 fillShow_ = 0;                                // (the fill radius shown a moment after [ / ])
@@ -1142,7 +1515,7 @@ private:
   std::vector<TTPt> penFillPoints(const QPointF& mp) const;  // (what Shift+RMB fills: a pick with the user's anchors, else the ghost's polygon, else the rim's)
   std::vector<TTPt> penFillPick(const QPointF& mp) const;
   std::vector<TTPt> penFillHole(const QPointF& mp) const;   // (nothing to pick round the pointer: the hole of the mesh it is in — up to 24 corners)
-  struct PenAsk { int m = -1; std::vector<std::pair<Vec3, Vec3>> pairs; QWidget* w = nullptr; } penAsk_;   // (PolyPen: a weld in doubt — asked; its vertices by place, world)
+  struct PenAsk { int m = -1; std::vector<std::pair<Vec3, Vec3>> pairs, mirror; QWidget* w = nullptr; } penAsk_;   // (mirror: Symmetry — the twins' weld, by place too)   // (PolyPen: a weld in doubt — asked; its vertices by place, world)
   void penWeldAsk(const QPointF& at); void penAskClose(); void penAskWeld();
   QString penFillHoleMake(const QPointF& mp);           // (that hole filled: quads round its middle — the anchor there, else a point made)   // Shift+RMB: the anchors / rim vertices round the pointer that hold it (3 or 4) — none: empty
   Vec3 ttPtW(const TTPt& p) const;                     // (a pen point in the world)
@@ -1168,12 +1541,21 @@ private:
   const topo::Bvh* pickBvhOf(int m) const;                // the shown polygons of the mesh, for "is it hidden by the mesh itself"
   std::optional<TopoPick> tPick(const QPointF& mp, const std::vector<int>& list) const;
   int loopEdgeAt(int m, int f, const QPointF& mp) const;  // the edge a polygon loop runs across (from where in the polygon the pointer is)
-  std::vector<int> tLoopOf(int m, const TopoPick& r, const QPointF& mp, bool ring) const;   // Loop / Ring: the elements (the mode's)
+  std::vector<int> tLoopOf(int m, const TopoPick& r, const QPointF& mp, bool ring, char key0 = 0) const;   // Loop / Ring: the elements (the mode's; key0 — that kind of element instead: the Paint room's polygons)
   std::vector<int> tSymList(int m, const std::vector<int>& list, char key) const;          // the elements' mirrors across X = 0
   struct SymC { const PolyMesh* B = nullptr; std::vector<int> pairs; std::unordered_multimap<quint64, int> faces; }; mutable SymC symC_;   // (faces: by their sorted corners' hash)
   std::shared_ptr<const topo::Bvh> bvhOf(int m, bool masked) const;
   struct BvhC { std::weak_ptr<PolyMesh> poly; QString tag; std::shared_ptr<topo::Bvh> b; };
   mutable std::map<int, BvhC> bvhCache_;
+  // a reference's outer shell (ViewportTopo.cpp): the polygons that can be seen from outside the mesh itself (a ray from either side
+  // of one escapes it), worked out in the background; bvhSurf — the hierarchy of just those (the snap's nearest-point queries: never
+  // onto an inner layer, a lining, a wall inside) — until it is ready, the whole surface
+  struct ShellJob { std::shared_ptr<topo::Bvh> whole, shell; std::vector<char> outer; int buried = 0, lining = 0, nf = 0; };
+  struct ShellC { std::weak_ptr<PolyMesh> poly; QByteArray geo, maskTag; std::shared_ptr<std::atomic<int>> state; std::shared_ptr<ShellJob> job; std::shared_ptr<topo::Bvh> bvh; bool announced = false; };
+  mutable std::map<int, ShellC> shellCache_;
+  std::shared_ptr<const topo::Bvh> bvhSurf(int m, bool peek = false) const;
+  bool shellWanted(const Item& it) const;
+  void shellWait(int m) const;
   mutable QByteArray ghostKey_; mutable std::vector<Ghost> ghosts_;   // (Topology Ghost: what it was made from, the ghosts)
   QByteArray ghostMidKey_; std::vector<std::vector<Vec3>> ghostMid_; qint64 revealShown_ = 0;   // (the Reveal Brush: the ghost polygons' middles, its stroke last shown)
   mutable std::vector<std::pair<QByteArray, std::vector<Ghost>>> ghostRecent_; mutable QByteArray ghostDrawKey_; mutable TopoDraw ghostDrawn_;   // (the last few made — back to one at once; its lines made once)
@@ -1194,13 +1576,14 @@ private:
   // through both, every so many as far apart as they are (up to the selection or a fork)
   void topoDouble(int m, const TopoPick& r, char key, int a = -1, const std::vector<int>& prev = {});
   std::vector<int> tPatternWalk(int m, char key, int a, int b, const std::set<int>& stop) const;
-  std::vector<int> tBoxPick(int m, double x0, double y0, double x1, double y1, char key) const;
   // the elements of the active mesh whose point on the screen is inside (the box first; facing the camera unless through)
   std::vector<int> tAreaPick(int m, double x0, double y0, double x1, double y1, char key, const std::function<bool(double, double)>& in) const;
   void tPaintAt(const QPointF& mp, const QString& mode);  // (the Select Cursor's drag: what is under the brush picked / taken off)
   void topoAfterMove(int m, std::vector<Vec3>& P, const std::vector<int>& verts, const std::vector<Vec3>& base, const std::vector<int>* pairs);
   void topoLive(int m, const std::vector<Vec3>& pos, const std::vector<std::array<float, 2>>* uv = nullptr);   // (a drag: the positions shown, no undo step yet)
-  void topoWrite(int m, std::shared_ptr<PolyMesh> B);   // (a new source: the geometry changed)
+public:
+  void topoWrite(int m, std::shared_ptr<PolyMesh> B);   // (a new source: the geometry changed — the panels' clean-up goes through it too)
+private:
   void liveApply(int m, const std::vector<Vec3>* pos, const std::vector<std::array<float, 2>>* uv);
   void smPaint(const QPointF& m);
   void smLasso();
@@ -1208,7 +1591,10 @@ private:
   struct GzComp { std::vector<int> idx; Vec3 c; Quat q; };   // (a component moved on its own: its vertices (indices into verts), centre, axes)
   struct TopoGz { int m = -1; std::vector<int> verts; std::vector<Vec3> w0, base; std::vector<int> pairs; bool on = false; std::vector<std::array<float, 2>> uv0;
     std::vector<GzComp> comps; Quat q0; Vec3 p0; std::vector<std::vector<int>> nbs;   // (Components; the gizmo at the press; Slide: each vertex's neighbours off the selection)
+    std::vector<std::pair<int, std::shared_ptr<PolyMesh>>> preExtrudeX; std::map<int, TSel> preSelX;   // (Ctrl + a handle: the other meshes as they were before their extrude)
     std::shared_ptr<PolyMesh> preExtrude; TSel preSel; } tgz_;
+  struct TgzX { int m = -1; std::vector<int> verts; std::vector<Vec3> w0, base; std::vector<int> pairs; std::vector<std::array<float, 2>> uv0; };
+  std::vector<TgzX> tgzX_;                                // (the other meshes picked with the active one: moved / turned / scaled by the same gizmo)
   bool tExtrudeSel(int m);                               // Ctrl + a gizmo handle: the selected polygons / edges extruded in place (selected, ready to move)
   bool gizmoPressFree(const QPointF& m);                 // a drag in free space: as the gizmo's centre / view ring
   std::vector<int> uvParked_;
@@ -1225,6 +1611,11 @@ private:
   TopoDraw topoDraw_; QByteArray topoSig_;
   // the UV (ViewportUv.cpp)
   int uvRev_ = 1, uvStamp_ = 0;
+  std::pair<int, qint64> uvGzClick_{-1, 0};              // (the polygon and the time of the last press with the gizmo on: a second one soon — the shell)
+  struct UvHot { size_t uvh = 0; int nf = -1, ne = -1; uint attr = 0; bool sym = false; std::vector<int> flipped, overlap, minusX, shellOf; std::vector<char> cont; std::vector<uv::ShellAttr> attrs; };   // (a mesh's slow UV facts, kept while its UV stays)
+  std::map<int, UvHot> uvHot_;
+  const UvHot& uvHotOf(int id);
+  void uvPadOutline(UvDraw& D, const UvTex& tex);        // (the thin line at half the padding round each shell: red where it is too close)
   UvDraw uvDraw_, uvHovDraw_; QByteArray uvSig_, uvHovSig_; int uvHovRev_ = 0;
   struct UvCache { std::weak_ptr<PolyMesh> base; int stamp = -1; std::shared_ptr<const topo::TTopo> T; uv::Points P; uv::Shells S; std::vector<char> cont, seam; std::vector<int> mc; bool mcMade = false; };   // (mc: the mirror corners — made when the symmetry tint asks)
   mutable UvCache uvc_;
@@ -1232,15 +1623,17 @@ private:
   std::set<int> uvPts_; int uvPtsVer_ = -1, uvLastPt_ = -1;   // (UV points picked in the editor; −1: from the vertices picked; uvLastPt_: the last clicked — Ctrl+Shift's path from it)
   std::set<int> uvPoints();                              // the picked UV points (Vertex mode)
   struct UvHover { int f = -1, e = -1, ek = -1, p = -1; } uvHov_;
-  struct UvDragS { int type = 0; QPointF p0, last; bool moved = false; QString mode; int m = -1; char op = 'm'; int axis = 0; std::vector<int> corners; std::vector<std::array<float, 2>> uv0; std::vector<std::array<double, 2>> piv;   // (axis: the gizmo's handle — 0 free, 1 U, 2 V; piv: per corner its pivot — each shell its own)
-                   double cu = 0, cv = 0; bool dbl = false; } uvd_;
+  struct UvMore { int m = -1; std::vector<int> corners; std::vector<std::array<float, 2>> uv0; };   // (another picked mesh dragged with the active one)
+  struct UvDragS { std::vector<UvMore> more; int type = 0; QPointF p0, last; bool moved = false; QString mode; int m = -1; int leadF = -1; char op = 'm'; int axis = 0; std::vector<int> corners; std::vector<std::array<float, 2>> uv0; std::vector<std::array<double, 2>> piv;   // (axis: the gizmo's handle — 0 free, 1 U, 2 V; piv: per corner its pivot — each shell its own)
+                   double cu = 0, cv = 0; bool dbl = false; std::vector<std::pair<double, double>> pts; } uvd_;
   // the brushes (ViewportUvBrush.cpp): 'r' Relax, 'p' Pin — the radius in screen pixels, the Relax's step
   QPointF uvBrushAt_{-1, -1};
-  struct UvBrushS { std::vector<std::vector<int>> pf; std::vector<char> border, fixed, vis, showF; std::vector<std::array<float, 2>> U; std::shared_ptr<PolyMesh> W; uv::PackOpts po; QPointF last{-1e9, -1e9}; int touched = 0; } uvBr_;   // (W: a copy the Relax works on; vis: a point of a shown polygon)
+  struct UvBrushS { std::vector<std::pair<int, float>> grab; std::vector<std::array<float, 2>> U0; QPointF p0; std::vector<std::vector<int>> pf; std::vector<char> border, fixed, vis, showF; std::vector<std::array<float, 2>> U; std::shared_ptr<PolyMesh> W; uv::PackOpts po; std::vector<std::vector<int>> nb;   /* (nb: each UV point's neighbours — the Smooth brush) */  QPointF last{-1e9, -1e9}; int touched = 0; } uvBr_;   // (W: a copy the Relax works on; vis: a point of a shown polygon)
   void uvBrushOverlay(std::vector<Overlay>& out) const;
   bool uvBrushPress(const QPointF& mp, bool ctrl);
   void uvBrushStroke(const QPointF& mp, Qt::KeyboardModifiers mods);
   void uvBrushRelease(const UvDragS& d);
+  void uvSyncToolBrush();   bool uvBrushFromTool_ = false;   /* (the Topology Brush tool in the UV Editor: its Move = Grab, Smooth / Relax = Relax; its size and hardness) */
   struct UvClick { int el = -1; char key = 0; qint64 t = 0; } uvClick_;
   struct UvTf { bool on = false; char kind = 0; int m = -1; std::vector<int> ks; std::vector<std::array<float, 2>> uv0; const PolyMesh* base = nullptr;
     std::array<double, 4> box{0, 0, 1, 1}; int nx = 3, ny = 3; std::vector<std::array<double, 2>> ctl, ctl0;   // (the warp's anchors: now, at the drag's start)
@@ -1265,6 +1658,32 @@ private:
   void uvFrame();
   struct UvPick { int f = -1, e = -1, ek = -1, p = -1; };   // (ek: the corner the edge starts from — its side)
   UvPick uvPickAt(const QPointF& m) const;
+  std::vector<int> uvArea(const std::function<bool(double, double)>& inPx, char key, int mesh = -1) const;   // (elements whose middle the screen test says inside — of the active mesh, or of `mesh`)
+  const UvCache* uvCacheFor(int m, UvCache& tmp) const;      // the points and shells of any mesh (a cache of its own, not kept)
+  void uvApplyList(const std::vector<int>& list, const QString& mode);
+  void uvApplyFaces(const std::vector<int>& fs, const QString& mode);
+  std::vector<int> uvShellOf(int f0) const;
+  int uvFaceAt(const QPointF& mp) const;
+  bool uvToolPress(const QPointF& mp, bool ctrl, bool shift);   // (the Select tools of the Topology room, in the UV Editor)
+  void uvTransformDrag(int mesh, const std::vector<int>& corners, const std::vector<std::array<float, 2>>& uv0, const std::vector<std::array<double, 2>>& piv, const QPointF& mp, Qt::KeyboardModifiers mods, bool main);
+  std::vector<int> uvMeshes() const;                       // the selected meshes that have UV (the active one first)
+  int uvMeshAt(const QPointF& mp) const;                  // the selected mesh whose UV lie under the pointer (the active one first) — -1 none
+  void uvMakeActive(int m);                                // that mesh the active one (the picks of the others kept)
+  void uvFillMore();
+  struct UvProj { bool on = false; double ox = 0, x0 = 0, y0 = 0, sc = 1; struct M { int id; std::vector<int> fs; }; std::vector<M> meshes; };   // (the projection of the polygons not unfolded: its frame placed above the tile)
+  mutable UvProj uvProj_;
+  bool uvProjPick(const QPointF& mp, int& mesh, int& face) const;
+  std::vector<int> uvProjArea(int mesh, const std::function<bool(double, double)>& inPx) const;
+  void uvAreaApply(const std::function<bool(double, double)>& inPx, const QString& mode);   // an area pick on all the selected meshes
+  std::vector<int> uvMovingOf(int m, const TSel& s) const;   // the corners of the picked elements of mesh m (not the active one)
+  bool uvRmbPress(const QPointF& mp);                     // RMB in the editor: its action on the shells (uvRmb)
+  bool uvStretchHud_ = false;                              // (the stretch line shown for the polygon under the pointer)
+  bool uvTfRemovePin(const QPointF& mp);                  // RMB on a Puppet pin: it is taken off
+public:
+  QString uvRmb = "rotate";                               // what RMB does in the UV Editor: rotate (free), rot90, scale, flip
+  double uvChainAmt = 0.5;                                  // Smooth Edge Chain (UV): how much of the chain's bends goes
+private:
+  void uvPaintAt(const QPointF& mp);
   std::vector<int> uvBox(double x0, double y0, double x1, double y1, char key) const;
   std::vector<int> uvMoving() const;                     // the corners the selection moves
   void uvLive(int m, const std::vector<std::array<float, 2>>& uv);
@@ -1274,6 +1693,10 @@ private:
                      Selection sel; QString tool = "cursor"; QJsonValue counters; };
   std::map<QString, RoomState> rooms_;
   std::set<int> sharedIds(const std::map<int, Item>& items) const;
+  std::set<int> hpvItems_, hpvAnchors_;                  // (the Topology room: the Hair room's items and anchors it shows — kept with Hair when the room is left)
+  uint64_t hairSig_ = 0;                                 // (what the hair was last built from here: not rebuilt for an edit that did not touch it)
+  void hairPreviewFlush(RoomState& cur);
+  void hairPreviewAdd(std::map<int, Item>& items, std::map<int, Anchor>& anchors, std::vector<int>& roots);
   void loadTopoPrefs();
   std::vector<double> smoothStart_;
 
@@ -1298,6 +1721,7 @@ private:
   void commit(bool topology);                            // the network kept up, a snapshot for undo
   Snapshot snapshot() const;
   void restore(const Snapshot& s);
+  void histMerge(int h0);                                // (the steps after the mark h0 made one — an edit done on several meshes in turn)
 
   Scene* scene_;
   Camera cam_;
@@ -1368,6 +1792,19 @@ private:
   QWidget* pieHost_ = nullptr;
   std::optional<SurfCutState> scut_;
   int scutDrag_ = -1;
+  bool paintProjDrag_ = false; float paintScale_ = 1; QPointF paintTex_, paintLast_; bool paintToolDrag_ = false; int pvSelRev_ = 1; mutable int pvSelSegRev_ = 0; mutable std::vector<std::array<int, 3>> pvSelSeg_;
+  bool paintInv_ = false;                                // (the stroke going erases: Ctrl / the pen turned over at its press)
+  bool rollDrag_ = false; QPointF rollAt_; double rollRaw_ = 0, rollDone_ = 0;   // (the Paint room: R held + drag rolls the view)
+  bool paintDrag_ = false; bool paintPress(QMouseEvent* e); bool paintMove(const QPointF& m); bool paintRelease();
+  bool paintAdj_ = false, paintAdjHard_ = false, altPickArm_ = false; QPointF paintAdjAt_, altPickAt_;           // (an RMB drag setting the brush's size / opacity: where it began)
+  QPointF steady_; bool steadyOn_ = false;               // (Steady Stroke: where the brush is, on its string behind the pointer)
+  void paintStrokeTo(const QPointF& m);                  // (the stroke on the model moved on to a screen point — by the projection or the texture point there)
+  float penP_ = 1; qint64 penT_ = -1000000; bool penEraser_ = false, penDown_ = false, penLine_ = false;   // (the last pen event: its pressure, when (ms), its tip, touching; penLine_ — a tool's line being laid: no pressure)
+  int pvRev_ = 1; struct PvCache { qint64 key = -1; const PolyMesh* poly = nullptr; std::vector<char> blk; }; mutable std::map<int, PvCache> pvCache_;
+  std::vector<char> pvVec(const Item& it, const char* all, const char* faces) const; void pvWrite(Item& it, const char* all, const char* faces, const std::vector<char>& v);
+  int pvSetFaces(const QString& key, const Item& it, std::vector<char>& flags) const;   // 0 — nothing of the mesh is in the set, 1 — all of it, 2 — the flagged polygons
+  void pvTouch();
+  int pvPolyFace(const RayHit& hit, const Item& it) const;
   QString applyEdgeCut();                                // (the cut begun on the wall: from its top edge to its bottom)
   QString applyEdgeToCurveCut();                         // (begun on a curve, its last anchor on the top / bottom edge: from the edge to that curve)
   QString applyFoldCut(const void* fold);                // (a "V" placed: a "Y" — two curves sharing the stem, the triangle between the legs taken out)
@@ -1396,6 +1833,7 @@ private:
   std::map<std::string, std::string> netSig_;            // the network names' signatures per group (NET_SIG)
 
   Drag drag_ = Drag::None;
+  Qt::MouseButtons ignoreUp_;                            // (buttons pressed while another was held: their release ends nothing)
   QPointF last_, start_;
   AnchorDrag ad_;
   std::vector<std::pair<double, double>> lasso_;

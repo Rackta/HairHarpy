@@ -50,6 +50,8 @@ PolyMesh subset(const PolyMesh& d, const std::vector<char>& keep, std::vector<in
 // the UV Sets: d has them whole; polygon f of d (its corners cs, in d) onto the polygon just added to o (its sets, its live
 // one, each set's UVs) — o takes the sets' names the first time
 bool hasUvSets(const PolyMesh& d);
+// a mesh with no UV Sets: the name of the one set it is in — its material's (all its polygons one material; "_Mat" off), else "UV Set 1"
+QString defaultUvSetName(const PolyMesh& d);
 void addFaceSets(PolyMesh& o, const PolyMesh& d, int f, const std::vector<int>& cs);
 void dropGroup(PolyMesh& d, int gi);                  // (its polygons must be gone already: the later groups renumbered)
 QByteArray packPMesh(const PolyMesh& d);
@@ -74,6 +76,7 @@ std::vector<char> smDec(const QString& s, int n);
 struct Partners { std::vector<int> part; std::vector<double> cx; double plane = 0; };
 std::shared_ptr<const Partners> smPartners(const std::shared_ptr<PolyMesh>& B);   // each polygon's mirror across X = 0
 std::vector<int> symPairs(const PolyMesh& B, const std::vector<Vec3>& base);      // each vertex's mirror (−1 none)
+int symPairsByLinks(const TTopo& T, const std::vector<Vec3>& pos, std::vector<int>& pair, double maxDist);   // the pairs grown along the connections from those found by the place (a mirrored side moved a little); how many added
 
 // ---- decimation ----
 struct QemResult { std::vector<float> pos; std::vector<uint32_t> idx; std::vector<int> src; };

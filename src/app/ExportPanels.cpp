@@ -1,4 +1,5 @@
-#include "app/ExportPanels.h"
+﻿#include "app/ExportPanels.h"
+#include "app/ZBrushLink.h"
 #include "app/ImportWindow.h"
 #include "io/Export.h"
 #include "scene/Scene.h"
@@ -38,6 +39,7 @@
 #include <QTreeWidget>
 #include <QVBoxLayout>
 #include <map>
+#include <set>
 
 namespace hm {
 
@@ -46,7 +48,7 @@ namespace {
 const QStringList FORMATS = {"obj", "fbx", "gltf", "ply", "stl"};
 bool fbxGroups() { return QSettings().value("export/fbxGroups", false).toBool(); }
 struct Bridge { const char* key; const char* label; int port; const char* file; };
-const Bridge BRIDGES[] = {{"blender", "Blender", 8790, "hmc_bridge_blender.py"}, {"maya", "Maya", 8791, "hmc_bridge_maya.py"}, {"folder", "Folder", 0, ""}};
+const Bridge BRIDGES[] = {{"maya", "Maya", 8791, "hmc_bridge_maya.py"}, {"blender", "Blender", 8790, "hmc_bridge_blender.py"}, {"folder", "Folder", 0, ""}};
 const Bridge* bridgeOf(const QString& k) { for (auto& b : BRIDGES) if (k == b.key) return &b; return nullptr; }
 std::map<QString, std::pair<bool, QString>> g_status;           // a live bridge's last test / send: ok, message
 
@@ -109,6 +111,21 @@ QString sendTip() {
   return QObject::tr("Send the %1 to %2 — Ctrl+Shift+E. Set up in 🔗 Bridge").arg(what, to);
 }
 
+// where each project was last exported: its own folder, file name and the meshes written separately — kept per project (by the
+// project file's path), so a project never shows the path of another; a project with none yet starts in its own folder
+// under its own name (an unsaved one: in Documents)
+QString projectKey(const Scene* sc) { return sc && !sc->path.isEmpty() ? QDir::cleanPath(QFileInfo(sc->path).absoluteFilePath()).toLower() : QString(); }
+QJsonObject projectExport(const Scene* sc) {
+  const QString k = projectKey(sc); if (k.isEmpty()) return {};
+  return QJsonDocument::fromJson(QSettings().value("export/byProject").toByteArray()).object().value(k).toObject();
+}
+void setProjectExport(const Scene* sc, const QJsonObject& o) {
+  const QString k = projectKey(sc); if (k.isEmpty()) return;
+  QJsonObject all = QJsonDocument::fromJson(QSettings().value("export/byProject").toByteArray()).object(); all.insert(k, o);
+  if (all.size() > 300) { const QString first = all.keys().first(); if (first != k) all.remove(first); }   // (the oldest forgotten)
+  QSettings().setValue("export/byProject", QJsonDocument(all).toJson(QJsonDocument::Compact));
+}
+
 // the export window (as the import window): in the middle of the screen; the file's path at the top (typed, pasted or
 // picked — its extension is the format), the meshes (each ticked in or out), the scale and the normals type: as Maya
 // keeps them (per corner, split at the hard edges) or as 3ds Max (smoothing groups)
@@ -119,12 +136,14 @@ public:
     setObjectName("ioWin"); setStyleSheet(ioWindowStyle()); setWindowTitle(tr("Export")); setMinimumSize(460, 340);
     auto* v = new QVBoxLayout(this); v->setContentsMargins(10, 8, 10, 10); v->setSpacing(6);
     QSettings s; const QString ft0 = st("export/fmt", "obj");
-    QString dir = s.value("export/dir", s.value("lastDir").toString()).toString();
+    const QJsonObject pe = projectExport(sc);                    // (this project's own last export — never another project's)
+    QString dir = pe.value("dir").toString(); if (dir.isEmpty() && !sc->path.isEmpty()) dir = QFileInfo(sc->path).absolutePath();
     if (dir.isEmpty()) dir = QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation);
+    const QString name0 = !pe.value("name").toString().isEmpty() ? pe.value("name").toString() : !sc->path.isEmpty() ? QFileInfo(sc->path).completeBaseName() : QString("hair");
     // ---- the path ----
     auto* pr = new QHBoxLayout; pr->setSpacing(4);
     auto* pl = new QLabel(tr("Path")); pl->setObjectName("rowName"); pr->addWidget(pl);
-    path_ = new QLineEdit(QDir::toNativeSeparators(QDir(dir).filePath(st("export/name", "hair") + "." + ft0)));
+    path_ = new QLineEdit(QDir::toNativeSeparators(QDir(dir).filePath(name0 + "." + ft0)));
     path_->setToolTip(tr("Where the file is written — typed, pasted or picked; its extension is the format"));
     pr->addWidget(path_, 1);
     auto* br = new QPushButton(tr("Browse…")); pr->addWidget(br); v->addLayout(pr);
@@ -173,7 +192,9 @@ public:
     connect(go_, &QPushButton::clicked, this, [this] { run(); });
     connect(br, &QPushButton::clicked, this, [this] {
       const QString ft = fmt_->currentData().toString();
-      QString p = QFileDialog::getSaveFileName(this, tr("Export"), path_->text(), exportLabel(ft) + QString(" (*.%1)").arg(ft));
+      // (a path whose folder is not there — a drive that is gone, a folder of another project — would make the dialog hunt for it: it opens in the project's own folder instead)
+      QString from = path_->text(); if (!QFileInfo(from).dir().exists()) from = QDir(sc_->path.isEmpty() ? QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation) : QFileInfo(sc_->path).absolutePath()).filePath(QFileInfo(from).fileName());
+      QString p = QFileDialog::getSaveFileName(this, tr("Export"), from, exportLabel(ft) + QString(" (*.%1)").arg(ft));
       if (!p.isEmpty()) { path_->setText(QDir::toNativeSeparators(p)); fromPath(); } });
     connect(fmt_, &QComboBox::currentIndexChanged, this, [this] {      // (the format → the path's extension)
       const QString ft = fmt_->currentData().toString(); QSettings().setValue("export/fmt", ft);
@@ -214,7 +235,7 @@ private:
   void fill() {
     one_->clear(); sep_->clear();
     meshes_ = exportMeshes(*sc_, vp_->selection().items, what_->currentData().toString());
-    std::map<QString, QString> wasSep; for (const QString& e : QSettings().value("export/separate").toStringList()) { const int b = e.lastIndexOf('|'); if (b >= 0) wasSep[e.mid(b + 1)] = e.left(b); }
+    std::map<QString, QString> wasSep; for (const QJsonValue& ev : projectExport(sc_).value("separate").toArray()) { const QString e = ev.toString(); const int b = e.lastIndexOf('|'); if (b >= 0) wasSep[e.mid(b + 1)] = e.left(b); }
     for (size_t i = 0; i < meshes_.size(); i++) {
       auto w = wasSep.find(meshes_[i].name); if (w == wasSep.end()) { one_->addTopLevelItem(meshItem(i)); continue; }
       QTreeWidgetItem* at = nullptr;
@@ -253,14 +274,18 @@ private:
     std::vector<std::pair<QString, int>> seps; sepList(seps, false);
     if (list.empty() && seps.empty()) return;
     if (!QFileInfo(path).dir().exists()) { ui::toast(tr("No such folder: %1").arg(QFileInfo(path).path())); return; }
-    QSettings s; s.setValue("export/dir", QFileInfo(path).absolutePath()); s.setValue("export/name", QFileInfo(path).completeBaseName()); s.setValue("export/scale", scale_->value());
-    { std::vector<std::pair<QString, int>> all; sepList(all, true); QStringList keep; for (auto& [d, i] : all) keep << d + "|" + meshes_[size_t(i)].name; s.setValue("export/separate", keep); }   // (where each separate one was: the next time)
+    QSettings s; s.setValue("export/scale", scale_->value());
+    { std::vector<std::pair<QString, int>> all; sepList(all, true); QJsonArray keep; for (auto& [d, i] : all) keep.append(d + "|" + meshes_[size_t(i)].name);   // (where each separate one was: the next time)
+      setProjectExport(sc_, QJsonObject{{"dir", QFileInfo(path).absolutePath()}, {"name", QFileInfo(path).completeBaseName()}, {"separate", keep}}); }   // (this project's: its folder, its file name)
     QString err; int files = 0;
     if (!list.empty()) { if (!writeFile(path, exportText(ft, list, scale_->value(), max_->isChecked()), &err)) { ui::toast(tr("Export failed: %1").arg(err)); return; } files++; }
     // (each separate one: its name as the file's, in its folders beside the file)
     static const QRegularExpression bad(R"([\\/:*?"<>|])");
+    std::set<QString> used; if (!list.empty()) used.insert(QFileInfo(path).absoluteFilePath().toLower());   // (the files of this export: two meshes of one name never written over each other — _2, _3…)
     for (auto& [d, i] : seps) { QDir dir = QFileInfo(path).dir(); if (!d.isEmpty()) { QString clean; for (const QString& p : d.split('/')) clean += (clean.isEmpty() ? "" : "/") + QString(p).replace(bad, "_"); if (!dir.mkpath(clean)) { ui::toast(tr("Could not make the folder %1").arg(clean)); return; } dir = QDir(dir.filePath(clean)); }
-      const QString f = dir.filePath(QString(meshes_[size_t(i)].name).replace(bad, "_") + "." + ft);
+      const QString base = QString(meshes_[size_t(i)].name).replace(bad, "_"); QString f = dir.filePath(base + "." + ft);
+      for (int k = 2; used.count(QFileInfo(f).absoluteFilePath().toLower()); k++) f = dir.filePath(QString("%1_%2.%3").arg(base).arg(k).arg(ft));
+      used.insert(QFileInfo(f).absoluteFilePath().toLower());
       if (!writeFile(f, exportText(ft, {meshes_[size_t(i)]}, scale_->value(), max_->isChecked()), &err)) { ui::toast(tr("Export failed: %1").arg(err)); return; } files++; }
     ui::toast(seps.empty() ? tr("Exported %1 mesh%2 → %3").arg(list.size()).arg(list.size() > 1 ? "es" : "").arg(QFileInfo(path).fileName())
                            : tr("Exported %1 file%2 into %3").arg(files).arg(files == 1 ? "" : "s").arg(QDir::toNativeSeparators(QFileInfo(path).absolutePath())));
@@ -326,9 +351,10 @@ void openBridgePanel(QPushButton* anchor, Viewport* vp, Scene* sc, const std::fu
     auto* stl = new QLabel(it == g_status.end() ? QObject::tr("Not tested yet") : it->second.second); stl->setWordWrap(true); stl->setMaximumWidth(380);
     stl->setStyleSheet(it == g_status.end() ? "color:#8a8a8a" : it->second.first ? "color:#7fe07f" : "color:#e07060"); v->addWidget(stl);
     QObject::connect(port, &QSpinBox::editingFinished, f, [port, t, changed] { QSettings().setValue("bridge/port_" + t, port->value()); g_status.erase(t); if (changed) changed(); });
-    QObject::connect(test, &QPushButton::clicked, f, [t, stl, b] {
+    QObject::connect(test, &QPushButton::clicked, f, [t, stl = QPointer<QLabel>(stl), b] {   // (the popup may close during the wait: its label looked at only while it lives)
       QString err; QApplication::setOverrideCursor(Qt::WaitCursor); QJsonObject r = liveCall(t, "ping", {}, &err); QApplication::restoreOverrideCursor();
       g_status[t] = err.isEmpty() ? std::make_pair(true, QObject::tr("Connected: %1 %2").arg(r.value("program").toString(b->label), r.value("version").toVariant().toString()).trimmed()) : std::make_pair(false, err);
+      if (!stl) return;
       stl->setText(g_status[t].second); stl->setStyleSheet(g_status[t].first ? "color:#7fe07f" : "color:#e07060");
     });
     QObject::connect(save, &QPushButton::clicked, f, [f, anchor, b, t] {
@@ -361,7 +387,26 @@ void openBridgePanel(QPushButton* anchor, Viewport* vp, Scene* sc, const std::fu
     auto* go = new QPushButton(QObject::tr("⇪ Send now")); go->setEnabled(bridgeReady()); v->addWidget(go);
     QObject::connect(what, &QComboBox::currentIndexChanged, f, [what, changed] { QSettings().setValue("bridge/what", what->currentData()); if (changed) changed(); });
     QObject::connect(scl, &QDoubleSpinBox::valueChanged, f, [](double x) { QSettings().setValue("bridge/scale", x); });
-    QObject::connect(go, &QPushButton::clicked, f, [f, anchor, vp, sc, reopen] { bridgeSend(anchor->window(), vp, sc, nullptr); if (st("bridge/target", "") != "folder") reopen(); else f->close(); });
+    QObject::connect(go, &QPushButton::clicked, f, [pf = QPointer<QFrame>(f), anchor, vp, sc, reopen] { bridgeSend(anchor->window(), vp, sc, nullptr);
+      if (!pf) return;   // (closed by a click elsewhere while the program answered)
+      if (st("bridge/target", "") != "folder") reopen(); else pf->close(); });
+  }
+  // ---- ◆ from ZBrush: SubTools sent from ZBrush (its plugin) into the open scene ----
+  if (ZBrushLink* zl = ZBrushLink::get()) {
+    auto* sep = new QFrame; sep->setFrameShape(QFrame::HLine); sep->setStyleSheet("color:#3a3a3a"); v->addWidget(sep);
+    auto* head = new QLabel(QObject::tr("<b>◆ From ZBrush</b> (2026 and later)")); v->addWidget(head);
+    auto* rc = new QCheckBox(QObject::tr("Receive from ZBrush")); rc->setChecked(zl->receiving());
+    rc->setToolTip(QObject::tr("While on, the SubTools ZBrush sends (Zplugin → HairHarpy → Send SubTool / Send Visible) come into the open scene; one sent again replaces its mesh"));
+    v->addWidget(rc);
+    const bool inst = zl->pluginInstalled();
+    auto* ib = new QPushButton(inst ? QObject::tr("Plugin installed — install again") : QObject::tr("Install the plugin in ZBrush"));
+    ib->setToolTip(QObject::tr("Copies the plugin (a Python file you can read: %1) into %2 and adds that folder to ZBRUSH_PLUGIN_PATH in your user's environment; ZBrush loads it when it starts")
+                       .arg("hairharpy_zbrush.py", QDir::toNativeSeparators(ZBrushLink::pluginDir())));
+    v->addWidget(ib);
+    v->addWidget(hint(inst ? QObject::tr("In ZBrush: <b>Zplugin → HairHarpy → Send SubTool</b> — the active SubTool at its current subdivision level, with its polypaint; <b>Send Visible</b> — every visible one. (Installed just now — restart ZBrush first. Start it from the Start menu or a shortcut: a launcher that was already running before the install — a pie menu, a hotkey tool — passes on the old environment, and ZBrush won't see the plugin until that launcher is restarted too.)")
+                           : QObject::tr("Install once, restart ZBrush (from the Start menu or a shortcut — not from a launcher that was running before the install); then <b>Zplugin → HairHarpy → Send SubTool</b> sends the active SubTool (with its polypaint) here.")));
+    QObject::connect(rc, &QCheckBox::toggled, f, [zl](bool on) { zl->setReceiving(on); });
+    QObject::connect(ib, &QPushButton::clicked, f, [zl, reopen] { const QString m = zl->installPlugin(); ui::toast(m.startsWith('!') ? m.mid(1) : m); reopen(); });
   }
   place(f, anchor);
 }

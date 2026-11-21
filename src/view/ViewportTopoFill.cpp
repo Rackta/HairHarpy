@@ -344,8 +344,9 @@ void edgeFlow(MeshEd& E, const std::vector<int>& free, double amount) {
 }  // namespace
 
 QString Viewport::tSelectNgons(bool add) {
+  if (!eachBusy_ && uvMulti()) return tEachMesh([&] { return tSelectNgons(add); }, true);   // (several meshes picked: done on each — on its own picks, or on the whole of it)
   const int m = topoMesh(); Item* it = m >= 0 ? scene_->item(m) : nullptr; if (!it) { ui::toast(tr("Select a mesh first")); return "!"; }
-  if (topoHeavy(m)) { ui::toast(tr("A high-poly mesh — Object mode only")); return "!"; }
+  
   if (topoMode != "poly") setTopoMode("poly", true);
   auto T = topo::ttopo(baseSp(*it)); std::vector<int> fs; for (int f = 0; f < T->nf; f++) if (T->faceSize(f) > 4) fs.push_back(f);
   tselApply(m, fs, add ? "add" : "set", 'f');
@@ -356,7 +357,7 @@ void Viewport::fillSnapPts(int m, std::vector<Vec3>& pts) const {
   if (!tset.snap || pts.empty()) return;
   const Item* it = scene_->item(m); if (!it) return;
   std::vector<std::shared_ptr<const topo::Bvh>> tg;
-  for (auto& [id, t] : scene_->items) if (id != m && t.type == ItemType::IMesh && t.poly && scene_->isVisible(t)) if (auto b = bvhOf(id, true)) tg.push_back(b);
+  for (auto& [id, t] : scene_->items) if (id != m && t.type == ItemType::IMesh && t.poly && scene_->isVisible(t)) if (auto b = bvhSurf(id)) tg.push_back(b);
   if (tg.empty()) return;
   const Affine M = meshmods::meshMatrix(*scene_, *it), Mi = M.inverse();
   for (auto& p : pts) { const Vec3 w = M.apply(p); double bd = 1e300; Vec3 best = w;
@@ -383,9 +384,29 @@ std::vector<int> Viewport::fillBuild(int m, MeshEd& E, QJsonArray* loops) {
 // the hole(s) aimed at: those the selection touches, else the one nearest the pointer — their filling shown
 void Viewport::fillPreview(const QPointF& mp, const Vec3* aim) {
   const int m = topoMesh(); Item* it = m >= 0 ? scene_->item(m) : nullptr; std::vector<std::vector<int>> was = tt_.fillLoops; tt_.fillLoops.clear();
-  if (!it || topoHeavy(m)) { tt_.fillPrev.clear(); ttTouch(); return; }
+  if (!it) { tt_.fillPrev.clear(); ttTouch(); return; }
   auto T = topo::ttopo(baseSp(*it)); const PolyMesh* B = baseOf(*it);
-  if (tt_.fillB != B) { tt_.fillB = B; tt_.fillAll = holesOf(*T); tt_.fillKey.clear(); }
+  if (tt_.fillB != B) { tt_.fillB = B; tt_.fillAll = holesOf(*T); tt_.fillKey.clear();
+    // (a mesh in a virtual symmetry group: a hole open to the mirror plane — an open run of the rim between two vertices ON the plane — is
+    // a hole too; the line along the axis that closes it is made with the filling)
+    for (const Item* g = scene_->item(it->parent); g; g = scene_->item(g->parent)) {
+      if (g->type != ItemType::Group || !g->raw.value("vsym").isObject()) continue;
+      const QJsonObject vs = g->raw.value("vsym").toObject(); const auto sides = meshmods::vsymSides(vs); if (vs.value("off").toBool() || sides.empty()) break;
+      const Affine Gi = meshmods::vsymFrame(*scene_, *g).inverse(); const auto W0 = ttWorld(m); const double tol = std::max(1e-6, vs.value("weldDist").toDouble(0.05));
+      auto onPlane = [&](int v) { const Vec3 l = Gi.apply(W0[size_t(v)]); for (auto [a, s] : sides) if (std::abs(a == 0 ? l.x : a == 1 ? l.y : l.z) <= tol) return true; return false; };
+      std::map<int, std::vector<int>> nb; for (int e = 0; e < T->ne; e++) if (T->ef1[size_t(e)] < 0) { nb[T->ea[size_t(e)]].push_back(T->eb[size_t(e)]); nb[T->eb[size_t(e)]].push_back(T->ea[size_t(e)]); }
+      for (auto& [A, ns] : nb) { if (!onPlane(A)) continue;
+        for (int n1 : ns) { if (onPlane(n1)) continue; std::vector<int> path{A, n1}; int prev = A, cur = n1; bool ok = true;
+          while (ok && !onPlane(cur)) { const auto& cn = nb[cur]; if (cn.size() != 2 || path.size() > 24) { ok = false; break; } const int nx = cn[0] == prev ? cn[1] : cn[0]; prev = cur; cur = nx; path.push_back(cur); }
+          if (!ok || cur == A || cur < A) continue;                  // (each run once: from its lower end)
+          const auto& an = nb[A]; if (std::find(an.begin(), an.end(), cur) != an.end()) continue;   // (the two ends already joined: a hole of its own, found above)
+          // (turned the way the polygons beside it do not run: as the holes are)
+          const int a0 = path[0], b0 = path[1]; bool agree = false;
+          for (int e = 0; e < T->ne && !agree; e++) if (T->ef1[size_t(e)] < 0 && ((T->ea[size_t(e)] == a0 && T->eb[size_t(e)] == b0) || (T->ea[size_t(e)] == b0 && T->eb[size_t(e)] == a0))) {
+            const int f = T->ef0[size_t(e)]; for (int k = T->fo[size_t(f)]; k < T->fo[size_t(f) + 1]; k++) { const int k2 = k + 1 < T->fo[size_t(f) + 1] ? k + 1 : T->fo[size_t(f)]; if (T->fv[size_t(k)] == a0 && T->fv[size_t(k2)] == b0) agree = true; } }
+          if (agree) std::reverse(path.begin(), path.end());
+          tt_.fillAll.push_back(path); } }
+      break; } }
   // (only a picked rim — edges or vertices — chooses the holes: picked polygons (the patch just made among them) do
   // not, else every hole they touch would be filled at once; then the one at the pointer)
   std::set<int> sv; if (tsel_.id == m && (topoMode == "edge" || topoMode == "vert")) { auto vs = tSelVerts(m); sv.insert(vs.begin(), vs.end()); }

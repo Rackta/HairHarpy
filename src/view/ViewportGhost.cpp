@@ -373,7 +373,7 @@ void Viewport::revealGather(const QPointF& mp) {
     for (size_t gi = 0; gi < Gs.size(); gi++) { const Ghost& G = Gs[gi]; auto& C = ghostMid_[gi]; C.resize(G.fok.size());
       for (size_t f = 0; f < G.fok.size(); f++) { Vec3 c; const int s = G.fo[f], e = G.fo[f + 1]; for (int k = s; k < e; k++) c += G.P[size_t(G.fv[size_t(k)])]; C[f] = c * (1.0 / std::max(1, e - s)); } } }
   // (what may hide a ghost polygon: the shown references — through their hierarchies, a high-poly one's only when ready)
-  int tm = topoMesh(); if (const Item* t = tm >= 0 ? scene_->item(tm) : nullptr; !t || t->raw.value("tghost").toBool() || topoHeavy(tm)) tm = -1;   // (the mesh being built — not a reference)
+  int tm = topoMesh(); if (const Item* t = tm >= 0 ? scene_->item(tm) : nullptr; !t || t->raw.value("tghost").toBool()) tm = -1;   // (the mesh being built — not a reference)
   std::vector<std::pair<int, std::shared_ptr<const topo::Bvh>>> occ;
   for (auto& [id, x] : scene_->items) { if (id == tm || x.type != ItemType::IMesh || !x.poly || !scene_->isVisible(x)) continue;
     if (heavyRay(id, Ray{cam_.pos, cam_.dir()}, false)) occ.push_back({id, nullptr});
@@ -402,7 +402,7 @@ QString Viewport::revealApply() {
   if (faces.empty()) return {};
   const auto& Gs = ghosts();
   int m = topoMesh(); Item* it = m >= 0 ? scene_->item(m) : nullptr;
-  if (it && (topoHeavy(m) || it->raw.value("tghost").toBool())) { ui::toast(tr("Pick the mesh being built (not the ghost source, not a high-poly one) — or none: a new one is made")); return "!"; }
+  if (it && (it->raw.value("tghost").toBool())) { ui::toast(tr("Pick the mesh being built (not the ghost source, not a high-poly one) — or none: a new one is made")); return "!"; }
   // (a ghost point onto what is built there — a vertex of the mesh within a third of the ghost's edges — else a new one)
   std::vector<Vec3> W; Affine M, Mi; if (it) { M = meshmods::meshMatrix(*scene_, *it); Mi = M.inverse(); for (auto& p : baseOf(*it)->pos) W.push_back(M.apply(p)); }
   double avgL = 1; for (auto& G : Gs) avgL = std::min(avgL == 1 ? G.avgL : avgL, G.avgL); const double tol = avgL / 3;
@@ -419,7 +419,7 @@ QString Viewport::revealApply() {
     if (best < 0) { best = E.addVert(it ? Mi.apply(w) : w); grid[key(w)].push_back(best); }
     made[{gi, gv}] = best; return best; };
   std::vector<int> newF; int skipped = 0;
-  for (auto [gi, f] : faces) { const Ghost& G = Gs[size_t(gi)]; if (size_t(f) >= G.fok.size()) continue;
+  for (auto [gi, f] : faces) { if (size_t(gi) >= Gs.size()) continue; const Ghost& G = Gs[size_t(gi)]; if (size_t(f) >= G.fok.size() || size_t(f) + 1 >= G.fo.size()) continue;
     std::vector<int> vs; for (int k = G.fo[size_t(f)]; k < G.fo[size_t(f) + 1]; k++) { const int v = vertOf(gi, G.fv[size_t(k)]); if (vs.empty() || (vs.back() != v && vs.front() != v)) vs.push_back(v); }
     if (vs.size() < 3) { skipped++; continue; }
     bool exists = false; for (int x : E.facesOfVert(vs[0])) { std::set<int> a(E.f[size_t(x)].v.begin(), E.f[size_t(x)].v.end()), b(vs.begin(), vs.end()); if (a == b) exists = true; }

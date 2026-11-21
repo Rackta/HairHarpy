@@ -5,7 +5,10 @@
 // pointer on / off the item — a preview) and a dwell (held a moment → the next menu).
 // Also the toast (a line at the bottom for 2.2 s) and the HUD (a line at the top of the viewport while it is set).
 #pragma once
+#include <QElapsedTimer>
+#include <QJsonObject>
 #include <QImage>
+#include <QJsonObject>
 #include <QPointer>
 #include <QString>
 #include <QWidget>
@@ -47,6 +50,7 @@ public:
   static std::function<void(const QString&)> faqHook;   // (~ over an item: its help in the FAQ — the item's label and tip)
   static void closeCurrent();
   void keyReleased(const QString& code);       // (the window passes the key the pie is held by)
+  QString subWalk();                           // (checks: the pointer moved pixel by pixel from each item with a sub-list onto each of its items — where the list closed on the way)
 
 protected:
   void paintEvent(QPaintEvent*) override;
@@ -55,6 +59,7 @@ protected:
   void mouseReleaseEvent(QMouseEvent* e) override;
   void keyPressEvent(QKeyEvent* e) override;
   void keyReleaseEvent(QKeyEvent* e) override;
+  void closeEvent(QCloseEvent* e) override;
 
 private:
   struct Btn { QRect r; const PieItem* it; bool ring = false; double ang = 0; int level = 0; int parent = -1; bool inner = false; };
@@ -82,6 +87,13 @@ private:
 void toast(const QString& msg); QString lastToast();   // (lastToast: the last one shown — checks)
 std::function<void(const QString&)>& toastHook();       // (each message shown passed on too — the development session's record)
 std::function<void(const QString&)>& stepHook();        // (each message shown — the history names its step after it)
+// (the session's record — DevSession: a line of it from anywhere in the program — a stroke with what it did and how long it took,
+// an undo, a save… Nothing happens while no session is recorded)
+std::function<void(const QString& kind, const QJsonObject& data)>& devHook();
+inline void devLog(const QString& kind, const QJsonObject& data) { if (devHook()) devHook()(kind, data); }
+// (an operation timed for the session's record: an "op" line with its name and how long it took, when it took `least` ms or more)
+struct DevOp { QString name; QJsonObject more; qint64 least; QElapsedTimer t; explicit DevOp(const QString& n, qint64 leastMs = 0, const QJsonObject& m = {}) : name(n), more(m), least(leastMs) { t.start(); }
+  ~DevOp() { if (!devHook() || t.elapsed() < least) return; QJsonObject o = more; o.insert("name", name); o.insert("ms", double(t.elapsed())); devHook()("op", o); } };
 // the busy indicator (busyStart / busyEnd): the program's little hair picture filling blue and a label ("Opening…") at
 // the bottom right of the viewport while a long task holds the program; painted before the task starts
 class BusyScope {

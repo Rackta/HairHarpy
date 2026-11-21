@@ -17,6 +17,11 @@ struct HeadFit { double k = 1; Vec3 from, to; };
 std::optional<HeadFit> headFit(const Scene& sc, const QJsonObject& P, const QString& projectPath);
 
 struct MigrateResult { bool ok = false; QString message; std::vector<int> select; };
-MigrateResult migrateData(Scene& sc, const QJsonObject& P, const QString& name, bool wrap, const std::optional<HeadFit>& fit);
+// everything: the items dragged from another HairHarpy's outliner (P.roots — what was dragged): imported meshes and their modifiers
+// come in too; the service groups are left out but what lies in them comes (18.11: two projects open, an item dragged between them)
+MigrateResult migrateData(Scene& sc, const QJsonObject& P, const QString& name, bool wrap, const std::optional<HeadFit>& fit, bool everything = false);
+// what another program gets when items are dragged out of the outliner: the project's records cut down to them, their contents,
+// the modifiers hanging on them and the anchors their curves use; every imported mesh with its geometry inside (no file of its own)
+QJsonObject dragSubset(const QJsonObject& P, const std::vector<int>& roots);
 
 }  // namespace hm

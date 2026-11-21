@@ -32,7 +32,7 @@ double f32(double x) { return double(float(x)); }                 // (the HTML v
 struct Raw { std::vector<Vec3> v; std::vector<std::array<float, 2>> vt; std::vector<int> fo{0}, fv, ft, fm, fg; std::vector<QString> mats, groups, mtllib;
              std::vector<std::array<float, 3>> vn;                 // (a normal per corner — parallel to fv — or none)
              std::vector<std::array<float, 3>> vc;                 // (polypaint: a colour per raw vertex — parallel to v — or none)
-             std::vector<std::array<int, 2>> hard; std::vector<PolyMesh::Crease> crease; };   // (raw vertex indices)
+             std::vector<std::array<int, 2>> hard; std::vector<PolyMesh::Crease> crease; bool sepObjects = false; };   // (raw vertex indices; sepObjects: the file has several objects (o) — their vertices never welded across them)
 std::shared_ptr<PolyMesh> baseOf(Raw& o, bool exact, QString* error) {
   const int nf = int(o.fo.size()) - 1;
   if (o.ft.size() != o.fv.size()) o.ft.assign(o.fv.size(), -1);
@@ -46,12 +46,14 @@ std::shared_ptr<PolyMesh> baseOf(Raw& o, bool exact, QString* error) {
   }
   if (nf <= 0) { if (error) *error = QStringLiteral("No polygons in the file"); return nullptr; }
   std::vector<Vec3> P; std::vector<int> fv = o.fv;
-  std::vector<int> used, remap;                              // (raw vertex → used vertex → welded)
+  std::vector<int> used, remap, vgrp;                        // (raw vertex → used vertex → welded; vgrp: the object of each used vertex)
   if (exact) P = o.v;
   else {
     used.assign(o.v.size(), -1); int n0 = 0;
     for (int& i : fv) { if (used[size_t(i)] < 0) used[size_t(i)] = n0++; i = used[size_t(i)]; }
     P.resize(size_t(n0)); for (size_t i = 0; i < used.size(); i++) if (used[i] >= 0) P[size_t(used[i])] = o.v[i];
+    if (o.sepObjects) { vgrp.assign(size_t(n0), 0); std::vector<char> got(size_t(n0), 0);   // (the object each vertex belongs to: that of the first polygon using it)
+      for (int f = 0; f < nf; f++) for (int k = o.fo[size_t(f)]; k < o.fo[size_t(f) + 1]; k++) { const int u = fv[size_t(k)]; if (!got[size_t(u)]) { got[size_t(u)] = 1; vgrp[size_t(u)] = o.fg[size_t(f)]; } } }
   }
   Box3 box; for (auto& p : P) box.expand(p);
   double size = box.size().length(); if (!(size > 0)) size = 1;
@@ -62,10 +64,26 @@ std::shared_ptr<PolyMesh> baseOf(Raw& o, bool exact, QString* error) {
     for (size_t i = 0; i < P.size(); i++) {
       long long x = std::llround((P[i].x - box.min.x) / q), y = std::llround((P[i].y - box.min.y) / q), z = std::llround((P[i].z - box.min.z) / q);
       std::string k(reinterpret_cast<const char*>(&x), 8); k.append(reinterpret_cast<const char*>(&y), 8); k.append(reinterpret_cast<const char*>(&z), 8);
+      if (!vgrp.empty()) { const int g = vgrp[i]; k.append(reinterpret_cast<const char*>(&g), 4); }   // (parts of different objects that only touch stay apart: welded they would share edges of three polygons)
       auto it = cell.find(k); if (it != cell.end()) { remap[i] = it->second; continue; }
       int id = int(m->pos.size()); cell.emplace(std::move(k), id); m->pos.push_back(P[i]); remap[i] = id;
     }
     for (int& i : fv) i = remap[size_t(i)];
+    // (welded, a polygon may name one vertex twice — two of its points fell into one: the double is dropped (a quad becomes a triangle), a polygon
+    // left with fewer than three goes; its corners' UVs / normals and its group / material go with them)
+    bool dirty = false;
+    for (int f = 0; f < nf && !dirty; f++) { const int s = o.fo[size_t(f)], e = o.fo[size_t(f) + 1]; std::set<int> u(fv.begin() + s, fv.begin() + e); if (int(u.size()) != e - s) dirty = true; }
+    if (dirty) {
+      std::vector<int> fo2{0}, fv2, ft2, fm2, fg2; std::vector<std::array<float, 3>> vn2; const bool hasVn = o.vn.size() == fv.size();
+      for (int f = 0; f < nf; f++) { const int s = o.fo[size_t(f)], e = o.fo[size_t(f) + 1]; std::vector<int> ks;
+        for (int k = s; k < e; k++) if (ks.empty() || fv[size_t(k)] != fv[size_t(ks.back())]) ks.push_back(k);
+        while (ks.size() > 1 && fv[size_t(ks.back())] == fv[size_t(ks.front())]) ks.pop_back();
+        std::set<int> u; for (int k : ks) u.insert(fv[size_t(k)]); if (ks.size() < 3 || u.size() != ks.size()) continue;
+        for (int k : ks) { fv2.push_back(fv[size_t(k)]); ft2.push_back(o.ft[size_t(k)]); if (hasVn) vn2.push_back(o.vn[size_t(k)]); }
+        fo2.push_back(int(fv2.size())); fm2.push_back(o.fm[size_t(f)]); fg2.push_back(o.fg[size_t(f)]); }
+      fv = fv2; o.fo = fo2; o.ft = ft2; o.fm = fm2; o.fg = fg2; if (hasVn) o.vn = vn2;
+      if (o.fo.size() < 2) { if (error) *error = QStringLiteral("No polygons in the file"); return nullptr; }
+    }
   }
   m->faceVerts = fv; m->faceStart = o.fo; m->faceGroup = o.fg; m->groupNames = o.groups;
   m->faceMat = o.fm; m->matNames = o.mats; m->mtllib = o.mtllib;
@@ -86,7 +104,7 @@ std::shared_ptr<PolyMesh> baseOf(Raw& o, bool exact, QString* error) {
 // OBJ (parseOBJFast): v / vt / f (negative indices too; repeated corners in a row dropped, a polygon of fewer than 3
 // different corners dropped), usemtl / mtllib, g / o — the polygroups
 std::shared_ptr<PolyMesh> parseObj(const QByteArray& text, QString* error, bool flat) {
-  Raw o; std::unordered_map<std::string, int> gix; int cur = -1, gcur = -1;
+  Raw o; std::unordered_map<std::string, int> gix; int cur = -1, gcur = -1, objLines = 0;
   std::vector<std::array<float, 3>> vcs; bool anyVc = false; std::vector<std::array<float, 3>> mrgb;   // (polypaint: "v x y z r g b", ZBrush'"'"'s "#MRGB" blocks)
   std::vector<std::array<float, 3>> vns; std::vector<int> fn, fsg; int sg = 1; bool anyS = false;   // (vn, a corner's vn, the faces' smoothing groups)
   auto groupOf = [&](const std::string& n) { auto it = gix.find(n); if (it != gix.end()) return it->second; int k = int(o.groups.size()); o.groups.push_back(QString::fromStdString(n)); gix.emplace(n, k); return k; };
@@ -128,7 +146,7 @@ std::shared_ptr<PolyMesh> parseObj(const QByteArray& text, QString* error, bool 
     }
     else if (le - q >= 6 && std::strncmp(q, "usemtl", 6) == 0) { QString n = QString::fromStdString(rest(q + 6, le)); int k = int(std::find(o.mats.begin(), o.mats.end(), n) - o.mats.begin()); if (k == int(o.mats.size())) { k = int(o.mats.size()); o.mats.push_back(n); } cur = k; }
     else if (le - q >= 6 && std::strncmp(q, "mtllib", 6) == 0) o.mtllib.push_back(QString::fromStdString(rest(q + 6, le)));
-    else if (q + 1 < le && (q[0] == 'o' || q[0] == 'g') && (q[1] == ' ' || q[1] == '\t')) { std::string n = rest(q + 1, le); gcur = groupOf(n.empty() ? "default" : n); }
+    else if (q + 1 < le && (q[0] == 'o' || q[0] == 'g') && (q[1] == ' ' || q[1] == '\t')) { std::string n = rest(q + 1, le); gcur = groupOf(n.empty() ? "default" : n); if (q[0] == 'o' && ++objLines >= 2) o.sepObjects = true; }
     p = le + 1;
   }
   if (mrgb.size() == o.v.size() && !mrgb.empty()) o.vc = mrgb; else if (anyVc && vcs.size() == o.v.size()) o.vc = vcs;   // (polypaint, when the file has it)
@@ -222,12 +240,13 @@ std::shared_ptr<PolyMesh> parseGltf(const QByteArray& data, bool glb, QString* e
   QByteArray json, bin;
   if (glb) {
     if (data.size() < 20 || std::memcmp(data.constData(), "glTF", 4) != 0) { if (error) *error = QStringLiteral("Not a GLB file"); return nullptr; }
-    int off = 12;
+    qint64 off = 12;
     while (off + 8 <= data.size()) {
       uint32_t len, type; std::memcpy(&len, data.constData() + off, 4); std::memcpy(&type, data.constData() + off + 4, 4);
-      QByteArray chunk = data.mid(off + 8, int(len));
+      if (qint64(len) > qint64(data.size()) - off - 8) break;   // (a chunk longer than the file: a damaged file, read no further)
+      QByteArray chunk = data.mid(off + 8, qsizetype(len));
       if (type == 0x4E4F534A) json = chunk; else if (type == 0x004E4942) bin = chunk;
-      off += 8 + int((len + 3) & ~3u);
+      off += 8 + ((qint64(len) + 3) & ~qint64(3));
     }
   } else json = data;
   QJsonObject G = QJsonDocument::fromJson(json).object();
@@ -295,6 +314,7 @@ std::shared_ptr<PolyMesh> parseGltf(const QByteArray& data, bool glb, QString* e
         for (int i = 0; i < cnt; i++) { double x = P[size_t(i * 3)], y = P[size_t(i * 3 + 1)], z = P[size_t(i * 3 + 2)];
           o.v.push_back({f32(W.m[0] * x + W.m[4] * y + W.m[8] * z + W.m[12]), f32(W.m[1] * x + W.m[5] * y + W.m[9] * z + W.m[13]), f32(W.m[2] * x + W.m[6] * y + W.m[10] * z + W.m[14])}); }
         std::vector<double> UV; if (at.contains("TEXCOORD_0")) UV = readAcc(at.value("TEXCOORD_0").toInt(), 2);
+        if (UV.size() < size_t(cnt) * 2) UV.clear();               // (fewer UVs than points: a damaged file, its UVs not used)
         int tb = int(o.vt.size()); for (int i = 0; i < cnt && !UV.empty(); i++) o.vt.push_back({float(UV[size_t(i * 2)]), float(1 - UV[size_t(i * 2 + 1)])});
         std::vector<double> I; if (pr.contains("indices")) I = readAcc(pr.value("indices").toInt(), 1); else for (int i = 0; i < cnt; i++) I.push_back(i);
         // the file's normals (per vertex → per corner), turned by the node's matrix (its inverse transpose)
@@ -314,6 +334,7 @@ std::shared_ptr<PolyMesh> parseGltf(const QByteArray& data, bool glb, QString* e
         for (size_t t = 0; t + 2 < I.size(); t += 3) {
           int c[3] = {int(I[t]), int(I[t + 1]), int(I[t + 2])}; if (det < 0) std::swap(c[1], c[2]);
           if (c[0] == c[1] || c[1] == c[2] || c[0] == c[2]) continue;
+          if (c[0] < 0 || c[1] < 0 || c[2] < 0 || c[0] >= cnt || c[1] >= cnt || c[2] >= cnt) continue;   // (an index past the primitive's points: skipped)
           for (int k : c) { o.fv.push_back(base + k); o.ft.push_back(UV.empty() ? -1 : tb + k);
             if (!NN.empty() && size_t(k * 3 + 2) < NN.size()) { double x = NN[size_t(k * 3)], y = NN[size_t(k * 3 + 1)], z = NN[size_t(k * 3 + 2)];
               double nx = nm[0] * x + nm[1] * y + nm[2] * z, ny = nm[3] * x + nm[4] * y + nm[5] * z, nz = nm[6] * x + nm[7] * y + nm[8] * z, l = std::sqrt(nx * nx + ny * ny + nz * nz); if (l > 0) { nx /= l; ny /= l; nz /= l; }
@@ -392,7 +413,7 @@ std::shared_ptr<PolyMesh> parsePMesh(const QByteArray& b, QString* error) {
   // (the UV Sets: their polygons, the one each shows, each set's UVs per corner)
   std::vector<QString> usn; for (const QJsonValue& x : h.value("uvsets").toArray()) usn.push_back(x.toString());
   std::vector<uint32_t> fsets; std::vector<int8_t> flive; std::vector<std::vector<std::array<float, 2>>> suv;
-  if (!usn.empty() && nt == c) { auto M = take<uint32_t>(b, off, nf); auto L = take<int32_t>(b, off, nf); fsets.assign(M.begin(), M.end()); for (int32_t x : L) flive.push_back(int8_t(x));
+  if (!usn.empty() && (nt == c || nt == 0)) { auto M = take<uint32_t>(b, off, nf); auto L = take<int32_t>(b, off, nf); fsets.assign(M.begin(), M.end()); for (int32_t x : L) flive.push_back(int8_t(x));
     for (size_t s = 0; s < usn.size(); s++) { auto U = take<float>(b, off, c * 2); std::vector<std::array<float, 2>> l; l.reserve(c); for (size_t i = 0; i + 1 < U.size(); i += 2) l.push_back({U[i], U[i + 1]}); suv.push_back(std::move(l)); } }
   const size_t nvc = size_t(h.value("nvc").toInt());              // (polypaint: after the UV Sets)
   if (nvc == n && n) { auto C = take<float>(b, off, n * 3); for (size_t i = 0; i < n; i++) o.vc.push_back({C[i * 3], C[i * 3 + 1], C[i * 3 + 2]}); }

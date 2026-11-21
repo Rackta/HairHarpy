@@ -180,7 +180,7 @@ QString applySymmetry(Scene& sc, int gid, const Vec3& headC, Selection& sel) {
     }
   }
   for (int id : list) {
-    const Item m = *sc.item(id); if (m.type != ItemType::Mesh || m.raw.value("symBaked").toBool() || !m.poly) continue;
+    const Item m = *sc.item(id); if (!(m.type == ItemType::Mesh || (m.type == ItemType::IMesh && m.raw.contains("srcSurfs"))) || m.raw.value("symBaked").toBool() || !m.poly) continue;
     auto poly = std::make_shared<PolyMesh>();
     QJsonArray P, F;
     for (auto& p : m.poly->pos) { Vec3 q = mirrorPt(p, ax, center); poly->pos.push_back(q); P.append(QJsonArray{q.x, q.y, q.z}); }
@@ -192,7 +192,9 @@ QString applySymmetry(Scene& sc, int gid, const Vec3& headC, Selection& sel) {
     edit::nextNumber(sc, ItemType::Mesh);
     Item& n = sc.addItem(ItemType::Mesh, par(id), m.name + " mirror");
     n.poly = poly;
+    poly->groupNames = m.poly->groupNames; poly->faceGroup = m.poly->faceGroup;   // (its locks' polygroups)
     n.raw = QJsonObject{{"data", QJsonObject{{"pos", P}, {"faces", F}}}, {"pending", false}, {"srcSurfs", QJsonArray()}, {"srcCrowns", QJsonArray()}, {"symBaked", false}};
+    plainMesh(n);
   }
   sym.insert("on", false); sc.item(gid)->raw.insert("sym", sym);
   sc.reindex();
@@ -251,6 +253,7 @@ QString duplicateSelection(Scene& sc, Selection& sel) {
     switch (it.type) {
       case ItemType::Curve: {
         if (it.ring >= 0) return -1;                                   // (disc rings are copied with their disc)
+        if (it.conn == "braid") return -1;                             // (a braid's end rings: its own — a braid is not copied, so neither are they; a copy would stay tied to the original braid)
         n = cloneItem(sc, id, parent, name);
         std::vector<int> an; for (int a : it.anchors) an.push_back(cpA(a));
         Item& c = *sc.item(n); c.anchors = an; c.ovr.clear();
@@ -292,7 +295,7 @@ QString duplicateSelection(Scene& sc, Selection& sel) {
         n = cloneItem(sc, id, parent, name); newX.push_back(n);
         break;
       case ItemType::Tube: n = cloneItem(sc, id, parent, name); newTubes.push_back(n); break;
-      case ItemType::Cap: case ItemType::Skin: case ItemType::PInf: n = cloneItem(sc, id, parent, name); break;
+      case ItemType::Cap: case ItemType::Skin: case ItemType::PInf: case ItemType::Spiral: n = cloneItem(sc, id, parent, name); break;
       case ItemType::Tip: case ItemType::Even: case ItemType::Shell: n = cloneItem(sc, id, parent, name); newMasked.push_back(n); break;
       case ItemType::IMesh: {
         n = cloneItem(sc, id, parent, name); sc.item(n)->headTag = false; sc.item(n)->raw.remove("headTag");

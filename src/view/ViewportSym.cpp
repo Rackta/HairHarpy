@@ -1,4 +1,4 @@
-// Symmetry (Shift+X) and its settings — one set of them for the Topology room and the Hair room. Type: Planar (a mirror
+// Symmetry (Shift+S) and its settings — one set of them for the Topology room and the Hair room. Type: Planar (a mirror
 // across each checked axis' plane, and their combinations), Topology (the planar pairs as seeds, then matched through
 // the mesh's own connections — holds on a posed or a slightly uneven mesh), Radial (copies turned round the first
 // checked axis). Space: Local (the mesh's own axes and origin), Global (the world's), Workplane (the gizmo put by
@@ -139,7 +139,7 @@ void Viewport::symApply(const SymSet& S, std::vector<Vec3>& P, const std::vector
 
 namespace hm {
 // a setting changed: the twins found again, what shows them drawn again, kept
-void Viewport::symChanged() { symCache_ = {}; symC_ = {}; saveTopoPrefs(); topoRev_++; overlayRev_++; uvChanged(); requestUpdate(); emit topoState(); }
+void Viewport::symChanged() { symCache_ = {}; symC_ = {}; inspC_.clear();   /* (the Inspector's Asymmetry: by the new mirror) */ saveTopoPrefs(); topoRev_++; overlayRev_++; uvChanged(); requestUpdate(); emit topoState(); }
 }  // namespace hm
 
 namespace hm {
@@ -173,9 +173,11 @@ Viewport::HairSym Viewport::hairSymTwins(const std::vector<int>& list) const {
   else { std::vector<Affine> R; for (int i : axes) { R.push_back(reflect(o, e(i))); H.planes.push_back({o, e(i)}); }
     for (int mask = 1; mask < (1 << int(R.size())); mask++) { Affine T; for (size_t i = 0; i < R.size(); i++) if (mask >> i & 1) T = Affine::mul(R[i], T); H.T.push_back(T); } }
   std::set<int> in(list.begin(), list.end());
+  std::set<int> shown; for (const Item* c : scene_->curves()) if (scene_->isVisible(*c)) shown.insert(c->anchors.begin(), c->anchors.end());   // (twins only among the shown curves' anchors)
   for (size_t i = 0; i < list.size(); i++) { const Anchor* a = scene_->anchor(list[i]); if (!a) continue; H.start.push_back({list[i], a->pos});
     for (size_t k = 0; k < H.T.size(); k++) { const Vec3 m = H.T[k].apply(a->pos); int best = -1; double bd = symo.tol;
-      for (const auto& [id, b] : scene_->anchors) { if (in.count(id)) continue; const double d = b.pos.distanceTo(m); if (d <= bd) { bd = d; best = id; } }
+      if (m.distanceTo(a->pos) <= symo.tol) continue;          // (on the plane / the axis: its own twin — a neighbour is not pulled onto it)
+      for (const auto& [id, b] : scene_->anchors) { if (in.count(id) || !shown.count(id)) continue; const double d = b.pos.distanceTo(m); if (d <= bd) { bd = d; best = id; } }
       if (best >= 0) H.tw.push_back({int(i), best, int(k)}); } }
   return H;
 }

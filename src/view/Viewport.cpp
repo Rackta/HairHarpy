@@ -1,4 +1,4 @@
-﻿#include "view/Viewport.h"
+#include "view/Viewport.h"
 #include <QDragEnterEvent>
 #include <QMimeData>
 #include <deque>
@@ -24,6 +24,8 @@
 #include <QVulkanFunctions>
 #include <QWheelEvent>
 #include <unordered_set>
+#include <cstring>
+#include <QJsonDocument>
 
 namespace hm {
 
@@ -54,6 +56,7 @@ void Viewport::sceneChanged(bool reframe) {
   if (reframe) {
     loadRooms();                                         // (Hair shown; the other rooms wait as their records)
     meshHierarchy(*scene_);
+    const bool collMade = coll::prepare(*scene_) > 0;   // (Head Collision: there, first; an older project's head marks → copies in it)
     hair_.load(*scene_);
     sel_ = {}; pendingCurves_.clear(); ad_ = {}; spots_.clear(); weldHot_ = -1;
     patchLoad();                                         // (PatchTool's curves as the project kept them)
@@ -64,29 +67,50 @@ void Viewport::sceneChanged(bool reframe) {
     if (u.changed()) hair_.load(*scene_);
     history_ = {snapshot()}; histIdx_ = 0; history_[0].label = tr("Project opened"); history_[0].weak = false; emit historyChanged();
     // every window frames the new model (each keeps its view); the project's camera — the active one
-    for (int i = 0; i < 4; i++) if (i != act_) { Camera& c = panes_[size_t(i)]; c.fitToBox(scene_->bounds()); }
+    setWorld();                                          // (first: the flat views stand outside all of it)
+    // (the head far smaller than what the scene holds — a model of another scale beside a head of 1: the windows show all of it)
+    const Box3 hb = scene_->bounds(), wb = cam_.world; auto big = [](const Box3& b) { if (b.empty()) return 0.0; const Vec3 s = b.size(); return std::max({s.x, s.y, s.z}); };
+    const bool wide = big(wb) > 4 * big(hb);
+    for (int i = 0; i < 4; i++) if (i != act_) { Camera& c = panes_[size_t(i)]; c.fitToBox(hb); if (wide) c.frame(wb, false); }
     cam_.fitToBox(scene_->bounds());
     const CameraState& c = scene_->camera;
-    if (c.valid) {                                       // the project's own camera
+    if (c.valid && c.view != "uv") {                     // the project's own camera (a UV Editor is no camera of a project: an older file that kept one opens as it is)
       cam_.view = c.view; cam_.pos = c.pos; cam_.quat = c.quat; cam_.zoom = c.zoom; cam_.pivot = c.pivot;
       cam_.up = cam_.view == "top" ? cam_.quat.rotate({0, 1, 0}) : Vec3(0, 1, 0);
     }
     emit viewChanged(cam_.view);
-    if (u.changed() || u.renamed) emit sceneEdited();
+    if (u.changed() || u.renamed || collMade) emit sceneEdited();   // (the outliner made again: the new group in it)
   }
   staticRev_++; allWalls_ = true; ringsDirty_ = true;
   tubesRev_++; ribsRev_++; crownsRev_++;                    // (the Display settings: their opacities, X-ray)
   { ProfScope p3("commit.onSelChange"); onSelChange(); }
 }
 
+// (what the scene holds — every mesh and curve, hidden too: each camera's views stand outside it, its far plane reaches past it)
+void Viewport::setWorld() {
+  Box3 b;
+  for (const auto& [id, it] : scene_->items) {
+    if (it.poly && (it.type == ItemType::IMesh || it.type == ItemType::Mesh || it.type == ItemType::Head)) b.unite(it.poly->bounds());
+    if (it.type == ItemType::Curve) for (int a : it.anchors) if (const Anchor* an = scene_->anchor(a)) b.expand(an->pos); }
+  cam_.world = b; for (auto& c : panes_) c.world = b;
+}
+
 void Viewport::fitToBox(const Box3& box) {
+  setWorld();
   for (int i = 0; i < 4; i++) if (i != act_) panes_[size_t(i)].fitToBox(box);
   cam_.fitToBox(box); staticRev_++; ringsDirty_ = true;
   emit viewChanged(cam_.view); requestUpdate();
 }
 
 void Viewport::onSelChange() {
+  pvRev_++;
+  tselPrune();
+  if (room() == "topo" && !hpvItems_.empty()) {                // (the HairPreview: a lock is picked whole — never its curves, walls or anchors)
+    sel_.items.erase(std::remove_if(sel_.items.begin(), sel_.items.end(), [this](int id) { const Item* it = scene_->item(id); return hpvItems_.count(id) && (!it || it->type != ItemType::Group); }), sel_.items.end());
+    sel_.anchors.erase(std::remove_if(sel_.anchors.begin(), sel_.anchors.end(), [this](int a) { return hpvAnchors_.count(a) > 0; }), sel_.anchors.end());
+  }
   if (lx_.on && drag_ != Drag::LockEx && sel_.items != lx_.selKey) lockExReset();   // (another object picked: the extrusion stays as it is)
+  if (room() == "hair") hselNote();                          // (picked / let go: an undo step of its own)
   if (!sel_.empty() && refPlane_ >= 0) { refPlane_ = -1; refPivEdit_ = false; refRev_++; }   // (selecting anything in the scene lets the plane go)
   if (soloFollow()) { staticRev_++; allWalls_ = true; }   // (Solo: the shown group follows the selection)
   { ProfScope a("sel.gizmo"); updateGizmo(); }
@@ -164,8 +188,9 @@ std::vector<Viewport::Overlay> Viewport::overlays() const {
       if (pts.size() >= 2) out.push_back({pts, QColor(0xff, 0xe6, 0xc8), false}); }
   }
   if (!lasso_.empty()) out.push_back({lasso_, QColor(0x99, 0xcc, 0xff), true});
+  if (room() == "paint") { pvOverlay(out); if (paintToolOverlay) paintToolOverlay(out); }   // (the Paint room: the selection's outline, a tool's line)
   esnapOverlay(out); topoToolOverlay(out);                                      // (the modelling tools' circles, lines, marks)
-  uvPinOverlay(out);                                         // (the UV Puppet's pins)
+  uvMarkOverlay(out); uvPinOverlay(out);                                         // (the UV Puppet's pins)
   uvGizmoOverlay(out);                                       // (the UV Editor's Move / Rotate / Scale gizmo)
   uvBrushOverlay(out);                                       // (the UV brush's circle)
   if (drag_ == Drag::AnchorLine) out.push_back({{{start_.x(), start_.y()}, {last_.x(), last_.y()}}, QColor(0xff, 0xcf, 0x4d), false});
@@ -226,8 +251,14 @@ std::optional<RayHit> Viewport::pickSurface(const QPointF& m) const {
     auto& slot = triCache[sp.get()]; slot = {sp, {std::move(t), p.bounds()}}; return slot.second;
   };
   const Ray R = ray(m); std::optional<RayHit> heavyHit;
+  const auto paneHidNow = paneHid(act_);                       // (the Paint room: a window showing a visibility set picks what it shows)
+  const bool collLocked = room() == "hair" && coll::locked(*scene_);   // (Head Collision locked: its objects not picked — only in the outliner)
   for (auto& [id, it] : scene_->items) {
-    if (!it.poly || !scene_->isVisible(it)) continue;
+    if (!it.poly || !shownWith(paneHidNow, it)) continue;
+    if (collLocked && it.headTag) continue;
+    if (room() == "hair" && (it.type == ItemType::IMesh || it.type == ItemType::Mesh)) {   // (in a group of meshes locked 🔒: picked only in the outliner — 20.11)
+      bool lk = false; for (const Item* g = scene_->item(it.parent); g && !lk; g = scene_->item(g->parent)) lk = g->type == ItemType::Group && !coll::isGroup(*g) && g->raw.value("selLock").toBool(false);
+      if (lk) continue; }
     if (it.raw.contains("collCap")) continue;                   // (a collision capsule: never picked in the viewport — it wraps the head)
     if (auto hh = heavyRay(id, R, false)) { if (*hh && (!heavyHit || (*hh)->t < heavyHit->t)) heavyHit = *hh; continue; }   // (a heavy mesh: its hierarchy)
     // (a converted mesh moved by the gizmo changes its points in place: its box made anew then)
@@ -366,6 +397,8 @@ bool Viewport::meshWeightsShown(int mesh) const {
 
 void Viewport::beforeFrame() {
   ProfScope prof_("beforeFrame");
+  syncPaneCams();                                          // (the Paint room: the windows whose cameras follow the main view's)
+  meshmods::paintVis = room() == "paint";
   if (!meshmods::refresh(*scene_, meshSig_, [this](int m) { return meshWeightsShown(m); }).empty()) staticRev_++;   // (imported meshes: their modifiers)
   heavyTick();                                             // (heavy meshes: their LOD / hierarchy made in the background)
   // ⇶ anchors glued by Snap to path: one moved — both (every frame, as the HTML version's frameBody)
@@ -397,8 +430,15 @@ void Viewport::syncKinks() {
 
 void Viewport::reloadHair() {
   pendingCurves_.clear(); dirtyWalls_.clear();
-  hair_.load(*scene_);
-  allWalls_ = true; ringsDirty_ = true; overlayRev_++;
+  bool build = true;
+  if (room() == "topo") {                                // (the Topology room: only the HairPreview's hair — rebuilt when it changed, not for every edit of a mesh)
+    uint64_t sg = 1469598103934665603ull; auto mix = [&sg](uint64_t v) { sg = (sg ^ v) * 1099511628211ull; };
+    auto dbl = [&](double d) { uint64_t u; std::memcpy(&u, &d, 8); mix(u); };
+    for (int id : hpvItems_) if (const Item* it = scene_->item(id)) { mix(uint64_t(id)); mix(it->visible); mix(uint64_t(it->anchors.size())); mix(uint64_t(it->children.size())); if (it->type == ItemType::Curve) { dbl(it->round); dbl(it->fair); mix(uint64_t(it->ovr.size())); mix(it->closed); } else mix(uint64_t(qHash(QJsonDocument(it->raw).toJson(QJsonDocument::Compact)))); }
+    for (int id : hpvAnchors_) if (const Anchor* a = scene_->anchor(id)) { dbl(a->pos.x); dbl(a->pos.y); dbl(a->pos.z); }
+    build = sg != hairSig_; hairSig_ = sg;
+  }
+  if (build) { hair_.load(*scene_); allWalls_ = true; ringsDirty_ = true; overlayRev_++; }
   staticRev_++;                                          // (meshes made / gone — Convert, its undo — and groups hidden)
   requestUpdate();
 }
@@ -412,10 +452,13 @@ void Viewport::convertSelected() {
   scene_->revision++;
   commit(true);
   emit statusText(r.message);
-  if (r.lockWeld) {                                      // (the joints to redo — red, after the commit)
-    showWeldSpots(*r.lockWeld);
-    if (!r.lockWeld->problems.empty()) emit weldIssues(r.lockWeld->problems, true);
-  }
+  // (the joints to redo — red, after the commit, with the report to close them by; the places welded right aren't shown:
+  // the locks are meshes now and there is no report to take their green pins away)
+  if (r.lockWeld && !r.lockWeld->problems.empty()) {
+    LockWeldResult lw = *r.lockWeld; lw.accepted.clear();
+    showWeldSpots(lw);
+    emit weldIssues(lw.problems, true);
+  } else clearWeldSpots();
 }
 
 // the places drawn: the problems (not where a fix is under review), the places marked correct, the fixes under review
@@ -504,7 +547,7 @@ void Viewport::setTool(const QString& t) {
   tool_ = t;
   // (a modelling tool from the Object mode: the mode it works in — the PolyPen vertices, Bevel / Inset polygons, the
   // rest edges)
-  if (isModelTool() && t != "tpatch" && t != "tlobe" && topoMode == "object" && topoMesh() >= 0 && !topoHeavy(topoMesh()))   // (PatchTool: works in any mode)
+  if (isModelTool() && t != "tpatch" && t != "tlobe" && topoMode == "object" && topoMesh() >= 0)   // (PatchTool: works in any mode)
     setTopoMode(t == "tpen" ? lastEditMode_ : t == "tweld" || t == "tslide" ? "vert" : t == "treveal" || t == "tbevel" || t == "tinset" || t == "tnormals" || t == "tmirror" ? "poly" : "edge", true);
   if (!isModelTool()) { tt_.chain.clear(); tt_.loopPrev.clear(); tt_.le = -1; }
   topoRev_++; overlayRev_++;                              // (the tool's own drawing — PatchTool's curves — made anew: else only after the next edit)
@@ -518,9 +561,9 @@ void Viewport::setTool(const QString& t) {
 // mask, the shell masks, the curve modifiers' weights, the flat locks' brush)
 void Viewport::syncCursor() {
   const QString& t = tool_;
-  static const char* SEL[] = {"cursor", "rect", "lasso", "fill", "outline", "loop", "ring"};   // (the Topology room's Select Cursor: its kind beside the arrow)
+  static const char* SEL[] = {"cursor", "rect", "lasso", "fill", "outline", "loop", "ring", "shell"};   // (the Topology room's Select Cursor: its kind beside the arrow)
   int kind = (t == "tmask" || t == "tbrush" || t == "tlobe" || shellBrushActive() || weightBrushOn() || ribBrushOn()) ? 2 : (t == "draw" || t == "guide" || t == "crown" || t == "edge" || t == "cut" || t == "tpen" || t == "tknife" || t == "tplane" || t == "tloop") ? 1 : 0;
-  if (kind == 0 && t == "cursor" && room() == "topo") for (int i = 0; i < 7; i++) if (tset.selTool == SEL[i]) kind = 10 + i;
+  if (kind == 0 && t == "cursor" && room() == "topo") for (int i = 0; i < 8; i++) if (tset.selTool == SEL[i]) kind = 10 + i;
   if (kind == cursorKind_) return; cursorKind_ = kind;
   if (kind >= 10) setCursor(ui::badgeCursor(QString("cur_tsel_") + SEL[kind - 10]));
   else if (kind == 2) setCursor(ui::badgeCursor("brush_paint")); else setCursor(kind == 1 ? Qt::CrossCursor : Qt::ArrowCursor);
@@ -613,11 +656,12 @@ bool Viewport::pickWeldSpot(const QPointF& m) {
 }
 
 // (the project's keys undone with the edits: the weld settings and marked places, the shell modifiers all off)
-namespace { const char* WELD_KEYS[] = {"weld", "lockWeld", "lockWeldR", "weldOk", "weldSnap", "shellModsOff"}; }
+namespace { const char* WELD_KEYS[] = {"weld", "lockWeld", "lockWeldR", "weldOk", "weldSnap", "shellModsOff", "uvSetsFree", "uvSetProps"}; }
 Viewport::Snapshot Viewport::snapshot() const {
   QJsonObject w; for (const char* k : WELD_KEYS) if (scene_->fileRaw.contains(k)) w.insert(k, scene_->fileRaw.value(k));
   std::shared_ptr<const void> ch; if (tt_.ec.m >= 0) ch = std::make_shared<const decltype(tt_.ec)>(tt_.ec);   // (the EdgeChain curve: its shape back with the step)
-  return {scene_->items, scene_->anchors, scene_->roots, sel_, w, scene_->refPlanes, tsel_, topoMode, ch};
+  Snapshot s{scene_->items, scene_->anchors, scene_->roots, sel_, w, scene_->refPlanes, tsel_, topoMode, ch};
+  s.gz = gzCustom_; s.tselX = tselX_; return s;
 }
 
 // commit: the network kept up after the edit (merged, cut at the forks, joined, named — the HTML version's order),
@@ -647,9 +691,24 @@ void Viewport::commit(bool topology) {
   if (topology || u.changed() || u.renamed) emit sceneEdited();
 }
 
+// one edit done on several meshes in turn (each its own step as it went): the steps after the mark made one — the last holds them all. Ctrl+Z
+// undid one mesh at a time — nine presses for a Stretch on nine meshes, 2026-11-11
+void Viewport::histMerge(int h0) {
+  if (h0 < -1 || histIdx_ - h0 < 2 || size_t(histIdx_ + 1) != history_.size() || history_.size() >= 300) return;   // (the cap dropped the oldest meanwhile: left as it is)
+  const QString label = history_.back().label; const bool weak = history_.back().weak;
+  history_.erase(history_.begin() + (h0 + 1), history_.begin() + histIdx_); histIdx_ = h0 + 1;
+  history_.back().label = label; history_.back().weak = weak; emit historyChanged();
+}
+
 void Viewport::restore(const Snapshot& s) {
   lockExReset();   // (Lock Extrude's live extrusion: its curves and walls may be gone with the step — the next drag makes it anew)
   ProfScope prof_("restore");
+  gzCustom_ = s.gz;                                          // (the Custom gizmo as it stood at that step)
+  symCache_ = {};                                      // (the Workplane symmetry's plane goes with the gizmo)
+  // (the modelling tools' half-made things hold vertex / edge numbers of the mesh as it was: PolyPen's polygon being drawn,
+  // the Loop's hovered edge. The mesh of another step has other numbers — a click then built on wrong vertices or read past the end)
+  if (std::any_of(tt_.chain.begin(), tt_.chain.end(), [](const TTPt& p) { return p.v >= 0 || p.ea >= 0 || p.eb >= 0; })) tt_.chain.clear();
+  tt_.hov = {}; tt_.le = -1; tt_.loopPrev.clear(); revealFaces_.clear(); tt_.rev++;
   if (s.chain) tt_.ec = *static_cast<const decltype(tt_.ec)*>(s.chain.get()); else if (tt_.ec.m >= 0) tt_.ec = {};   // (the EdgeChain curve as it was at that step)
   // (what differs from now: only anchors moved, curves reshaped, walls' settings — those rebuilt; anything else — items
   // come or gone, cocoons, groups, meshes — the whole hair built anew)
@@ -672,8 +731,13 @@ void Viewport::restore(const Snapshot& s) {
       if ((a.pos - f->second.pos).lengthSq() > 0 || a.smooth != f->second.smooth || a.pass != f->second.pass || a.raw != f->second.raw) movedA.push_back(id); } }
   // (only anchors / shapes / wall settings changed: written into the items in place — the hair's systems kept for the
   // partial rebuild below (the cocoons' context among them) hold pointers to them; a copied map would leave those dangling)
+  // (a mesh's shown copy as the step holds it: its modifiers made again on it. A step is kept right after an edit — before the next frame put
+  //  the mesh's Transform on — so its shown copy can be the bare source; the source the same as now, the modifiers were not made again and the
+  //  mesh stood at the origin: the staff jumped to the middle on an undo after a UV edit, 2026-11-11)
+  std::map<int, const PolyMesh*> polyWas; for (auto& [id, it] : scene_->items) if (it.type == ItemType::IMesh) polyWas[id] = it.poly.get();
   if (whole) { scene_->items = s.items; scene_->anchors = s.anchors; }
   else { for (auto& [id, it] : s.items) scene_->items.at(id) = it; for (auto& [id, a] : s.anchors) scene_->anchors.at(id) = a; }
+  for (auto& [id, it] : scene_->items) if (it.type == ItemType::IMesh) { auto f = polyWas.find(id); if (f == polyWas.end() || f->second != it.poly.get()) { meshSig_.erase(id); pickCache_.erase(id); } }
   scene_->roots = s.roots;
   scene_->refPlanes = s.refPlanes; refRev_++; if (!refPlane(refPlane_)) refPlane_ = -1;
   for (const char* k : WELD_KEYS) { if (s.weld.contains(k)) scene_->fileRaw.insert(k, s.weld.value(k)); else scene_->fileRaw.remove(k); }
@@ -685,7 +749,9 @@ void Viewport::restore(const Snapshot& s) {
     // (the mode stays: the selection back only when it was made in this mode — else none)
     const int ver = tsel_.ver + 1;
     if (s.tmode.isEmpty() || s.tmode == topoMode) tsel_ = s.tsel; else { const int id = tsel_.id; tsel_ = {}; tsel_.id = id; }
+    selVC_ = {};                                             // (the selection's vertices are kept by its version: an older version is back with the step)
     tsel_.ver = ver; thov_ = {};
+    if (s.tmode.isEmpty() || s.tmode == topoMode) tselX_ = s.tselX; else tselX_.clear();
     staticRev_++; topoRev_++; updateGizmo(); emit topoState();
   }
   scene_->reindex(); scene_->revision++;
@@ -704,8 +770,9 @@ void Viewport::restore(const Snapshot& s) {
 
 QJsonObject Viewport::cameraJson() const {
   auto v3 = [](const Vec3& p) { return QJsonArray{p.x, p.y, p.z}; };
-  return QJsonObject{{"view", cam_.view}, {"pos", v3(cam_.pos)}, {"quat", QJsonArray{cam_.quat.x, cam_.quat.y, cam_.quat.z, cam_.quat.w}},
-                     {"zoom", cam_.zoom}, {"pivot", v3(cam_.pivot)}};
+  Camera cc = cam_; if (cc.view == "uv") for (int i = 0; i < 4; i++) if (paneCamera(i).view != "uv") { cc = paneCamera(i); break; }   // (the UV Editor is not saved as the project's camera: the first other window's)
+  return QJsonObject{{"view", cc.view}, {"pos", v3(cc.pos)}, {"quat", QJsonArray{cc.quat.x, cc.quat.y, cc.quat.z, cc.quat.w}},
+                     {"zoom", cc.zoom}, {"pivot", v3(cc.pivot)}};
 }
 
 // the Topology room's selection changed: noted as an undo step when the gesture (a drag) is over — one per click / drag
@@ -714,11 +781,34 @@ void Viewport::tselNote() {
   tselPending_ = true;
   QTimer::singleShot(0, this, [this] { tselPending_ = false; if (drag_ == Drag::Topo) { tselPending_ = true; QTimer::singleShot(60, this, [this] { tselPending_ = false; tselNote(); }); return; } tselPush(); });
 }
+// the Hair room's selection changed (a curve, a wall, anchors picked or let go): an undo step of its own once the
+// gesture is over — Ctrl+Z took back the edit before it and left the selection as it was
+void Viewport::hselNote() {
+  if (hselPending_ || room() != "hair") return;
+  hselPending_ = true;
+  QTimer::singleShot(0, this, [this] { hselPending_ = false;
+    if (drag_ != Drag::None && drag_ != Drag::Orbit && drag_ != Drag::Pan && drag_ != Drag::Dolly) { hselPending_ = true; QTimer::singleShot(60, this, [this] { hselPending_ = false; hselNote(); }); return; }
+    hselPush(); });
+}
+void Viewport::hselPush() {
+  if (room() != "hair" || histIdx_ < 0 || size_t(histIdx_) >= history_.size()) return;
+  const Snapshot& h = history_[size_t(histIdx_)];
+  if (h.sel.items == sel_.items && h.sel.anchors == sel_.anchors) return;   // (nothing new: an undo, an edit's own step)
+  const int dropped = int(history_.size()) - (histIdx_ + 1);
+  history_.resize(size_t(histIdx_ + 1)); history_.push_back(snapshot());
+  history_.back().label = tr("Selection"); history_.back().weak = false; history_.back().at = QDateTime::currentMSecsSinceEpoch();
+  if (history_.size() > 300) history_.erase(history_.begin());
+  histIdx_ = int(history_.size()) - 1;
+  if (dropped > 0) emit historyOverwritten(dropped, bySlider_);
+  bySlider_ = false;
+  emit historyChanged();
+}
+
 void Viewport::tselPush() {
   ProfScope prof_("tselPush");
   if (histIdx_ < 0 || size_t(histIdx_) >= history_.size()) return;
   const Snapshot& h = history_[size_t(histIdx_)];
-  if (h.tsel.id == tsel_.id && h.tsel.f == tsel_.f && h.tsel.e == tsel_.e && h.tsel.v == tsel_.v) return;   // (nothing new — a mode switch alone is no step)
+  if (h.tsel.id == tsel_.id && h.tsel.f == tsel_.f && h.tsel.e == tsel_.e && h.tsel.v == tsel_.v && h.tselX.size() == tselX_.size() && std::equal(h.tselX.begin(), h.tselX.end(), tselX_.begin(), [](const auto& a, const auto& b) { return a.first == b.first && a.second.f == b.second.f && a.second.e == b.second.e && a.second.v == b.second.v; })) return;   // (nothing new — a mode switch alone is no step)
   history_.resize(size_t(histIdx_ + 1)); history_.push_back(snapshot());
   history_.back().label = tr("Selection"); history_.back().weak = false; history_.back().at = QDateTime::currentMSecsSinceEpoch();
   if (history_.size() > 300) history_.erase(history_.begin());
@@ -729,7 +819,7 @@ void Viewport::tselPush() {
 // polygons, where one is on)
 void Viewport::snapAnchors(const std::vector<int>& list) {
   std::vector<std::shared_ptr<const topo::Bvh>> tg;
-  for (auto& [id, t] : scene_->items) if (t.type == ItemType::IMesh && t.poly && t.raw.value("tref").toBool() && scene_->isVisible(t)) if (auto b = bvhOf(id, true)) tg.push_back(b);
+  for (auto& [id, t] : scene_->items) if (t.type == ItemType::IMesh && t.poly && t.raw.value("tref").toBool() && scene_->isVisible(t)) if (auto b = bvhSurf(id)) tg.push_back(b);
   if (tg.empty()) return;
   for (int a : list) { Anchor* an = scene_->anchor(a); if (!an) continue; double bd = 1e300; Vec3 best;
     for (auto& b : tg) { double d; auto q = b->closest(an->pos, nullptr, &d); if (q && d < bd) { bd = d; best = *q; } }
@@ -740,9 +830,14 @@ void Viewport::undo() {
   bySlider_ = false;
   if (room() == "topo" && tool_ == "tknife" && kUndoRedo(false)) return;   // (the knife's curves: their own steps first)
   if (room() == "topo" && tool_ == "tpatch" && patchUndoRedo(false)) return;   // (PatchTool's curves: theirs)
+  if (room() == "topo" && tool_ == "tpen" && !tt_.anchors.empty() && penAnchorHist_ == histIdx_) {   // (PolyPen's anchors: taken back one by one before any step)
+    tt_.anchors.pop_back(); { const int n = int(tt_.anchors.size()); tt_.chain.erase(std::remove_if(tt_.chain.begin(), tt_.chain.end(), [n](const TTPt& p) { return p.anchor >= n; }), tt_.chain.end()); } ttTouch(); emit topoState(); if (tt_.anchors.empty()) penAnchorHist_ = -1; requestUpdate(); return; }
   if (histIdx_ <= 0) { emit statusText(tr("Nothing to undo")); return; }
+  const bool knifeCutStep = room() == "topo" && tt_.kcCutIdx >= 0 && histIdx_ == tt_.kcCutIdx && !tt_.kcCut.empty();   // (the cut of the Knife taken back: its curves with it)
   const auto used = history_[size_t(histIdx_)].patchUsed;   // (a patch undone: the curves it was made of come back)
   restore(history_[size_t(--histIdx_)]);
+  if (knifeCutStep) { tt_.kc = tt_.kcCut; tt_.kcur = int(tt_.kc.size()) - 1; tt_.kUndo.clear(); tt_.kRedo.clear(); tt_.kcCutIdx = -1; if (tool_ != "tknife") setTool("tknife");
+    ttTouch(); overlayRev_++; requestUpdate(); ui::hud(tr("Cut undone — the knife's curves are back: change them and cut again (Enter)"), 2500); }
   if (used) { pt_.c = *static_cast<const std::vector<PatchCurve>*>(used.get()); pt_.undo.clear(); pt_.redo.clear(); pt_.draw = pt_.selC = pt_.selA = -1; patchChanged(); }
 }
 void Viewport::redo() {
@@ -770,7 +865,7 @@ void Viewport::noteStep(const QString& s, bool done) {
 
 QString Viewport::guessStepLabel() const {
   static const std::map<QString, const char*> T = {{"move", "Move"}, {"rotate", "Rotate"}, {"gizmo", "Scale"}, {"draw", "Curve drawn"}, {"brush", "Brush"},
-    {"cut", "Scissors"}, {"guide", "Shell modifiers"}, {"modifier", "Curve modifiers"}, {"crown", "Crown"}, {"braid", "Braid"}, {"edge", "Edges"}, {"cursor", "Edit"}};
+    {"cut", "Scissors"}, {"guide", "Shell modifiers"}, {"modifier", "Curve modifiers"}, {"crown", "Crown"}, {"braid", "Braid"}, {"lockfix", "Lock lines"}, {"edge", "Edges"}, {"cursor", "Edit"}};
   auto f = T.find(tool_); return f != T.end() ? tr(f->second) : room() == "topo" ? tr("Topology edit (%1)").arg(tool_) : tr("Edit (%1)").arg(tool_);
 }
 
@@ -1044,9 +1139,18 @@ void Viewport::checkWeld(int a, const QPointF& m) {
 
 std::optional<Vec3> Viewport::pickPoint(const QPointF& wp) const { auto h = pickSurface(wp - paneOrigin()); if (h) return h->point; return std::nullopt; }
 
-void Viewport::frameSelection() {
+void Viewport::frameSelection(bool allPanes) {
   if (cam_.view == "uv") { uvFrame(); return; }               // (the UV Editor: the selection's UV, else all of them)
   Box3 b; bool small = false;
+  // (the Paint room: the polygons selected there; none — what is shown now: an isolated lock fills the view, not the whole model)
+  if (room() == "paint" && sel_.items.empty() && sel_.anchors.empty()) {
+    for (int id : pvMeshes()) { const Item* it = scene_->item(id); if (!it || !it->poly || !scene_->isVisible(*it) || it->raw.value("pHid").toBool()) continue;
+      const auto B = it->base ? it->base : it->poly; const auto& pos = it->poly->pos; if (pos.size() < B->pos.size()) continue;
+      const std::vector<char> hid = pvVec(*it, "pHid", "pHidF"); const auto sf = pvSel.find(id);
+      for (int f = 0; f < B->faceCount(); f++) {
+        if (!pvSel.empty() ? (sf == pvSel.end() || !sf->second.count(f)) : (size_t(f) < hid.size() && hid[size_t(f)])) continue;
+        for (int k = B->faceStart[size_t(f)]; k < B->faceStart[size_t(f) + 1]; k++) b.expand(pos[size_t(B->faceVerts[size_t(k)])]); } }
+    if (!b.empty()) { cam_.frame(b, true); cam_.pivot = b.center(); requestUpdate(); return; } }
   if (!sel_.anchors.empty()) { for (int a : sel_.anchors) if (auto* an = scene_->anchor(a)) b.expand(an->pos); small = true; }
   else for (int id : sel_.items) {
     const Item* it = scene_->item(id); if (!it) continue;
@@ -1058,8 +1162,17 @@ void Viewport::frameSelection() {
     if (it->type == ItemType::Cocoon) if (auto k = hair_.cocoons().find(id); k != hair_.cocoons().end()) for (auto& p : k->second.geo.c) b.expand(p);
     small = true;
   }
-  if (b.empty()) { b = scene_->bounds(); small = false; }
+  if (b.empty()) {                                              // (nothing selected: everything shown — 20.11: not the head alone, hair far
+    // from it (brought from a project of another scale) could not be reached)
+    for (const auto& [id, it] : scene_->items) { if (!scene_->isVisible(it)) continue;
+      if (it.poly && (it.type == ItemType::IMesh || it.type == ItemType::Mesh || it.type == ItemType::Head)) b.unite(it.poly->bounds());
+      if (it.type == ItemType::Curve) for (int a : it.anchors) if (auto* an = scene_->anchor(a)) b.expand(an->pos); }
+    if (b.empty()) b = scene_->bounds();
+    small = false; }
+  if (allPanes) setWorld();                                     // (what came in: the flat views outside it too)
   cam_.frame(b, small);
+  // (what came in from another project: every view onto it, not the active one only — 20.11: the other views stayed where they were)
+  if (allPanes) for (int i = 0; i < 4; i++) if (i != act_ && panes_[size_t(i)].view != "uv") panes_[size_t(i)].frame(b, small);
   requestUpdate();
 }
 
@@ -1073,10 +1186,14 @@ QMouseEvent localEvent(QMouseEvent* e, const QPointF& origin) { return QMouseEve
 }  // namespace
 
 void Viewport::mousePressEvent(QMouseEvent* ev) {
+  // (another button already held: its drag goes on — this press starts nothing, and its release is let pass too)
+  if (ev->buttons() & ~Qt::MouseButtons(ev->button())) { ignoreUp_ |= ev->button(); return; }
+  ignoreUp_ = Qt::NoButton;                                    // (no other button held: nothing left to let pass)
   if (drag_ == Drag::None) choosePane(ev->position());
   QMouseEvent le = localEvent(ev, paneOrigin()); QMouseEvent* e = &le;
   QPointF m = e->position(); last_ = start_ = m;
   if (cam_.view == "uv") { uvPress(e); requestUpdate(); return; }   // (the UV Editor: its own picking and navigation)
+  if (paintPress(e)) { requestUpdate(); return; }               // (the Paint room: the brush on the model)
   bool alt = e->modifiers() & Qt::AltModifier, ctrl = e->modifiers() & Qt::ControlModifier, shift = e->modifiers() & Qt::ShiftModifier;
   const int navK = ui::Keymap::get().navFor(ui::Keymap::buttonOf(e->button()), ui::Keymap::modsOf(e->modifiers()));   // (the camera's mouse buttons — Hotkeys → Mouse & camera)
   const int mm = ui::Keymap::modsOf(e->modifiers()), mb = ui::Keymap::buttonOf(e->button());
@@ -1114,10 +1231,13 @@ void Viewport::mousePressEvent(QMouseEvent* ev) {
   }
   if (room() == "topo") {                                    // (the Topology room: its own Cursor — none of the hair tools)
     if (topoToolRmb(e)) return;                              // (a topology tool's own RMB menus)
-    if (ui::Keymap::get().pieMouse("main", mb, mm) && tool_ != "treveal") { emit pieRequested(toGlobal(m)); return; }   // (the Reveal Brush: no pies — its RMB is its size)
+    if ((ui::Keymap::get().pieMouse("main", mb, mm) || (mb == 3 && !mm)) && tool_ != "treveal" && !(tool_ == "tbrush" && mb == 3 && !mm)) { emit pieRequested(toGlobal(m)); return; }   // (a plain RMB too, where no tool took it; the Reveal Brush: no pies — its RMB is its size; the brush: its RMB is its stroke along the normals)
     if (ui::Keymap::get().pieMouse("ops", mb, mm) && tool_ != "tbrush" && tool_ != "tmask" && tool_ != "treveal") { emit opsPieRequested(toGlobal(m)); return; }   // (Ctrl+RMB: the edits)
     topoPress(e); return;
   }
+  // (the Paint room: a plain RMB is the brush's size drag (paintPress), its hide / isolate menu is H held. With Ctrl or Shift the RMB
+  // does nothing there: the Hair room's line across the curves, its anchors put into a curve and the pie menus are not this room's)
+  if (room() == "paint" && mb == 3) return;
   if (tool_ == "lockex" && !ui::Keymap::get().pieMouse("main", mb, mm) && lockExPress(e)) return;   // (Lock Extrude: its picks and drags)
   if (ui::Keymap::get().pieMouse("main", mb, mm)) { emit pieRequested(toGlobal(m)); return; }   // (Shift+RMB: the pie — or as set in Hotkeys)
   if (tool_ == "edge") {                                     // (Edges: Ctrl — a click deselects an edge, a drag — every edge in the box)
@@ -1191,6 +1311,7 @@ void Viewport::mouseMoveEvent(QMouseEvent* ev) {
   QPointF m = e->position(), d = m - last_;
   double dpr = devicePixelRatio();
   if (drag_ == Drag::Uv || (drag_ == Drag::None && cam_.view == "uv")) { uvMove(e); last_ = m; return; }
+  if (paintMove(m)) { last_ = m; requestUpdate(); return; }
   if (drag_ == Drag::None && tool_ == "draw" && drawing_ >= 0 && !ui::Pie::current()) {   // (the ghost line to the next point)
     ghost_ = placePoint(m); overlayRev_++; requestUpdate();
   }
@@ -1272,9 +1393,12 @@ void Viewport::mouseMoveEvent(QMouseEvent* ev) {
 }
 
 void Viewport::mouseReleaseEvent(QMouseEvent* ev) {
+  if (ignoreUp_.testFlag(ev->button())) { ignoreUp_ &= ~Qt::MouseButtons(ev->button()); return; }   // (a button pressed during another's drag: its release ends nothing)
   QMouseEvent le = localEvent(ev, paneOrigin()); QMouseEvent* e = &le;
   QPointF m = e->position(); Drag d = drag_;
   if (d == Drag::Uv || (d == Drag::None && cam_.view == "uv")) { uvRelease(e); return; }
+  if (paintRelease()) { requestUpdate(); return; }
+  if (altPickArm_) { altPickArm_ = false; if (room() == "paint" && paintAltPick && std::hypot(m.x() - altPickAt_.x(), m.y() - altPickAt_.y()) < 4) paintAltPick(m); }   // (Alt + click, the camera not moved: the colour)
   if (d == Drag::Orbit && snapOrbit_.on) { snapOrbit_.on = false; ui::hud({}); }
   if (d == Drag::Gizmo) { gizmoRelease(m); requestUpdate(); return; }
   if (d == Drag::Topo) { topoRelease(m); requestUpdate(); return; }
@@ -1334,6 +1458,7 @@ void Viewport::mouseReleaseEvent(QMouseEvent* ev) {
     ui::hud({}); if (rpd_.moved) commit(false); rpd_ = {};
   } else if (d == Drag::RefTop || d == Drag::RefMove) {
     ui::hud({});
+    if (d == Drag::RefTop && refCube) refApplyStep(true);       // (the loops by the cube's last height — one undo step for the drag)
   } else if (d == Drag::Slide) {
     if (sl_.moved) { beforeFrame(); commit(false); }
     sl_ = {};
@@ -1362,6 +1487,9 @@ void Viewport::wheelEvent(QWheelEvent* ev) {
   if (!steps) return;
   // (the camera: by how far the wheel turned — 120 a notch; a smooth / high-resolution wheel sends parts of one)
   const double notches = e->angleDelta().y() / 120.0;
+  // (the Paint room with the 3D-Coat controls: the wheel — the brush's size, Ctrl + the wheel — the camera's zoom)
+  if (room() == "paint" && paintRing && paintWheelSize && ui::Keymap::get().nav().paint == "coat") {
+    if (!(e->modifiers() & Qt::ControlModifier)) { paintWheelSize(notches); overlayRev_++; requestUpdate(); return; } }
   if (mergePick && (e->modifiers() & Qt::ControlModifier)) { pickR = clamp(pickR * (steps > 0 ? 1.1 : 0.9), 2, 400); setMergePick(true); return; }   // (◎ Pick: Ctrl+wheel — its size)
   if (ribDrawOn() && (e->modifiers() & Qt::ControlModifier)) { ribR = clamp(ribR * (steps > 0 ? 1.1 : 0.9), 3, 400); overlayRev_++; requestUpdate(); panelsLater(); return; }   // (a flat lock: Ctrl+wheel — its width)
   if ((tool_ == "brush" || tool_ == "tmask" || tool_ == "tbrush" || tool_ == "treveal" || nBrushOn() || tool_ == "tlobe" || shellBrushActive() || weightBrushOn() || ribBrushOn()) && (e->modifiers() & Qt::ControlModifier)) { brushResize(steps > 0 ? 1.1 : 0.9); panelsLater(); return; }
@@ -1381,6 +1509,7 @@ void Viewport::wheelEvent(QWheelEvent* ev) {
 
 // (the hotkeys are the main window's — Keymap; here only what has no action: Esc, Enter)
 void Viewport::keyPressEvent(QKeyEvent* e) {
+  if (room() == "paint" && paintToolKey && paintToolKey(e->key())) return;   // (the Paint room's tools: Enter — the curve laid, Esc — dropped)
   if (e->key() == Qt::Key_Escape && escape()) return;
   if ((e->key() == Qt::Key_Return || e->key() == Qt::Key_Enter) && drawing_ >= 0) { finishDrawing(); return; }
   QVulkanWindow::keyPressEvent(e);
@@ -1400,7 +1529,9 @@ bool Viewport::event(QEvent* e) {
 }  // namespace hm
 
 namespace hm {
+std::function<void(const char*, qint64)>& profHook() { static std::function<void(const char*, qint64)> h; return h; }
 void prof(const char* what, qint64 ms) {
+  if (profHook()) profHook()(what, ms);
   static const bool on = qEnvironmentVariableIsSet("HM_PROF"); if (!on) return;
   static QFile f(QDir::temp().filePath("hm_prof.txt")); if (!f.isOpen()) f.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate);
   f.write(QByteArray(what) + " " + QByteArray::number(ms) + "\n"); f.flush();

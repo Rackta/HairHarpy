@@ -68,7 +68,8 @@ bool Viewport::paintWeights(const QPointF& m, const QString& op, double amt) {
     std::vector<double> W = tube::maskOf(x.raw.value("mask")); const std::vector<double> src = W; bool ch = false;
     const int N = int(W.size());
     for (int k = 0; k < N; k++) {
-      auto q = pointOnCurve(ci->second, double(k) / (N - 1)); if (!q) continue;
+      auto q = pointOnCurve(ci->second, N > 1 ? double(k) / (N - 1) : 0.0);   // (a one-entry mask: its point at the start)
+      if (!q) continue;
       ScreenPt s = P.toScreen(*q); if (s.z > 1) continue;
       double d = std::hypot(s.x - m.x(), s.y - m.y()); if (d >= brushR) continue;
       double bw = brushWeight(d), old = W[size_t(k)];

@@ -27,12 +27,12 @@ namespace hm {
 namespace {
 struct SrState {
   QString scope = "sel", prefix, find, repl; bool perGroup = true, clean = true, regex = false;
-  std::set<QString> types{"group", "curve", "surface", "tube", "xmod", "guide", "mesh", "imesh", "crown", "cap", "skin", "tip", "shell", "pinf", "cocoon"};
+  std::set<QString> types{"group", "curve", "surface", "tube", "xmod", "guide", "mesh", "imesh", "crown", "cap", "skin", "tip", "shell", "pinf", "spiral", "cocoon"};
 };
 SrState SR;
 const std::vector<std::pair<QString, QString>> SR_TYPES = {{"group", "Groups"}, {"curve", "Curves"}, {"surface", "Surfaces"}, {"tube", "Modifiers"}, {"xmod", "Extras"},
   {"guide", "Guides"}, {"mesh", "Meshes"}, {"imesh", "Imported"}, {"crown", "Crowns"}, {"cap", "Caps"}, {"skin", "Fill holes"}, {"tip", "Density"},
-  {"shell", "Proxy shells"}, {"pinf", "Parent influence"}, {"cocoon", "Cocoons"}};
+  {"shell", "Proxy shells"}, {"pinf", "Parent influence"}, {"spiral", "Spirals"}, {"cocoon", "Cocoons"}};
 
 bool svc(const Item& it) { return it.type == ItemType::Group && (it.raw.value("guidesGroup").toBool() || it.raw.value("meshesGroup").toBool() || it.raw.value("importGroup").toBool()); }
 bool isG(const Item* g) { return g && g->type == ItemType::Group && !svc(*g); }
@@ -248,9 +248,13 @@ void SmartRename::refill() {
     vp_->runEdit([this, gs](Scene& s, Selection&, const CurveCache&) { for (int g : gs) srSortGroup(vp_, s, g); return QString(); }, false);
     again(); ui::toast(tr("Sorted %1 group%2").arg(gs.size()).arg(gs.size() == 1 ? "" : "s"));
   });
-  connect(s2, &QPushButton::clicked, this, [this, gs, apply] {
-    for (int g : gs) srSortGroup(vp_, *sc_, g);                         // (one step with the renaming)
-    apply(srRenumberPlan(vp_, *sc_, srScope(*sc_, vp_->selection()).list), tr("Sorted and renumbered"));
+  connect(s2, &QPushButton::clicked, this, [this, gs, again] {
+    int n = 0;   // (the sort and the renaming in one edit: one undo step, the order taken back with the names)
+    vp_->runEdit([this, gs, &n](Scene& s, Selection& sel, const CurveCache&) {
+      for (int g : gs) srSortGroup(vp_, s, g);
+      const Plan plan = srRenumberPlan(vp_, s, srScope(s, sel).list); for (auto& [id, nn] : plan) if (Item* it = s.item(id)) it->name = nn;
+      n = int(plan.size()); edit::refreshCounters(s); return QString(); }, false);
+    again(); ui::toast(tr("Sorted and renumbered: %1 name%2 changed").arg(n).arg(n == 1 ? "" : "s"));
   });
   bs->addWidget(s1); bs->addWidget(s2); bs->addStretch(1); lay_->addLayout(bs);
   // clean up & renumber

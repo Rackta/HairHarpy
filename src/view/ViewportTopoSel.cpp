@@ -46,11 +46,19 @@ int Viewport::loopEdgeAt(int m, int f, const QPointF& mp) const {
 }
 
 // Loop / Ring from the element under the pointer, in the mode's elements
-std::vector<int> Viewport::tLoopOf(int m, const TopoPick& r, const QPointF& mp, bool ring) const {
+std::vector<int> Viewport::tLoopOf(int m, const TopoPick& r, const QPointF& mp, bool ring, char key0) const {
   const Item* it = scene_->item(m); if (!it) return {};
-  auto Tp = topo::ttopo(baseSp(*it)); const auto& T = *Tp; const char key = tKey();
+  auto Tp = topo::ttopo(baseSp(*it)); const auto& T = *Tp; const bool givenE = key0 == 'F'; const char key = givenE ? 'f' : key0 ? key0 : tKey();   // ('F': the polygons, across the side r.e given — the Paint room's preview)
   const bool mine = tsel_.id == m;
   auto badF = [&](int f) { const int n = T.faceSize(f); return (tset.loopStopTri && n == 3) || (tset.loopStopNgon && n > 4); };
+  // (Stop at a seam / a crease: the walk ends before an edge that is one — the flags per edge, made once)
+  std::vector<char> blockE; if (tset.loopStopSeam || tset.loopStopCrease) { blockE.assign(size_t(T.ne), 0); const PolyMesh* BM = baseOf(*it);
+    if (tset.loopStopSeam) { const auto sf = uv::seamFlags(*BM, T); for (int e = 0; e < T.ne; e++) if (sf[size_t(e)]) blockE[size_t(e)] = 1; }
+    if (tset.loopStopCrease) for (const auto& c : BM->creases) if (c.w > 0) { const int e = T.edgeOf(c.a, c.b); if (e >= 0) blockE[size_t(e)] = 1; } }
+  auto blocked = [&](int e) { return !blockE.empty() && blockE[size_t(e)]; };
+  // (a loop crossing a seam / a crease meets it at a vertex, not along an edge: it ends there — the leg's loop went on through the ankle seam into the foot, 2026-11-10)
+  std::vector<char> blockV; if (!blockE.empty()) { blockV.assign(T.voff.size(), 0); for (int e = 0; e < T.ne; e++) if (blockE[size_t(e)]) blockV[size_t(T.ea[size_t(e)])] = blockV[size_t(T.eb[size_t(e)])] = 1; }
+  auto crossesAt = [&](int e, int v) { return !blockV.empty() && !blocked(e) && size_t(v) < blockV.size() && blockV[size_t(v)]; };
   auto other = [&](int e, int f) { return T.ef0[size_t(e)] == f ? T.ef1[size_t(e)] : T.ef0[size_t(e)]; };
   auto opp = [&](int f, int e) { const int s = T.fo[size_t(f)], n = T.faceSize(f); if (n % 2) return -1;   // (the side across: quads, even n-gons)
     for (int k = 0; k < n; k++) if (T.ce[size_t(s + k)] == e) return T.ce[size_t(s + (k + n / 2) % n)]; return -1; };
@@ -62,7 +70,7 @@ std::vector<int> Viewport::tLoopOf(int m, const TopoPick& r, const QPointF& mp, 
       for (;;) {
         if (tset.loopStopSel && mine && key == 'v' && tsel_.v.count(v) && e != e0) break;
         bool stop = false; for (int i = T.vfo[size_t(v)]; i < T.vfo[size_t(v) + 1]; i++) if (badF(T.vF[size_t(i)])) stop = true;
-        if (stop) break;
+        if (stop || crossesAt(e, v)) break;
         const int s = T.voff[size_t(v)], t = T.voff[size_t(v) + 1]; int nx = -1, c = 0;
         if (T.ef1[size_t(e)] < 0) { for (int j = s; j < t; j++) { int x = T.vE[size_t(j)]; if (x != e && T.ef1[size_t(x)] < 0) { nx = x; c++; } } }   // (along the rim)
         else if (t - s == 4) for (int j = s; j < t; j++) { int x = T.vE[size_t(j)]; if (x == e) continue;
@@ -70,6 +78,7 @@ std::vector<int> Viewport::tLoopOf(int m, const TopoPick& r, const QPointF& mp, 
           if (!share) { nx = x; c++; } }
         if (c != 1 || seen.count(nx)) break;
         if (tset.loopStopSel && mine && key == 'e' && tsel_.e.count(nx)) break;
+        if (blocked(nx)) break;
         seen.insert(nx); out.push_back(nx); v = T.other(nx, v); e = nx;
       }
     }
@@ -84,6 +93,7 @@ std::vector<int> Viewport::tLoopOf(int m, const TopoPick& r, const QPointF& mp, 
         seenF.insert(f); if (badF(f)) break;
         const int nx = opp(f, e); if (nx < 0 || seenE.count(nx)) break;
         if (tset.loopStopSel && mine && key == 'e' && tsel_.e.count(nx)) break;
+        if (blocked(nx)) break;
         seenE.insert(nx); out.push_back(nx); f = other(nx, f); e = nx;
       }
     }
@@ -97,6 +107,7 @@ std::vector<int> Viewport::tLoopOf(int m, const TopoPick& r, const QPointF& mp, 
       while (e >= 0) {
         const int g = other(e, f); if (g < 0 || seen.count(g)) break;
         if (tset.loopStopSel && mine && key == 'f' && tsel_.f.count(g)) break;
+        if (blocked(e)) break;
         if (badF(g)) break;
         seen.insert(g); out.push_back(g);
         const int ne = opp(g, e); f = g; e = ne;              // (a triangle / an odd n-gon: taken, the loop ends in it)
@@ -107,7 +118,7 @@ std::vector<int> Viewport::tLoopOf(int m, const TopoPick& r, const QPointF& mp, 
   auto vertsOf = [&](const std::vector<int>& es) { std::set<int> vs; for (int e : es) { vs.insert(T.ea[size_t(e)]); vs.insert(T.eb[size_t(e)]); } return std::vector<int>(vs.begin(), vs.end()); };
   if (key == 'f') {
     if (r.f < 0) return {};
-    int e = loopEdgeAt(m, r.f, mp); if (e < 0) return {r.f};
+    int e = givenE ? r.e : loopEdgeAt(m, r.f, mp); if (e < 0) return {r.f};
     if (ring) { const int s = T.fo[size_t(r.f)], n = T.faceSize(r.f); for (int k = 0; k < n; k++) if (T.ce[size_t(s + k)] == e) { e = T.ce[size_t(s + (k + 1) % n)]; break; } }   // (the other way)
     return faceLoop(r.f, e);
   }
@@ -139,24 +150,24 @@ std::vector<int> Viewport::tPatternWalk(int m, char key, int a, int b, const std
   if (key == 'f') {
     if (T.faceSize(a) != 4) return {};
     auto walkF = [&, a](int e0) { return [&, a, e0] { Walk w; int f = a, e = e0;
-      while (e >= 0) { const int g = other(e, f); if (g < 0) break; if (g == a) { w.closed = true; break; }
+      while (e >= 0) { const int g = other(e, f); if (g < 0 || w.seq.size() > size_t(T.nf)) break;   /* (a walk that enters a loop not through a: ends, it would never) */ if (g == a) { w.closed = true; break; }
         if (stop.count(g) || T.faceSize(g) != 4) break; w.seq.push_back(g); e = opp(g, e); f = g; }
       return w; }; };
     for (int k = T.fo[size_t(a)]; k < T.fo[size_t(a) + 1]; k++) { const int e = T.ce[size_t(k)]; dirs.push_back({walkF(e), walkF(opp(a, e))}); }
   } else if (key == 'e') {
     auto walkL = [&, a](int v0) { return [&, a, v0] { Walk w; int e = a, v = v0;
-      for (;;) { const int nx = loopNext(e, v); if (nx < 0) break; if (nx == a) { w.closed = true; break; } if (stop.count(nx)) break;
+      for (;;) { const int nx = loopNext(e, v); if (nx < 0 || w.seq.size() > size_t(T.ne)) break;   /* (the same guard) */ if (nx == a) { w.closed = true; break; } if (stop.count(nx)) break;
         w.seq.push_back(nx); v = T.other(nx, v); e = nx; }
       return w; }; };
     auto walkR = [&, a](int f0) { return [&, a, f0] { Walk w; int f = f0, e = a;
-      while (f >= 0) { const int nx = opp(f, e); if (nx < 0) break; if (nx == a) { w.closed = true; break; } if (stop.count(nx)) break;
+      while (f >= 0) { const int nx = opp(f, e); if (nx < 0 || w.seq.size() > size_t(T.ne)) break; if (nx == a) { w.closed = true; break; } if (stop.count(nx)) break;
         w.seq.push_back(nx); f = other(nx, f); e = nx; }
       return w; }; };
     dirs.push_back({walkL(T.ea[size_t(a)]), walkL(T.eb[size_t(a)])}); dirs.push_back({walkL(T.eb[size_t(a)]), walkL(T.ea[size_t(a)])});
     dirs.push_back({walkR(T.ef0[size_t(a)]), walkR(T.ef1[size_t(a)])}); dirs.push_back({walkR(T.ef1[size_t(a)]), walkR(T.ef0[size_t(a)])});
   } else {
     auto walkV = [&, a](int x0) { return [&, a, x0] { Walk w; if (x0 < 0) return w; int e = x0, v = T.other(x0, a);
-      for (;;) { if (v == a) { w.closed = true; break; } if (stop.count(v)) break; w.seq.push_back(v);
+      for (;;) { if (v == a) { w.closed = true; break; } if (stop.count(v) || w.seq.size() > size_t(T.ne)) break; w.seq.push_back(v);
         const int nx = loopNext(e, v); if (nx < 0) break; v = T.other(nx, v); e = nx; }
       return w; }; };
     for (int j = T.voff[size_t(a)]; j < T.voff[size_t(a) + 1]; j++) { const int x = T.vE[size_t(j)]; dirs.push_back({walkV(x), walkV(loopNext(x, a))}); }
@@ -194,6 +205,7 @@ std::vector<int> Viewport::tSymList(int m, const std::vector<int>& list, char ke
 
 // ---------- selection sets ----------
 QString Viewport::tSelSetCreate() {
+  if (!eachBusy_ && uvMulti()) return tEachMesh([&] { return tSelSetCreate(); }, true);   // (several meshes picked: done on each — on its own picks, or on the whole of it)
   const int m = topoMesh(); Item* it = m >= 0 ? scene_->item(m) : nullptr;
   if (!it || topoMode == "object" || tsel_.id != m) { ui::toast(tr("Select polygons, edges or vertices first")); return {}; }
   const char key = tKey(); const std::set<int>& S = key == 'f' ? tsel_.f : key == 'e' ? tsel_.e : tsel_.v;

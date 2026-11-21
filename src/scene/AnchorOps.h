@@ -33,7 +33,7 @@ ZipParts zipParts(const Scene& sc, int J);
 std::vector<Vec3> zipAverage(const std::vector<ZipPart>& parts);
 QString zipApply(Scene& sc, const CurveCache& cc, Selection& sel, int J, bool up, int target);   // target: a curve of that side, -1 — the averaged line
 
-QString optimizeAnchors(Scene& sc, const CurveCache& cc, const std::vector<int>& curves, const std::set<int>* only);
+QString optimizeAnchors(Scene& sc, const CurveCache& cc, const std::vector<int>& curves, const std::set<int>* only, double tolScale = 1);   // (tolScale: the shape kept tighter — < 1)
 
 // ⇶ linked anchor pairs: one moved — the other follows (last: their positions after the previous sync) → the anchors moved
 std::vector<int> linkSync(Scene& sc, std::map<int, Vec3>& last);

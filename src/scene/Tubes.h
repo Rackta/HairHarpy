@@ -30,8 +30,7 @@ std::vector<int> gluedRun(const Profile& pts, int i);    // the points glued to 
 QColor profColor(int j);                                 // the dim colour of profile point j (its guide along the lock)
 
 const int MASK_N = 96, TUBE_NR = 96;
-enum class XKind { Mask, Thick, Twist, Noise, Curl, Xform, Unknown };
-XKind xkind(const QString& k);
+
 QString xkindName(const QString& k);                     // 'Mask', 'Thickness' …
 QString xkindIcon(const QString& k);
 bool painted(const QString& k);                          // painted along the lock with the weight brush: mask, thick, twist

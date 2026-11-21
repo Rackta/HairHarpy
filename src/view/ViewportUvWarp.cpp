@@ -2,6 +2,7 @@
 // the frame as one move, size and turn of its box; the warp as a grid of anchors over the box whose moves bend the UV
 // smoothly between them (each point moved by the anchors' moves near it, Catmull–Rom weighted — through every anchor,
 // no kinks). A drag is shown live, its release one undo step; another selection, an undo, an edit elsewhere — they end.
+#include <QJsonDocument>
 #include "ui/Pie.h"
 #include "scene/Uv.h"
 #include "view/Viewport.h"
@@ -9,6 +10,8 @@
 #include <QGuiApplication>
 #include <cmath>
 #include <map>
+#include <set>
+#include <unordered_map>
 
 namespace hm {
 
@@ -53,9 +56,9 @@ std::vector<std::array<float, 2>> Viewport::uvTfResult() const {
   const double W = t.box[2] - t.box[0], H = t.box[3] - t.box[1];
   if (t.kind == 'p') { for (size_t i = 0; i < t.ks.size(); i++) { const auto& q = t.pcur[size_t(t.pof[i])]; U[size_t(t.ks[i])] = {float(q[0]), float(q[1])}; } return U; }
   if (t.kind == 'f') {
-    const double hw0 = W / 2, hh0 = H / 2, c0u = (t.box[0] + t.box[2]) / 2, c0v = (t.box[1] + t.box[3]) / 2, cs = std::cos(t.ang), sn = std::sin(t.ang);
-    for (int k : t.ks) { const double x = (t.uv0[size_t(k)][0] - c0u) / hw0 * t.hw, y = (t.uv0[size_t(k)][1] - c0v) / hh0 * t.hh;
-      U[size_t(k)] = {float(t.cu + x * cs - y * sn), float(t.cv + x * sn + y * cs)}; }
+    const double hw0 = W / 2, hh0 = H / 2, c0u = (t.box[0] + t.box[2]) / 2, c0v = (t.box[1] + t.box[3]) / 2, cs = std::cos(t.ang), sn = std::sin(t.ang), ka = cam_.uvAsp;
+    for (int k : t.ks) { const double x = (t.uv0[size_t(k)][0] - c0u) / hw0 * t.hw, y = (t.uv0[size_t(k)][1] - c0v) / hh0 * t.hh * ka;   // (turned as texels are: V in the texture's proportion)
+      U[size_t(k)] = {float(t.cu + x * cs - y * sn), float(t.cv + (x * sn + y * cs) / ka)}; }
   } else {
     auto anc = [&](int i, int j) { i = std::clamp(i, 0, t.nx); j = std::clamp(j, 0, t.ny); const auto& c = t.ctl[size_t(j * (t.nx + 1) + i)];
       return std::array<double, 2>{c[0] - (t.box[0] + W * i / t.nx), c[1] - (t.box[1] + H * j / t.ny)}; };   // (the anchor's move from its rest)
@@ -69,9 +72,18 @@ std::vector<std::array<float, 2>> Viewport::uvTfResult() const {
 
 namespace {
 // the frame's handles in UV: 0–3 the corners, 4–7 the sides' middles (−x, +x, −y, +y in its own axes)
-template <class Tf> std::array<double, 2> frameAt(const Tf& t, double x, double y) { const double cs = std::cos(t.ang), sn = std::sin(t.ang), a = x * t.hw, b = y * t.hh; return {t.cu + a * cs - b * sn, t.cv + a * sn + b * cs}; }
+template <class Tf> std::array<double, 2> frameAt(const Tf& t, double x, double y, double ka) { const double cs = std::cos(t.ang), sn = std::sin(t.ang), a = x * t.hw, b = y * t.hh * ka; return {t.cu + a * cs - b * sn, t.cv + (a * sn + b * cs) / ka}; }   // (ka: the texture's proportion — turned as texels are)
 const double HX[8] = {-1, 1, 1, -1, -1, 1, 0, 0}, HY[8] = {-1, -1, 1, 1, 0, 0, -1, 1};
 }  // namespace
+
+// RMB on a Puppet pin: it is taken off (true when there was one under the pointer)
+bool Viewport::uvTfRemovePin(const QPointF& mp) {
+  UvTf& t = uvTf_; if (!t.on || t.kind != 'p') return false;
+  double bd = 12; int hit = -1;
+  for (size_t i = 0; i < t.pins.size(); i++) { const QPointF q = uvToPx(t.pcur[size_t(t.pins[i])][0], t.pcur[size_t(t.pins[i])][1]); const double d = std::hypot(q.x() - mp.x(), q.y() - mp.y()); if (d < bd) { bd = d; hit = int(i); } }
+  if (hit < 0) return false;
+  t.pins.erase(t.pins.begin() + hit); uvTfRev_++; uvChanged(); requestUpdate(); ui::hud(tr("Pin taken off"), 800); return true;
+}
 
 bool Viewport::uvTfPress(const QPointF& mp) {
   UvTf& t = uvTf_; if (!t.on) return false;
@@ -88,10 +100,10 @@ bool Viewport::uvTfPress(const QPointF& mp) {
     t.drag = hit; t.pcur0 = t.pcur; t.pin0.clear(); for (int p : t.pins) t.pin0.push_back(t.pcur[size_t(p)]); return true; }
   if (t.kind == 'w') { double bd = 10; for (size_t i = 0; i < t.ctl.size(); i++) { QPointF q = px(t.ctl[i]); const double d = std::hypot(q.x() - mp.x(), q.y() - mp.y()); if (d < bd) { bd = d; t.drag = int(i); } }
     return t.drag >= 0; }
-  for (int h = 0; h < 8; h++) { QPointF q = px(frameAt(t, HX[h], HY[h])); if (std::hypot(q.x() - mp.x(), q.y() - mp.y()) < 9) { t.drag = h; return true; } }
-  for (int h = 0; h < 4; h++) { QPointF q = px(frameAt(t, HX[h], HY[h])); const double d = std::hypot(q.x() - mp.x(), q.y() - mp.y()); if (d < 30) { t.drag = 8; return true; } }   // (just outside a corner: turn)
+  for (int h = 0; h < 8; h++) { QPointF q = px(frameAt(t, HX[h], HY[h], cam_.uvAsp)); if (std::hypot(q.x() - mp.x(), q.y() - mp.y()) < 9) { t.drag = h; return true; } }
+  for (int h = 0; h < 4; h++) { QPointF q = px(frameAt(t, HX[h], HY[h], cam_.uvAsp)); const double d = std::hypot(q.x() - mp.x(), q.y() - mp.y()); if (d < 30) { t.drag = 8; return true; } }   // (just outside a corner: turn)
   // inside the frame: move
-  auto at = pxToUv(mp); const double cs = std::cos(-t.ang), sn = std::sin(-t.ang), x = (at[0] - t.cu) * cs - (at[1] - t.cv) * sn, y = (at[0] - t.cu) * sn + (at[1] - t.cv) * cs;
+  auto at = pxToUv(mp); const double ka = cam_.uvAsp, cs = std::cos(-t.ang), sn = std::sin(-t.ang), x = (at[0] - t.cu) * cs - (at[1] - t.cv) * ka * sn, y = ((at[0] - t.cu) * sn + (at[1] - t.cv) * ka * cs) / ka;
   if (std::abs(x) <= std::abs(t.hw) && std::abs(y) <= std::abs(t.hh)) { t.drag = 9; return true; }
   return false;
 }
@@ -182,10 +194,10 @@ void Viewport::uvTfMove(const QPointF& mp, Qt::KeyboardModifiers mods) {
     uvTfRev_++; uvLive(t.m, uvTfResult()); return; }
   if (t.kind == 'w') { t.ctl[size_t(t.drag)] = {t.ctl0[size_t(t.drag)][0] + a1[0] - a0[0], t.ctl0[size_t(t.drag)][1] + a1[1] - a0[1]}; }
   else if (t.drag == 9) { t.cu = t.cu0 + a1[0] - a0[0]; t.cv = t.cv0 + a1[1] - a0[1]; }
-  else if (t.drag == 8) { const double b0 = std::atan2(a0[1] - t.cv0, a0[0] - t.cu0), b1 = std::atan2(a1[1] - t.cv0, a1[0] - t.cu0); double d = b1 - b0;
+  else if (t.drag == 8) { const double ka = cam_.uvAsp, b0 = std::atan2((a0[1] - t.cv0) * ka, a0[0] - t.cu0), b1 = std::atan2((a1[1] - t.cv0) * ka, a1[0] - t.cu0); double d = b1 - b0;   // (the angle as texels are)
     if (shift) d = std::round(d / (M_PI / 12)) * (M_PI / 12); t.ang = t.ang0 + d; ui::hud(tr("Turn %1°").arg(t.ang * 180 / M_PI, 0, 'f', 1)); }
   else {                                                     // scale: the opposite side held (its own axes)
-    const double cs = std::cos(-t.ang0), sn = std::sin(-t.ang0); auto loc = [&](const std::array<double, 2>& u) { const double x = u[0] - t.cu0, y = u[1] - t.cv0; return std::array<double, 2>{x * cs - y * sn, x * sn + y * cs}; };
+    const double ka = cam_.uvAsp, cs = std::cos(-t.ang0), sn = std::sin(-t.ang0); auto loc = [&](const std::array<double, 2>& u) { const double x = u[0] - t.cu0, y = (u[1] - t.cv0) * ka; return std::array<double, 2>{x * cs - y * sn, (x * sn + y * cs) / ka}; };   // (its own axes as texels are; V back in UV)
     const auto p = loc(a1); const double hx = HX[t.drag], hy = HY[t.drag];
     double nx0 = -t.hw0, nx1 = t.hw0, ny0 = -t.hh0, ny1 = t.hh0;   // (the box in its own axes)
     if (hx > 0) nx1 = p[0]; else if (hx < 0) nx0 = p[0];
@@ -194,7 +206,7 @@ void Viewport::uvTfMove(const QPointF& mp, Qt::KeyboardModifiers mods) {
     if (shift && hx != 0 && hy != 0) { const double k = std::max(std::abs(nw) / std::max(1e-9, t.hw0), std::abs(nh) / std::max(1e-9, t.hh0)); nw = (nw < 0 ? -1 : 1) * t.hw0 * k; nh = (nh < 0 ? -1 : 1) * t.hh0 * k;
       if (hx > 0) nx1 = nx0 + 2 * nw; else nx0 = nx1 - 2 * nw; if (hy > 0) ny1 = ny0 + 2 * nh; else ny0 = ny1 - 2 * nh; }
     const double mx = (nx0 + nx1) / 2, my = (ny0 + ny1) / 2, c = std::cos(t.ang0), s = std::sin(t.ang0);
-    t.cu = t.cu0 + mx * c - my * s; t.cv = t.cv0 + mx * s + my * c; t.hw = nw; t.hh = nh;
+    t.cu = t.cu0 + mx * c - my * ka * s; t.cv = t.cv0 + (mx * s + my * ka * c) / ka; t.hw = nw; t.hh = nh;
     ui::hud(tr("Scale U %1 · V %2").arg(t.hw / std::max(1e-9, (t.box[2] - t.box[0]) / 2), 0, 'f', 3).arg(t.hh / std::max(1e-9, (t.box[3] - t.box[1]) / 2), 0, 'f', 3));
   }
   uvTfRev_++; uvLive(t.m, uvTfResult());
@@ -202,6 +214,9 @@ void Viewport::uvTfMove(const QPointF& mp, Qt::KeyboardModifiers mods) {
 
 void Viewport::uvTfRelease() {
   UvTf& t = uvTf_; if (!t.on || t.drag < 0) return; t.drag = -1; ui::hud({});
+  // (a click with no move — a handle touched, a pin placed: nothing written, no undo step)
+  const bool same = t.kind == 'p' ? t.pcur == t.pcur0 : t.ctl == t.ctl0 && t.cu == t.cu0 && t.cv == t.cv0 && t.hw == t.hw0 && t.hh == t.hh0 && t.ang == t.ang0;
+  if (same) { uvTfRev_++; requestUpdate(); return; }
   if (Item* it = scene_->item(t.m)) { auto B = baseSp(*it); B->cornerUV = uvTfResult(); uvSymApply(B->cornerUV); topoWrite(t.m, B); t.base = baseOf(*scene_->item(t.m)); uvStamp_++; uvRev_++; commit(false); emit topoState(); }
   uvTfRev_++; requestUpdate();
 }
@@ -217,9 +232,9 @@ void Viewport::uvTfDraw(UvDraw& D) {
     for (const auto& tr3 : t.ptri) for (int i = 0; i < 3; i++) { M.p.push_back(f2(t.pcur[size_t(tr3[size_t(i)])])); M.p.push_back(f2(t.pcur[size_t(tr3[size_t((i + 1) % 3)])])); }
     D.lines.push_back(std::move(M)); return; }                  // (the pins: drawn as pins over the editor — Viewport::overlays)
   if (t.kind == 'f') {
-    for (int h = 0; h < 4; h++) { L.p.push_back(f2(frameAt(t, HX[h], HY[h]))); L.p.push_back(f2(frameAt(t, HX[(h + 1) % 4], HY[(h + 1) % 4]))); }
-    for (int h = 0; h < 8; h++) { P.p.push_back(f2(frameAt(t, HX[h], HY[h]))); P.c.push_back(h < 4 ? C : QColor(0xff, 0xe8, 0xa0)); }
-    P.p.push_back(f2(frameAt(t, 0, 0))); P.c.push_back(QColor(0xff, 0xff, 0xff));
+    for (int h = 0; h < 4; h++) { L.p.push_back(f2(frameAt(t, HX[h], HY[h], cam_.uvAsp))); L.p.push_back(f2(frameAt(t, HX[(h + 1) % 4], HY[(h + 1) % 4], cam_.uvAsp))); }
+    for (int h = 0; h < 8; h++) { P.p.push_back(f2(frameAt(t, HX[h], HY[h], cam_.uvAsp))); P.c.push_back(h < 4 ? C : QColor(0xff, 0xe8, 0xa0)); }
+    P.p.push_back(f2(frameAt(t, 0, 0, cam_.uvAsp))); P.c.push_back(QColor(0xff, 0xff, 0xff));
   } else {
     // (each grid line drawn bent: the warp of its points along it)
     const double W = t.box[2] - t.box[0], H = t.box[3] - t.box[1];
@@ -239,7 +254,7 @@ void Viewport::uvTfDraw(UvDraw& D) {
 QString Viewport::uvTfTestDrag(int h, double dx, double dy, bool shift) {
   UvTf& t = uvTf_; if (!t.on) return "off";
   std::array<double, 2> u; if (t.kind == 'w') { if (size_t(h) >= t.ctl.size()) return "no anchor"; u = t.ctl[size_t(h)]; }
-  else u = h == 9 ? std::array<double, 2>{t.cu, t.cv} : h == 8 ? frameAt(t, 1.25, 1.25) : frameAt(t, HX[h], HY[h]);
+  else u = h == 9 ? std::array<double, 2>{t.cu, t.cv} : h == 8 ? frameAt(t, 1.25, 1.25, cam_.uvAsp) : frameAt(t, HX[h], HY[h], cam_.uvAsp);
   if (t.kind == 'p') { if (size_t(h) >= t.pins.size()) return "no pin"; t.pcur0 = t.pcur; t.pin0.clear(); for (int p : t.pins) t.pin0.push_back(t.pcur[size_t(p)]); u = t.pcur[size_t(t.pins[size_t(h)])]; }   // (a pin: its drag begun as a press does)
   const QPointF p = uvToPx(u[0], u[1]); t.drag = t.kind == 'w' ? h : h; t.p0 = p; t.ctl0 = t.ctl; t.cu0 = t.cu; t.cv0 = t.cv; t.hw0 = t.hw; t.hh0 = t.hh; t.ang0 = t.ang;
   uvTfMove(p + QPointF(dx, dy), shift ? Qt::ShiftModifier : Qt::NoModifier); uvTfRelease(); return "dragged";
@@ -304,13 +319,14 @@ QString Viewport::uvPuppetSynth(int fan) {
 namespace hm {
 // the UV symmetry: each moving corner's mirror (the same corner of the mirrored polygon — the mesh symmetric across its
 // X) put at its place mirrored across U = symAxis; a mirror that moves itself (both sides selected) left as it goes
-void Viewport::uvSymApply(std::vector<std::array<float, 2>>& U) const {
+void Viewport::uvSymApply(std::vector<std::array<float, 2>>& U, const std::vector<std::array<float, 2>>* start) const {
   if (!tset.sym || room() != "topo") return;
   const int m = topoMesh(); const Item* it = m >= 0 ? scene_->item(m) : nullptr; if (!it) return;
   const PolyMesh* B = baseOf(*it); if (!B || U.size() != B->faceVerts.size()) return;
   if (uvSymMap_.B != B || uvSymMap_.n != B->faceVerts.size()) {
     uvSymMap_ = {}; uvSymMap_.B = B; uvSymMap_.n = B->faceVerts.size(); uvSymMap_.part.assign(B->faceVerts.size(), -1);
-    const auto pv = topo::symPairs(*B, B->pos);
+    const auto pv = topo::symPairs(*B, B->pos); uvSymMap_.onPlane.assign(B->faceVerts.size(), 0);
+    for (size_t k = 0; k < B->faceVerts.size(); k++) { const int v = B->faceVerts[k]; if (size_t(v) < pv.size() && pv[size_t(v)] == v) uvSymMap_.onPlane[k] = 1; }
     std::map<std::vector<int>, int> byVerts;
     for (int f = 0; f < B->faceCount(); f++) { std::vector<int> vs(B->faceVerts.begin() + B->faceStart[size_t(f)], B->faceVerts.begin() + B->faceStart[size_t(f) + 1]); std::sort(vs.begin(), vs.end()); byVerts[vs] = f; }
     for (int f = 0; f < B->faceCount(); f++) { const int s = B->faceStart[size_t(f)], e = B->faceStart[size_t(f) + 1]; std::vector<int> mv; bool ok = true;
@@ -322,7 +338,48 @@ void Viewport::uvSymApply(std::vector<std::array<float, 2>>& U) const {
   const auto ks = uvMoving(); if (ks.empty()) return;
   std::vector<char> moving(U.size(), 0); for (int k : ks) if (size_t(k) < moving.size()) moving[size_t(k)] = 1;
   const float ax = float(uvo.symAxis);
-  for (int k : ks) { const int p = size_t(k) < uvSymMap_.part.size() ? uvSymMap_.part[size_t(k)] : -1; if (p < 0 || moving[size_t(p)]) continue;
+  // (both sides picked: the +X side leads, the −X side goes the mirrored way — not the same way: a pair moved together stays a mirror pair)
+  const std::vector<std::array<float, 2>>& s0all = start && start->size() == U.size() ? *start : B->cornerUV;
+  const UvCache* uc = uvCache();                               // (a shell across the plane is its own mirror: it moves as one — only a pair of two shells goes mirrored)
+  // (only a shell that is a mirror as a whole follows / leads: every corner of it has a partner, all in one shell (itself — across the plane — or its pair),
+  //  its UV points to the partner's one to one, the partner shell no bigger. A part of an asymmetric mesh whose points match by place here and there (the
+  //  dress's middle) had some of its corners dragged after the other side — the shell torn where no seam is, and shells jumping on Unfold, 2026-11-10)
+  std::vector<char> okSh; if (uc) { const int nS = uc->S.count; okSh.assign(size_t(nS), 1); std::vector<int> tgt(size_t(nS), -2), cnt(size_t(nS), 0); std::unordered_map<int, int> pmap; std::vector<std::set<int>> img(static_cast<size_t>(nS));
+    for (size_t c = 0; c < U.size(); c++) { const int s = uc->S.of[size_t(uc->T->cf[c])]; cnt[size_t(s)]++; if (!okSh[size_t(s)]) continue; const int p = c < uvSymMap_.part.size() ? uvSymMap_.part[c] : -1;
+      if (p < 0) { if (!uvSymMap_.onPlane[c]) okSh[size_t(s)] = 0; continue; }   // (a corner on the plane: its own mirror)
+      const int t = uc->S.of[size_t(uc->T->cf[size_t(p)])]; if (tgt[size_t(s)] == -2) tgt[size_t(s)] = t; else if (tgt[size_t(s)] != t) { okSh[size_t(s)] = 0; continue; }
+      const int a = uc->P.of[c];
+      const int b = uc->P.of[size_t(p)];
+      auto it2 = pmap.find(a);
+      if (it2 == pmap.end()) { pmap[a] = b; if (!img[size_t(s)].insert(b).second) okSh[size_t(s)] = 0; }
+      else if (it2->second != b) okSh[size_t(s)] = 0; }
+    for (int s = 0; s < nS; s++) { const int t = tgt[size_t(s)]; if (t < 0 || !okSh[size_t(t)] || tgt[size_t(t)] != s || cnt[size_t(t)] != cnt[size_t(s)]) okSh[size_t(s)] = 0; } }
+  auto shOk = [&](int k) { return uc && size_t(k) < uc->T->cf.size() && okSh[size_t(uc->S.of[size_t(uc->T->cf[size_t(k)])])]; };
+  std::vector<double> shU; if (uc && s0all.size() == U.size()) { shU.assign(size_t(uc->S.count), 0); std::vector<int> cn(size_t(uc->S.count), 0);
+    for (size_t c = 0; c < s0all.size(); c++) { const int s = uc->S.of[size_t(uc->T->cf[c])]; shU[size_t(s)] += s0all[c][0]; cn[size_t(s)]++; } for (size_t s = 0; s < shU.size(); s++) if (cn[s]) shU[s] /= cn[s]; }
+  // (a shell that is its own mirror - across the plane - and is being edited: its -X half made the mirror of its +X half about the
+  // shell's OWN middle line - where its corners on the plane lie - not about the editor's axis: the shell stays where it is, its size kept.
+  // So a half changed with the Symmetry off (one eye straightened) comes over to the other half as soon as the shell is touched with it on)
+  std::vector<char> selfSh; if (uc) { selfSh.assign(size_t(uc->S.count), 0);
+    for (int k : ks) { const int p = size_t(k) < uvSymMap_.part.size() ? uvSymMap_.part[size_t(k)] : -1; if (p < 0 || p == k || !shOk(k)) continue; const int s = uc->S.of[size_t(uc->T->cf[size_t(k)])]; if (s == uc->S.of[size_t(uc->T->cf[size_t(p)])]) selfSh[size_t(s)] = 1; }
+    std::vector<double> sum(size_t(uc->S.count), 0); std::vector<int> cnt(size_t(uc->S.count), 0);
+    for (size_t c = 0; c < U.size(); c++) { const int s = uc->S.of[size_t(uc->T->cf[c])]; if (!selfSh[size_t(s)] || !uvSymMap_.onPlane[c]) continue; sum[size_t(s)] += U[c][0]; cnt[size_t(s)]++; }
+    for (size_t c = 0; c < U.size(); c++) { const int s = uc->S.of[size_t(uc->T->cf[c])]; if (!selfSh[size_t(s)] || cnt[size_t(s)]) continue; const int p = uvSymMap_.part[c]; if (p < 0 || p == int(c)) continue; sum[size_t(s)] += (U[c][0] + U[size_t(p)][0]) / 2.0; cnt[size_t(s)]++; }   // (none on the plane: the middles of the mirror pairs)
+    for (size_t c = 0; c < U.size(); c++) { const int s = uc->S.of[size_t(uc->T->cf[c])]; if (!selfSh[size_t(s)] || !cnt[size_t(s)]) continue; const int p = uvSymMap_.part[c]; if (p < 0 || p == int(c) || uc->S.of[size_t(uc->T->cf[size_t(p)])] != s) continue;
+      if (B->pos[size_t(B->faceVerts[c])].x <= 0) continue;            // (the +X half leads)
+      const float a = float(sum[size_t(s)] / cnt[size_t(s)]); U[size_t(p)] = {2 * a - U[c][0], U[c][1]}; } }
+  auto inSelf = [&](int k) { return uc && !selfSh.empty() && selfSh[size_t(uc->S.of[size_t(uc->T->cf[size_t(k)])])]; };
+  if (uc && s0all.size() == U.size()) for (int k : ks) { const int p = size_t(k) < uvSymMap_.part.size() ? uvSymMap_.part[size_t(k)] : -1; if (p < 0 || p == k || !moving[size_t(p)] || !shOk(k)) continue;
+    if (uc->S.of[size_t(uc->T->cf[size_t(k)])] == uc->S.of[size_t(uc->T->cf[size_t(p)])]) continue;
+    // (the side as the UV shows it: the shell on the right of the axis leads, the one on the left follows — the ones picked "+X" in the editor; on the axis itself: the model's +X)
+    const int shK = uc->S.of[size_t(uc->T->cf[size_t(k)])], shP = uc->S.of[size_t(uc->T->cf[size_t(p)])];
+    const int hovF = uvd_.leadF >= 0 && uvd_.leadF < uc->T->nf ? uvd_.leadF : (uvHov_.f >= 0 && uvHov_.f < uc->T->nf ? uvHov_.f : -1), leadSh = hovF >= 0 ? uc->S.of[size_t(hovF)] : -1;   // (the one the pointer is on leads)
+    const double uk = shU[size_t(shK)], up = shU[size_t(shP)];   // (each shell by its middle, not corner by corner)
+    if (leadSh == shK) continue; if (leadSh == shP) { /* k follows */ }
+    else if (std::abs(uk - up) > 1e-6) { if (!(uk < up)) continue; }
+    else { const double xk = B->pos[size_t(B->faceVerts[size_t(k)])].x, xp = B->pos[size_t(B->faceVerts[size_t(p)])].x; if (!(xk < xp - 1e-9)) continue; }
+    U[size_t(k)] = {2 * ax - U[size_t(p)][0], U[size_t(p)][1]}; }   // (the mirror position exactly: a pair not quite symmetric before comes to be)
+  for (int k : ks) { const int p = size_t(k) < uvSymMap_.part.size() ? uvSymMap_.part[size_t(k)] : -1; if (p < 0 || moving[size_t(p)] || inSelf(k) || !shOk(k)) continue;
     U[size_t(p)] = {2 * ax - U[size_t(k)][0], U[size_t(k)][1]}; }
 }
 }  // namespace hm
@@ -370,11 +427,20 @@ void Viewport::uvPinOverlay(std::vector<Overlay>& out) const {
 namespace hm {
 int Viewport::overlayRevision() const {
   const bool giz = uvGizmoOn();                                // (the gizmo: it follows the view, the selection, the tool)
-  if (!giz && (!uvTf_.on || uvTf_.kind != 'p' || uvTf_.pins.empty() || cam_.view != "uv")) return overlayRev_;
+  bool marks = false; if (cam_.view == "uv" && room() == "topo") if (const Item* mi = topoMesh() >= 0 ? scene_->item(topoMesh()) : nullptr) marks = !mi->raw.value("uvShellAttr").toArray().isEmpty();   // (shells with a group / Sym: their markers follow the view)
+  // (lines of the world drawn on the screen — the fill outline, a pie's preview, the curves under the pointer: they follow the
+  // camera; 20.11: the camera turned while Detect's outline was shown left it where it had been on the screen)
+  int camKey = 0;
+  if (!fillViz_.empty() || !pieVizA_.empty() || !pieVizB_.empty() || !hoverCurves_.empty()) {
+    QByteArray c; for (double x : std::initializer_list<double>{cam_.pos.x, cam_.pos.y, cam_.pos.z, cam_.quat.x, cam_.quat.y, cam_.quat.z, cam_.quat.w, cam_.zoom, cam_.orthoHalf, double(paneW()), double(paneH())}) c += QByteArray::number(x, 'g', 7) + ",";
+    camKey = int(qHash(c + cam_.view.toLatin1()));
+  }
+  if (!giz && !marks && (!uvTf_.on || uvTf_.kind != 'p' || uvTf_.pins.empty() || cam_.view != "uv")) return overlayRev_ ^ camKey;
   const QPointF a = uvToPx(0, 0), b = uvToPx(1, 1);           // (where the tile is on the screen now)
   QByteArray k = QByteArray::number(a.x(), 'f', 2) + "," + QByteArray::number(a.y(), 'f', 2) + "," + QByteArray::number(b.x(), 'f', 2) + "," + QByteArray::number(b.y(), 'f', 2);
   if (giz) { const auto p = uvGizmoPivot(); k += "|" + tool_.toLatin1() + QByteArray::number(tsel_.ver) + "," + QByteArray::number(p[0], 'f', 5) + "," + QByteArray::number(p[1], 'f', 5); }
-  return overlayRev_ ^ int(qHash(k));
+  if (marks) k += "|" + QByteArray::number(uvRev_) + "," + QByteArray::number(tsel_.ver) + "," + QByteArray::number(qHash(QJsonDocument(scene_->item(topoMesh())->raw.value("uvShellAttr").toArray()).toJson(QJsonDocument::Compact)));
+  return overlayRev_ ^ int(qHash(k)) ^ camKey;
 }
 }  // namespace hm
 
@@ -395,5 +461,30 @@ QString Viewport::uvTfInfo() {
   uvTfResync(); const UvTf& t = uvTf_; const Item* it = scene_->item(t.m);
   double off = 0; if (it && t.on && t.kind == 'p') { const auto& U = baseOf(*it)->cornerUV; for (size_t i = 0; i < t.ks.size() && i < t.pof.size(); i++) { const auto& q = t.pcur[size_t(t.pof[i])]; off = std::max(off, std::hypot(q[0] - U[size_t(t.ks[i])][0], q[1] - U[size_t(t.ks[i])][1])); } }
   return QString("on %1 · kind %2 · pins %3 · mesh in step %4 · puppet off the UV by %5").arg(t.on).arg(QChar(t.kind ? t.kind : '-')).arg(t.pins.size()).arg(it && baseOf(*it) == t.base).arg(off, 0, 'g', 3);
+}
+}  // namespace hm
+
+namespace hm {
+// (checks) a shell across the plane: its +X half moved with the Symmetry off, then the whole shell moved a little with it on — how far its
+// halves are from mirrors of each other about its own middle line, before and after; its box before and after
+QString Viewport::testUvSelfSym(double du, double dv) {
+  const int m = topoMesh(); const Item* it = m >= 0 ? scene_->item(m) : nullptr; if (!it) return "no mesh";
+  const PolyMesh* B = baseOf(*it); const UvCache* uc = uvCache(); if (!uc) return "no uv";
+  { auto tmp = B->cornerUV; const bool s0 = tset.sym; tset.sym = true; tsel_.f.clear(); uvSymApply(tmp); tset.sym = s0; }   // (the mirror map made)
+  int best = -1; size_t bn = 0;   // (the biggest shell that is its own mirror)
+  std::map<int, size_t> n; for (size_t c = 0; c < B->faceVerts.size(); c++) { const int p = uvSymMap_.part[c]; if (p < 0 || p == int(c)) continue; const int s = uc->S.of[size_t(uc->T->cf[c])]; if (s == uc->S.of[size_t(uc->T->cf[size_t(p)])]) n[s]++; }
+  for (auto& [s, k] : n) if (k > bn) { bn = k; best = s; } if (best < 0) return "no self-mirror shell";
+  std::vector<int> all, plus; for (int f = 0; f < uc->T->nf; f++) if (uc->S.of[size_t(f)] == best) { all.push_back(f); bool p = true; for (int k = uc->T->fo[size_t(f)]; k < uc->T->fo[size_t(f) + 1]; k++) if (B->pos[size_t(B->faceVerts[size_t(k)])].x <= 1e-9) p = false; if (p) plus.push_back(f); }
+  auto dev = [&]() { const PolyMesh* b = baseOf(*scene_->item(m)); double a = 0; int cn = 0; for (size_t c = 0; c < b->faceVerts.size(); c++) if (uc->S.of[size_t(uc->T->cf[c])] == best && uvSymMap_.onPlane[c]) { a += b->cornerUV[c][0]; cn++; } a /= std::max(1, cn); double w = 0;
+    for (size_t c = 0; c < b->faceVerts.size(); c++) { const int p = uvSymMap_.part[c]; if (p < 0 || uc->S.of[size_t(uc->T->cf[c])] != best || uc->S.of[size_t(uc->T->cf[size_t(p)])] != best) continue; w = std::max(w, std::hypot(b->cornerUV[size_t(p)][0] - (2 * a - b->cornerUV[c][0]), b->cornerUV[size_t(p)][1] - b->cornerUV[c][1])); }
+    return std::make_pair(w, a); };
+  auto boxS = [&]() { const auto b = uvSelBox(); return b ? QString("%1..%2 x %3..%4").arg((*b)[0], 0, 'f', 4).arg((*b)[2], 0, 'f', 4).arg((*b)[1], 0, 'f', 4).arg((*b)[3], 0, 'f', 4) : QString("-"); };
+  const bool s0 = tset.sym; const int an0 = uvo.anch; uvo.anch = 0; setTopoMode("poly", true);   // (the box by its left-bottom corner)
+  const auto d0 = dev(); tset.sym = false; tselApply(m, plus, "set", 'f'); { const auto b = *uvSelBox(); uvSetBox(b[0] + du, b[1] + dv, b[2] - b[0], b[3] - b[1]); }   // (the +X half moved, the Symmetry off)
+  const auto d1 = dev(); tselApply(m, all, "set", 'f'); const QString box1 = boxS();
+  tset.sym = true; { const auto b = *uvSelBox(); uvSetBox(b[0] + 0.001, b[1], b[2] - b[0], b[3] - b[1]); }   // (the whole shell moved a hair, the Symmetry on)
+  const auto d2 = dev(); const QString box2 = boxS(); tset.sym = s0; uvo.anch = an0;
+  return QString("shell %1 (%2 polygons, +X half %3): off the mirror %4 -> after the half moved %5 -> after a move with Symmetry %6; its own axis %7 -> %8; box %9 -> %10")
+      .arg(best).arg(all.size()).arg(plus.size()).arg(d0.first, 0, 'g', 3).arg(d1.first, 0, 'g', 3).arg(d2.first, 0, 'g', 3).arg(d1.second, 0, 'f', 4).arg(d2.second, 0, 'f', 4).arg(box1, box2);
 }
 }  // namespace hm

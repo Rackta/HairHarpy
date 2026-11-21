@@ -1,7 +1,7 @@
 // Heavy meshes (over lodTris() triangles — a high-poly model, a scan): worked out once in the background when the mesh
 // comes (a load, an import) or after it changed and stays put a moment — a lighter copy shown while the camera moves
-// (the LOD: clustered to a couple of million triangles first when it is huge, then quadric-error collapses to
-// LOD_TARGET) and a bounding volume hierarchy of its triangles, so a click, the wheel or the hover finds the surface at
+// (the LOD: the vertices clustered on a grid sized for about LOD_TARGET / 2 of them — the triangle count is what the grid
+// gives) and a bounding volume hierarchy of its triangles, so a click, the wheel or the hover finds the surface at
 // once instead of trying every triangle.
 #include "scene/MeshMods.h"
 #include "view/Viewport.h"
@@ -130,7 +130,7 @@ void Viewport::heavyBuild(HeavyJob& J) {
   if (J.cancel) return;
   auto bvh = std::make_shared<topo::Bvh>(); bvh->build(B.pos, tris); J.bvh = bvh; J.bvhDone = true;   // (taken at once — the LOD may take longer)
   if (J.cancel || !J.wantLod) return;
-  // the LOD: huge — clustered first, then the quadric collapses
+  // the LOD: the clustering alone (its grid sized for about LOD_TARGET / 2 vertices — no quadric collapses after it)
   std::vector<float> pos; std::vector<uint32_t> idx; std::vector<int> src;
   cluster(B, pos, idx, src, LOD_TARGET / 2);
   if (J.cancel) return;
@@ -178,6 +178,10 @@ void Viewport::heavyTick() {
   }
   for (auto it = heavy_.begin(); it != heavy_.end();) { if (alive.count(it->first)) { ++it; continue; } if (it->second.job) it->second.job->cancel = true; it = heavy_.erase(it); }
   if (got) { staticRev_++; requestUpdate(); }
+  if (room() == "topo" && tset.snap && drag_ == Drag::None) {    // (Snap on: the references' outer shells worked out ahead, in the background)
+    const int act = topoMesh();
+    for (auto& [id, it] : scene_->items) if (id != act && it.type == ItemType::IMesh && shellWanted(it) && scene_->isVisible(it)) {
+      bvhSurf(id, true); const auto f = shellCache_.find(id); if (f != shellCache_.end() && f->second.state && f->second.state->load() == 0) waiting = true; } }
   if (maskProxyTick()) waiting = true;                         // (the snap mask's proxies of the high-poly meshes too)
   if (waiting) { if (!heavyPoll_) { heavyPoll_ = new QTimer(this); heavyPoll_->setInterval(150); connect(heavyPoll_, &QTimer::timeout, this, [this] { heavyTick(); }); } if (!heavyPoll_->isActive()) heavyPoll_->start(); }
   else if (heavyPoll_) heavyPoll_->stop();

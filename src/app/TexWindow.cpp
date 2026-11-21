@@ -19,6 +19,8 @@
 #include <QListWidget>
 #include <QMimeData>
 #include <QMouseEvent>
+#include <QRegularExpression>
+#include <QUrl>
 #include <QPointer>
 #include <QPushButton>
 #include <QScrollArea>
@@ -28,6 +30,8 @@
 #include <QTimer>
 #include <QVBoxLayout>
 #include <map>
+#include <set>
+#include <tuple>
 
 namespace hm {
 
@@ -65,17 +69,74 @@ protected:
   QStringList mimeTypes() const override { return {MIME}; }
 };
 
-// a map row: click — chosen (a folder thumbnail goes into it), a thumbnail dropped on it — into it
+const QRegularExpression IMG_FILE("\\.(png|jpe?g|webp|bmp|gif|tga)$", QRegularExpression::CaseInsensitiveOption);
+QString imageFileOf(const QMimeData* m) { if (m->hasUrls()) for (const QUrl& u : m->urls()) if (u.isLocalFile() && IMG_FILE.match(u.toLocalFile()).hasMatch()) return u.toLocalFile(); return {}; }
+
+// a map row: click — chosen (a folder thumbnail goes into it), a thumbnail dropped on it — into it; an image file dragged from
+// Explorer — into it, kept in the project
 class SlotRow : public QFrame {
 public:
-  std::function<void()> onClick; std::function<void(const QString&)> onDrop;
+  std::function<void()> onClick; std::function<void(const QString&)> onDrop, onFile;
   SlotRow() { setAcceptDrops(true); setCursor(Qt::PointingHandCursor); }
 protected:
   void mousePressEvent(QMouseEvent* e) override { if (e->button() == Qt::LeftButton && onClick) onClick(); }
-  void dragEnterEvent(QDragEnterEvent* e) override { if (e->mimeData()->hasFormat(MIME)) { e->acceptProposedAction(); setProperty("tgt", true); style()->polish(this); } }
+  void dragEnterEvent(QDragEnterEvent* e) override { if (e->mimeData()->hasFormat(MIME) || !imageFileOf(e->mimeData()).isEmpty()) { e->acceptProposedAction(); setProperty("tgt", true); style()->polish(this); } }
   void dragLeaveEvent(QDragLeaveEvent*) override { setProperty("tgt", property("sel").toBool()); style()->polish(this); }
-  void dropEvent(QDropEvent* e) override { if (onDrop) onDrop(QString::fromUtf8(e->mimeData()->data(MIME))); }
+  void dropEvent(QDropEvent* e) override {
+    if (e->mimeData()->hasFormat(MIME)) { if (onDrop) onDrop(QString::fromUtf8(e->mimeData()->data(MIME))); return; }
+    const QString f = imageFileOf(e->mimeData()); e->acceptProposedAction(); if (!f.isEmpty() && onFile) { auto cb = onFile; QTimer::singleShot(0, this, [cb, f] { cb(f); }); }
+  }
 };
+
+// a set's map / field in a look (an undefined value — the key taken off: the file's own)
+void putMap(QJsonObject& L, int set, int k, const QJsonValue& v) {
+  QJsonArray S = L.value("sets").toArray(); if (set < 0 || set >= S.size()) return; QJsonObject s = S[set].toObject(); QJsonObject m = s.value("maps").toObject();
+  if (v.isUndefined()) m.remove(looks::SLOT_KEY[k]); else m.insert(looks::SLOT_KEY[k], v);
+  s.insert("maps", m); S[set] = s; L.insert("sets", S);
+}
+void putField(QJsonObject& L, int set, const QString& k, const QJsonValue& v) {
+  QJsonArray S = L.value("sets").toArray(); if (set < 0 || set >= S.size()) return; QJsonObject s = S[set].toObject();
+  if (v.isUndefined()) s.remove(k); else s.insert(k, v); S[set] = s; L.insert("sets", S);
+}
+
+// the file's own image a set's map names (its file name, lower case; "" — none)
+QString ownRef(const Item& m, int set, int k) {
+  const auto sets = looks::setsOf(m); const PolyMesh* B = looks::baseOf(m); if (!B || set < 0 || size_t(set) >= sets.size()) return {};
+  const int mat = sets[size_t(set)].mat;
+  if (mat >= 0 && size_t(mat) < B->matMaps.size()) if (const QString n = QFileInfo(B->matMaps[size_t(mat)][size_t(k)].name).fileName().toLower(); !n.isEmpty()) return n;
+  return QFileInfo(looks::lookOf(m).value("sets").toArray()[set].toObject().value("ref").toObject().value(looks::SLOT_KEY[k]).toString()).fileName().toLower();   // (an OBJ: the MTL's)
+}
+// the sets that use the same texture as this one (20.11 — one texture loaded once, not for every model): every model's set of
+// the same material name ("Default" — a model without materials — never), and every set whose file names the same image
+std::vector<std::pair<int, int>> sameTexSets(const Scene& sc, int id, int set, int k) {
+  std::vector<std::pair<int, int>> out{{id, set}};
+  const Item* M = sc.item(id); if (!M) return out;
+  const auto ms = looks::setsOf(*M); if (set < 0 || size_t(set) >= ms.size()) return out;
+  const QString name = ms[size_t(set)].name, ref = ownRef(*M, set, k);
+  for (auto& [oid, it] : sc.items) {
+    if (it.type != ItemType::IMesh || !looks::hasUV(it)) continue;
+    const auto os = looks::setsOf(it);
+    for (size_t i = 0; i < os.size(); i++) {
+      if (oid == id && int(i) == set) continue;
+      const bool byName = name != "Default" && !name.isEmpty() && os[i].name == name;
+      const bool byRef = !ref.isEmpty() && ownRef(it, int(i), k) == ref;
+      if (byName || byRef) out.push_back({oid, int(i)});
+    }
+  }
+  return out;
+}
+// a map put into sets of several models — one undo step (show: their textures turned on)
+void putShared(Viewport* vp, const std::vector<std::pair<int, int>>& at, int k, const QJsonValue& img, bool show) {
+  vp->runEdit([&](Scene& s, Selection&, const CurveCache&) -> QString {
+    for (auto [id, set] : at) { Item* T = s.item(id); if (!T) continue; QJsonObject L = looks::lookOf(*T);
+      if (show) L.insert("tex", true);
+      putMap(L, set, k, img); if (k == 0) putField(L, set, "color", QJsonValue(QJsonValue::Undefined));
+      T->raw.insert("look", L); }
+    return QString();
+  }, false);
+  vp->liveView();
+}
+int modelsIn(const std::vector<std::pair<int, int>>& at) { std::set<int> m; for (auto& p : at) m.insert(p.first); return int(m.size()); }
 
 struct Slot { int id = -1, set = -1, k = -1; bool operator==(const Slot& o) const { return id == o.id && set == o.set && k == o.k; } };
 
@@ -156,16 +217,19 @@ private:
     const looks::TexFile* f = nullptr; for (auto& x : looks::texDir().files) if (x.path == path) { f = &x; break; }
     if (!f) return;
     QJsonObject o{{"name", f->name}, {"path", f->path}, {"dir", looks::texDir().name}};
-    lookChanged(vp_, {s.id}, [&](QJsonObject& L) { setMap(L, s.set, s.k, o); if (s.k == 0) dropColor(L, s.set); });
+    putAll(s.id, s.set, s.k, o);
   }
-  static void setMap(QJsonObject& L, int set, int k, const QJsonValue& v) {   // (an undefined value — the key taken off: the file's own)
-    QJsonArray S = L.value("sets").toArray(); if (set >= S.size()) return; QJsonObject s = S[set].toObject(); QJsonObject m = s.value("maps").toObject();
-    if (v.isUndefined()) m.remove(looks::SLOT_KEY[k]); else m.insert(looks::SLOT_KEY[k], v);
-    s.insert("maps", m); S[set] = s; L.insert("sets", S);
+  // a map into the set and into every set that uses the same texture (the same material, the same image named by the file)
+  void putAll(int id, int si, int k, const QJsonValue& img) {
+    const auto at = sameTexSets(*sc_, id, si, k); putShared(vp_, at, k, img, false);
+    if (const int n = modelsIn(at); at.size() > 1) ui::toast(tr("Also put into %1 more set%2 that use the same texture (%3 model%4)").arg(at.size() - 1).arg(at.size() > 2 ? "s" : "").arg(n).arg(n > 1 ? "s" : ""));
   }
-  static void setField(QJsonObject& L, int set, const QString& k, const QJsonValue& v) {
-    QJsonArray S = L.value("sets").toArray(); if (set >= S.size()) return; QJsonObject s = S[set].toObject();
-    if (v.isUndefined()) s.remove(k); else s.insert(k, v); S[set] = s; L.insert("sets", S);
+  static void setMap(QJsonObject& L, int set, int k, const QJsonValue& v) { putMap(L, set, k, v); }
+  static void setField(QJsonObject& L, int set, const QString& k, const QJsonValue& v) { putField(L, set, k, v); }
+  // an image file into a map (Load… / dropped from Explorer): kept in the project
+  void loadInto(int id, int si, int k, const QString& f) {
+    if (looks::loadImage(f).isNull()) { ui::toast(tr("Could not read the image")); return; }
+    putAll(id, si, k, looks::keptImage(f));
   }
   static void dropColor(QJsonObject& L, int set) { setField(L, set, "color", QJsonValue(QJsonValue::Undefined)); }
 
@@ -251,7 +315,7 @@ private:
           bool fileHas = B && mat >= 0 && size_t(mat) < B->matMaps.size() && (!B->matMaps[size_t(mat)][size_t(k)].data.isEmpty() || !B->matMaps[size_t(mat)][size_t(k)].name.isEmpty());
           Slot me{id, si, k}; bool sel = slot_ == me;
           auto* r = new SlotRow; r->setProperty("tgt", sel); r->setProperty("sel", sel);
-          r->setToolTip(tr("Click — choose this map: a click on a folder thumbnail puts the texture here (or drag one onto it)"));
+          r->setToolTip(tr("Click — choose this map: a click on a folder thumbnail puts the texture here (or drag one onto it, or an image file from Explorer)"));
           auto* rh = new QHBoxLayout(r); rh->setContentsMargins(4, 2, 4, 2);
           auto* lab = new QLabel(QObject::tr(looks::SLOT_LABEL[k])); lab->setFixedWidth(52);
           auto* th = new QLabel; th->setFixedSize(40, 40); th->setStyleSheet("background:#1a1a1a;border:1px solid #333"); th->setAlignment(Qt::AlignCenter);
@@ -264,17 +328,16 @@ private:
           QObject::connect(b, &QPushButton::clicked, this, [this, id, si, k] {
             QSettings st; QString f = QFileDialog::getOpenFileName(this, tr("Texture image"), st.value("textures/pickDir").toString(), tr("Images (*.png *.jpg *.jpeg *.webp *.bmp *.gif *.tga)"));
             if (f.isEmpty()) return; st.setValue("textures/pickDir", QFileInfo(f).absolutePath());
-            if (looks::loadImage(f).isNull()) { ui::toast(tr("Could not read the image")); return; }
-            QJsonObject img = looks::keptImage(f);
-            lookChanged(vp_, {id}, [&](QJsonObject& L2) { setMap(L2, si, k, img); if (k == 0) dropColor(L2, si); });
+            loadInto(id, si, k, f);
           });
           rh->addWidget(b);
           if (has) { auto* x = new QPushButton("✕"); x->setFixedWidth(26); x->setToolTip(tr("No map here"));
             QObject::connect(x, &QPushButton::clicked, this, [this, id, si, k] { lookChanged(vp_, {id}, [&](QJsonObject& L2) { setMap(L2, si, k, QJsonValue(QJsonValue::Null)); }); }); rh->addWidget(x); }
           if (!o.isUndefined() && fileHas) { auto* f = new QPushButton("↺"); f->setFixedWidth(26); f->setToolTip(tr("Back to the file's own map"));
             QObject::connect(f, &QPushButton::clicked, this, [this, id, si, k] { lookChanged(vp_, {id}, [&](QJsonObject& L2) { setMap(L2, si, k, QJsonValue(QJsonValue::Undefined)); }); }); rh->addWidget(f); }
-          r->onClick = [this, me, sel] { slot_ = sel ? Slot{} : me; renderSets(); };
+          r->onClick = [this, me, sel] { slot_ = sel ? Slot{} : me; QTimer::singleShot(0, this, [this] { renderSets(); }); };   // (the list made anew after this row's own click handler returns: the rebuild deletes the row)
           r->onDrop = [this, me](const QString& path) { assign(me, path); };
+          r->onFile = [this, id, si, k](const QString& f) { loadInto(id, si, k, f); };
           cv->addWidget(r);
         }
         auto* al = new QCheckBox(tr("Opacity from the colour map's alpha")); al->setChecked(looks::setAlpha(*T, si));
@@ -290,7 +353,7 @@ private:
     saveBtn_->setText(tr("💾 Save textures into the project") + (nl ? tr(" (%1 linked)").arg(nl) : QString())); saveBtn_->setEnabled(nl > 0);
     applyBtn_->setVisible(ids_.size() > 1);
     if (ids_.size() > 1) { applyBtn_->setText(tr("⇉ Apply to all selected (%1)").arg(ids_.size() - 1));
-      applyBtn_->setToolTip(tr("The textures of the first model (%1) — maps, colours, sets on / off, Textures shown / Flat — go to the other %2: a set takes the first model's set of the same name, else the one in the same place, else its first set").arg(sc_->item(ids_[0])->name).arg(ids_.size() - 1)); }
+      applyBtn_->setToolTip(tr("The textures of the first model (%1) go to the other %2: Textures shown / Flat go to every one; maps, colours and sets on / off only into a set of the same material — a set of another material keeps its own").arg(sc_->item(ids_[0])->name).arg(ids_.size() - 1)); }
   }
 
   // 💾 the linked images (texture folder) into the project: kept as data from now on, wherever the files go
@@ -319,6 +382,7 @@ private:
     if (ids_.size() < 2) return;
     const Item* F = sc_->item(ids_[0]); QJsonObject src = looks::lookOf(*F); auto fsets = looks::setsOf(*F); QJsonArray SS = src.value("sets").toArray();
     std::vector<int> rest(ids_.begin() + 1, ids_.end());
+    int same = 0;
     lookChanged(vp_, rest, [&](QJsonObject& L) {
       // (which model: the sets tell — lookChanged hands each model's look in turn)
       L.insert("tex", src.value("tex")); L.insert("flat", src.value("flat"));
@@ -326,15 +390,19 @@ private:
       for (int i = 0; i < S.size(); i++) {
         QString name = S[i].toObject().value("name").toString(); int k = -1;
         for (size_t j = 0; j < fsets.size(); j++) if (fsets[j].name == name) { k = int(j); break; }
-        QJsonObject o = SS[k >= 0 ? k : i < SS.size() ? i : 0].toObject();
+        // (20.11: only a set of the same material takes the first model's maps — before, any other set took the one in the same
+        // place or the first: a model of one set put its texture onto every model)
+        QJsonObject o = k >= 0 && k < SS.size() ? SS[k].toObject() : QJsonObject();
         if (o.isEmpty()) { out.append(S[i]); continue; }
+        same++;
         QJsonObject c{{"name", name}, {"on", o.value("on").toBool(true)}, {"maps", o.value("maps")}};
         if (o.contains("color")) c.insert("color", o.value("color")); if (o.contains("alpha")) c.insert("alpha", o.value("alpha"));
         out.append(c);
       }
       L.insert("sets", out);
     });
-    ui::toast(tr("Textures of %1 applied to %2 model%3").arg(F->name).arg(rest.size()).arg(rest.size() > 1 ? "s" : ""));
+    ui::toast(tr("Textures shown / Flat of %1 → %2 model%3").arg(F->name).arg(rest.size()).arg(rest.size() > 1 ? "s" : "")
+              + (same ? tr(" · its maps → %1 set%2 of the same material").arg(same).arg(same > 1 ? "s" : "") : tr(" · no set of the same material — the maps left as they were")));
   }
 
   Viewport* vp_; Scene* sc_;
@@ -353,6 +421,63 @@ void lookChanged(Viewport* vp, const std::vector<int>& ids, const std::function<
     return QString();
   }, false);
   vp->liveView();                                            // (the meshes drawn again with their new looks)
+}
+
+QString dropTextures(Viewport* vp, Scene* sc, const QStringList& files, int id, int face) {
+  const auto tr = [](const char* s) { return QObject::tr(s); };
+  if (id < 0 || !sc->item(id)) {                                // (not on a model: the one selected, else the only one there is)
+    std::vector<int> c; for (int s : vp->selection().items) if (const Item* x = sc->item(s); x && x->type == ItemType::IMesh && looks::hasUV(*x)) c.push_back(s);
+    if (c.empty()) for (auto& [k, x] : sc->items) if (x.type == ItemType::IMesh && looks::hasUV(x)) c.push_back(k);
+    id = c.size() == 1 ? c[0] : -1; face = -1;
+  }
+  // (no model to put it on — a file one of the models' files names still goes where it is named)
+  const Item* T = id >= 0 ? sc->item(id) : nullptr; QString noModel = tr("drop it onto the part of the model it is for");
+  if (T && (T->type != ItemType::IMesh || !looks::hasUV(*T))) { noModel = tr("%1 has no UVs — a texture can't be placed on it").arg(T->name); T = nullptr; }
+  const auto sets = T ? looks::setsOf(*T) : std::vector<TexSet>{};
+  int hit = sets.size() == 1 ? 0 : -1;
+  if (const PolyMesh* B = T ? looks::baseOf(*T) : nullptr; B && face >= 0 && size_t(face) < B->faceMat.size()) { const int m = B->faceMat[size_t(face)]; for (size_t i = 0; i < sets.size(); i++) if (sets[i].mat == m) hit = int(i); }
+  if (hit < 0 && face >= 0 && !sets.empty()) hit = 0;
+  static const QRegularExpression alphaRe("(alpha|opacity|opac|transp|cutout)", QRegularExpression::CaseInsensitiveOption);
+  static const QRegularExpression otherRe("(normal|_nrm|_nor\\b|rough|metal|_ao\\b|ambient|occlusion|spec|gloss|height|bump|disp|emiss)", QRegularExpression::CaseInsensitiveOption);
+  // (the models' files may name their images: a dropped file of that name goes wherever it is named, on every model)
+  std::map<QString, std::vector<std::tuple<int, int, int>>> named;
+  for (auto& [oid, it] : sc->items) if (it.type == ItemType::IMesh && looks::hasUV(it)) { const int n = int(looks::setsOf(it).size());
+    for (int i = 0; i < n; i++) for (int k = 0; k < 2; k++) if (const QString r = ownRef(it, i, k); !r.isEmpty()) named[r].push_back({oid, i, k}); }
+  struct Put { std::vector<std::pair<int, int>> at; int k; QString f; }; std::vector<Put> put; QStringList other, bad, lost;
+  for (const QString& f : files) {
+    if (!IMG_FILE.match(f).hasMatch()) continue;
+    const QString base = QFileInfo(f).completeBaseName(), lo = base.toLower();
+    if (auto nf = named.find(QFileInfo(f).fileName().toLower()); nf != named.end()) {
+      if (looks::loadImage(f).isNull()) { bad << base; continue; }
+      for (int k = 0; k < 2; k++) { Put p{{}, k, f}; for (auto [m, i, kk] : nf->second) if (kk == k) p.at.push_back({m, i}); if (!p.at.empty()) put.push_back(p); }
+      continue; }
+    if (otherRe.match(base).hasMatch()) { other << base; continue; }   // (a normal / roughness … map: the model has a Colour and an Opacity map only)
+    if (looks::loadImage(f).isNull()) { bad << base; continue; }
+    int best = -1, bl = 1; for (size_t i = 0; i < sets.size(); i++) { const QString n = sets[i].name.toLower(); if (n.size() > bl && lo.contains(n)) { best = int(i); bl = int(n.size()); } }
+    const int si = best >= 0 ? best : hit; if (si < 0) { lost << base; continue; }
+    const int k = alphaRe.match(base).hasMatch() ? 1 : 0;
+    put.push_back({sameTexSets(*sc, id, si, k), k, f});
+  }
+  QStringList done;
+  if (!put.empty()) {
+    std::map<QString, QJsonObject> img; for (const Put& p : put) if (!img.count(p.f)) img[p.f] = looks::keptImage(p.f);
+    vp->runEdit([&](Scene& s, Selection&, const CurveCache&) -> QString {   // (one undo step for every file and model)
+      for (const Put& p : put) for (auto [mid, set] : p.at) { Item* M = s.item(mid); if (!M) continue; QJsonObject L = looks::lookOf(*M); L.insert("tex", true);
+        putMap(L, set, p.k, img[p.f]); if (p.k == 0) putField(L, set, "color", QJsonValue(QJsonValue::Undefined)); M->raw.insert("look", L); }
+      return QString();
+    }, false);
+    vp->liveView();
+    for (const Put& p : put) { const Item* M = sc->item(p.at[0].first); const auto ms = looks::setsOf(*M);
+      QString d = QString("%1 → %2 %3").arg(QFileInfo(p.f).completeBaseName(), M->name + " · " + ms[size_t(p.at[0].second)].name, QObject::tr(looks::SLOT_LABEL[p.k]));
+      if (p.at.size() > 1) d += QObject::tr(" (+%1 more set%2 with the same texture, %3 model%4)").arg(p.at.size() - 1).arg(p.at.size() > 2 ? "s" : "").arg(modelsIn(p.at)).arg(modelsIn(p.at) > 1 ? "s" : "");
+      done << d; }
+  }
+  QString r = done.join(", ");
+  auto add = [&](const QString& s) { r += (r.isEmpty() ? QString() : QString(" · ")) + s; };
+  if (!lost.isEmpty()) add(tr("%1 — not placed: %2").arg(lost.join(", "), noModel));
+  if (!other.isEmpty()) add(tr("%1 — left out: a model takes Colour and Opacity maps (normals, roughness … are made in the Paint room)").arg(other.join(", ")));
+  if (!bad.isEmpty()) add(tr("%1 — could not be read").arg(bad.join(", ")));
+  return r.isEmpty() ? tr("No pictures to place") : r;
 }
 
 void openTexWindow(QWidget* parent, Viewport* vp, Scene* sc, int id, int mat) {

@@ -73,16 +73,17 @@ void tipControls(QVBoxLayout* v, Viewport* vp, Scene* sc, int k) {
   v->addWidget(s);
 }
 void brushControls(QVBoxLayout* v, Viewport* vp, const QString& tab, const std::vector<int>& ks) {
-  bool tip = tab == "tip"; Viewport::ShellBrush& B = tip ? vp->tipBrush : vp->pinfBrush;
+  bool tip = tab == "tip", spi = tab == "spiral"; Viewport::ShellBrush& B = tip ? vp->tipBrush : spi ? vp->spiralBrush : vp->pinfBrush;
   bool on = vp->tool() == "guide" && vp->shTab == tab && vp->shellBrushActive();
   auto* bar = new QWidget; auto* h = new QHBoxLayout(bar); h->setContentsMargins(0, 6, 0, 0); h->setSpacing(4);
-  auto* pb = button(tip ? QObject::tr("Density brush") : QObject::tr("Influence brush"),
-                    tip ? QObject::tr("LMB — paint where the density works, Ctrl — erase, Shift — smooth (both masks).\nCtrl+Shift — the second mode: Even spacing (cyan) — the rings there equally apart (no crowding on bends or toward the tip); Ctrl+Shift+Alt — erase it.\nWith density modifiers selected only their locks are painted")
+  auto* pb = button(tip ? QObject::tr("Density brush") : spi ? QObject::tr("Spiral brush") : QObject::tr("Influence brush"),
+                    spi ? QObject::tr("LMB — paint the stretch of the cocoon that is a spiral, Ctrl — erase, Shift — smooth. Where it is painted and the cocoon really winds (a turn and a quarter at least) the loops go by turns — the same number at the same place of every turn")
+                    : tip ? QObject::tr("LMB — paint where the density works, Ctrl — erase, Shift — smooth (both masks).\nCtrl+Shift — the second mode: Even spacing (cyan) — the rings there equally apart (no crowding on bends or toward the tip); Ctrl+Shift+Alt — erase it.\nWith density modifiers selected only their locks are painted")
                         : QObject::tr("LMB — weaken the parent's influence (red), Ctrl — inverted: add it (green), Ctrl+Alt — erase, Shift — smooth. With Parent influence modifiers selected only their cocoons are painted"));
   pb->setCheckable(true); pb->setChecked(on); pb->setIcon(ui::icon("brush_paint")); pb->setIconSize(QSize(18, 18));
   QObject::connect(pb, &QPushButton::clicked, vp, [vp, tab, on] {
-    Viewport::ShellBrush& b = tab == "tip" ? vp->tipBrush : vp->pinfBrush;
-    if (on) b.on = false; else { vp->tipBrush.on = vp->pinfBrush.on = false; b.on = true; vp->shTab = tab; if (vp->tool() != "guide") vp->setTool("guide"); }
+    Viewport::ShellBrush& b = tab == "tip" ? vp->tipBrush : tab == "spiral" ? vp->spiralBrush : vp->pinfBrush;
+    if (on) b.on = false; else { vp->tipBrush.on = vp->pinfBrush.on = vp->spiralBrush.on = false; b.on = true; vp->shTab = tab; if (vp->tool() != "guide") vp->setTool("guide"); }
     vp->shellChanged(); refresh(vp);
   });
   auto* cl = button(ks.size() == 1 ? QObject::tr("Clear mask") : QObject::tr("Clear all masks"), QObject::tr("Remove the painted mask — the modifier does nothing until painted again"));
@@ -90,10 +91,24 @@ void brushControls(QVBoxLayout* v, Viewport* vp, const QString& tab, const std::
   h->addWidget(pb); h->addWidget(cl); h->addStretch(1); v->addWidget(bar);
   if (!on) return;
   auto* st = new SliderRow(tip ? QObject::tr("Strength") : QObject::tr("Brush"), 0, 1, 0.01, B.strength, pct);
-  QObject::connect(st, &SliderRow::changed, vp, [vp, tab](double x) { (tab == "tip" ? vp->tipBrush : vp->pinfBrush).strength = x; });
+  QObject::connect(st, &SliderRow::changed, vp, [vp, tab](double x) { (tab == "tip" ? vp->tipBrush : tab == "spiral" ? vp->spiralBrush : vp->pinfBrush).strength = x; });
   auto* rr = new SliderRow(QObject::tr("Radius"), 8, 400, 1, vp->brushR, [](double x) { return QString("%1px").arg(int(std::lround(x))); });
   QObject::connect(rr, &SliderRow::changed, vp, [vp](double x) { vp->brushR = x; vp->shellChanged(); });
   v->addWidget(st); v->addWidget(rr);
+}
+// ---- Spiral ----
+void spiralControls(QVBoxLayout* v, Viewport* vp, Scene* sc, int k) {
+  const QJsonObject cur = k >= 0 ? sc->item(k)->raw.value("p").toObject() : vp->spiralDefaults;
+  auto* s = new SliderRow(QObject::tr("Loops per turn"), 3, 24, 1, cur.value("loops").toDouble(8), [](double x) { return QString::number(int(std::lround(x))); }); s->setReset(8);
+  s->setTip(QObject::tr("How many loops go on each turn of the coil: 6–8 for a low-poly stylised curl, 12 and more smooth. Double-click — 8"));
+  QObject::connect(s, &SliderRow::changed, vp, [vp, sc, k](double x) { if (k < 0) { vp->spiralDefaults.insert("loops", std::round(x)); return; } setRawP(*sc, k, "loops", std::round(x)); vp->touchShellMods({k}); });
+  QObject::connect(s, &SliderRow::released, vp, [vp, k](double) { if (k >= 0) vp->commitLive(); });
+  v->addWidget(s);
+  auto* ph = new SliderRow(QObject::tr("Phase"), 0, 1, 0.01, cur.value("phase").toDouble(0), pct); ph->setReset(0);
+  ph->setTip(QObject::tr("Where on each turn the loops lie: shifts them all along the coil by this share of a loop"));
+  QObject::connect(ph, &SliderRow::changed, vp, [vp, sc, k](double x) { if (k < 0) { vp->spiralDefaults.insert("phase", x); return; } setRawP(*sc, k, "phase", x); vp->touchShellMods({k}); });
+  QObject::connect(ph, &SliderRow::released, vp, [vp, k](double) { if (k >= 0) vp->commitLive(); });
+  v->addWidget(ph);
 }
 // ---- Parent influence ----
 void pinfControls(QVBoxLayout* v, Viewport* vp, Scene* sc, int k) {
@@ -151,7 +166,7 @@ void guideControls(QVBoxLayout* v, Viewport* vp, Scene* sc, int gid) {
   if (g) {
     const Item* k = modCocoon(*sc, g); bool disc = g->raw.value("kind").toString() == "disc";
     if (disc) v->addWidget(muted(k ? QObject::tr("NURBS disc on %1. E / R / T move, rotate, transform it, the Brush shapes it.").arg(k->name)
-                                   : QObject::tr("NURBS disc in the scene — a ring lies on it on every cocoon it crosses (where a cocoon takes its parent's / a linked one's loops, theirs rule). E / R / T move, rotate, transform it, the Brush shapes it.")));
+                                   : QObject::tr("NURBS disc in the scene — a ring lies on it on every cocoon it crosses (within its reach it rules over the loops a cocoon takes from its parent / a linked one). E / R / T move, rotate, transform it, the Brush shapes it.")));
     else if (g->raw.value("on").isObject()) v->addWidget(muted(k ? QObject::tr("Guide line across %1 — a ring lies in its plane. It follows the cocoon; to move it, draw a new one and delete this.").arg(k->name) : QObject::tr("Guide line on no cocoon — it does nothing.")));
     else v->addWidget(muted(QObject::tr("Guide line across %1 curves%2.").arg(g->raw.value("hits").toArray().size()).arg(k ? QObject::tr(" — on %1").arg(k->name) : QObject::tr(" (an older one, on no cocoon — it does nothing)"))));
     // a scene disc's cocoons: left out of its calculation, or only these
@@ -272,21 +287,24 @@ std::vector<int> modsOf(const Scene& sc, ItemType t) { std::vector<int> v; for (
 QWidget* buildShellPanel(Viewport* vp, Scene* sc) {
   auto* w = new QWidget; auto* v = new QVBoxLayout(w); v->setSpacing(4);
   v->addWidget(h4(QObject::tr("◍ Shell modifiers")));
-  if (vp->shTab != "tip" && vp->shTab != "pinf" && vp->shTab != "line" && vp->shTab != "disc") vp->shTab = "tip";
+  if (vp->shTab != "tip" && vp->shTab != "pinf" && vp->shTab != "spiral" && vp->shTab != "line" && vp->shTab != "disc") vp->shTab = "tip";
   auto set = [vp](const QString& k) {
-    vp->shTab = k; vp->tipBrush.on = k == "tip" && vp->tipBrush.on; vp->pinfBrush.on = k == "pinf" && vp->pinfBrush.on;
+    vp->shTab = k; vp->tipBrush.on = k == "tip" && vp->tipBrush.on; vp->pinfBrush.on = k == "pinf" && vp->pinfBrush.on; vp->spiralBrush.on = k == "spiral" && vp->spiralBrush.on;
     if ((k == "line" || k == "disc") && vp->tool() != "guide") vp->setTool("guide");
     vp->shellChanged(); refresh(vp);
   };
   v->addWidget(modes(QObject::tr("Topology"), {{"tip", QObject::tr("Density"), QObject::tr("Density: more (or fewer) rings where you paint it along a cocoon")},
-                                               {"pinf", QObject::tr("Parent influence"), QObject::tr("Parent influence: a mask painted along a cocoon — LMB weakens the pull of its parent (and linked cocoons): its own rings there; Ctrl adds it: their loops taken further out")}}, vp->shTab, set));
+                                               {"pinf", QObject::tr("Parent influence"), QObject::tr("Parent influence: a mask painted along a cocoon — LMB weakens the pull of its parent (and linked cocoons): its own rings there; Ctrl adds it: their loops taken further out")},
+                                               {"spiral", QObject::tr("Spiral"), QObject::tr("Spiral: paint the stretch of a cocoon that winds into a coil — the program finds its turns and puts the loops on them by turns (the same number at the same place of each turn)")}}, vp->shTab, set));
   v->addWidget(modes(QObject::tr("Guidelines"), {{"line", QObject::tr("Line"), QObject::tr("A line across a cocoon: a ring of it lies in the line's plane")},
                                                  {"disc", QObject::tr("NURBS disc"), QObject::tr("A disc across a cocoon: a ring lies on it")}}, vp->shTab, set));
   v->addWidget(hline());
   auto ks = vp->shellTargets(); QString on1 = ks.size() == 1 ? sc->item(ks[0])->name : QString();
+  // (a modifier of this tab selected: its sliders here edit it — the same as in Settings. None: they set the next one added)
+  auto selMod = [vp, sc](ItemType ty) { for (auto it = vp->selection().items.rbegin(); it != vp->selection().items.rend(); ++it) if (const Item* x = sc->item(*it); x && x->type == ty) return *it; return -1; };
   if (vp->shTab == "tip") {
     v->addWidget(muted(QObject::tr("Density: more (or fewer) rings on a cocoon where you paint it with its brush. Select a cocoon (or its lock), add it, set the density, paint along the cocoon.")));
-    tipControls(v, vp, sc, -1);
+    tipControls(v, vp, sc, selMod(ItemType::Tip));
     auto* ap = button(ks.size() > 1 ? QObject::tr("Add density to %1 cocoons").arg(ks.size()) : ks.size() ? QObject::tr("Add density to %1").arg(on1) : QObject::tr("Add density"), QObject::tr("Select a cocoon (or its lock), then add"), true);
     QObject::connect(ap, &QPushButton::clicked, vp, [vp] {
       QJsonObject def = vp->tipDefaults; def.insert("v", 2);
@@ -301,9 +319,25 @@ QWidget* buildShellPanel(Viewport* vp, Scene* sc) {
       v->addWidget(muted(QObject::tr("The painted mask is shown along the cocoon: dark — weak, yellow — full. Ctrl+Shift — Even spacing (cyan, beside it): the rings there equally apart; Ctrl+Shift+Alt — erase it.")));
       brushControls(v, vp, "tip", sel.empty() ? list : sel);
     }
+  } else if (vp->shTab == "spiral") {
+    v->addWidget(muted(QObject::tr("Spiral: select a cocoon (or its lock), add it and paint the stretch that winds into a coil. The program takes the coil's axis and turns from the cocoon as it is now — also a hand-shaped, uneven one — and puts the loops on them by turns: the same number at the same place of every turn. A stretch that winds less than a turn and a quarter is not taken for a spiral.")));
+    spiralControls(v, vp, sc, selMod(ItemType::Spiral));
+    auto* ap = button(ks.size() > 1 ? QObject::tr("Add Spiral to %1 cocoons").arg(ks.size()) : ks.size() ? QObject::tr("Add Spiral to %1").arg(on1) : QObject::tr("Add Spiral"), QObject::tr("Select a cocoon (or its lock), then add"), true);
+    QObject::connect(ap, &QPushButton::clicked, vp, [vp] {
+      auto made = vp->addShellMods("spiral", vp->spiralDefaults, QObject::tr("Spiral")); if (made.empty()) return;
+      vp->tipBrush.on = vp->pinfBrush.on = false; vp->spiralBrush.on = true; vp->shTab = "spiral"; vp->setTool("guide"); vp->shellChanged(); refresh(vp);
+      ui::toast(QObject::tr("%1 — now paint the coiled stretch of the cocoon (Ctrl — erase, Shift — smooth)").arg(made.size() > 1 ? QObject::tr("%1 spiral modifiers").arg(made.size()) : vp->scene()->item(made[0])->name));
+    });
+    v->addWidget(ap);
+    auto list = modsOf(*sc, ItemType::Spiral);
+    if (!list.empty()) {
+      std::vector<int> sel; for (int id : list) if (vp->isItemSelected(id)) sel.push_back(id);
+      v->addWidget(muted(QObject::tr("The painted mask is shown along the cocoon in green.")));
+      brushControls(v, vp, "spiral", sel.empty() ? list : sel);
+    }
   } else if (vp->shTab == "pinf") {
     v->addWidget(muted(QObject::tr("Parent influence: a mask painted along a cocoon. Where you paint it, the parent's (and the linked cocoons') influence weakens — the cocoon spaces its own rings there even inside them; inverted (Ctrl) it adds — the cocoon takes their loops further out, beside them too.")));
-    pinfControls(v, vp, sc, -1);
+    pinfControls(v, vp, sc, selMod(ItemType::PInf));
     auto* ap = button(ks.size() > 1 ? QObject::tr("Add Parent influence to %1 cocoons").arg(ks.size()) : ks.size() ? QObject::tr("Add Parent influence to %1").arg(on1) : QObject::tr("Add Parent influence"), QObject::tr("Select a cocoon (or its lock), then add"), true);
     QObject::connect(ap, &QPushButton::clicked, vp, [vp] {
       auto made = vp->addShellMods("pinf", vp->pinfDefaults, QObject::tr("Parent influence")); if (made.empty()) return;
@@ -319,7 +353,7 @@ QWidget* buildShellPanel(Viewport* vp, Scene* sc) {
     }
   } else {
     v->addWidget(muted(vp->shTab == "line"
-      ? QObject::tr("Select the cocoon, then drag a line across it: a ring of the cocoon lies in the line's plane there (shown as that ring); it follows the cocoon. Where the cocoon takes its parent's / a linked cocoon's loops, theirs rule. A click on a guide makes it active.")
+      ? QObject::tr("Select the cocoon, then drag a line across it: a ring of the cocoon lies in the line's plane there (shown as that ring); it follows the cocoon. Within its influence radius it rules over the loops the cocoon takes from its parent / a linked cocoon. A click on a guide makes it active.")
       : QObject::tr("A cocoon selected: click on it (or press Create) — a disc across it, its ring lies on the disc. Nothing selected: click (at that height) or Create — a level disc in the scene through all the cocoons, a ring of each cocoon it crosses lies on it (general alignment). Move (E), rotate (R), transform (T) it, shape it with the Brush.")));
     if (vp->shTab == "disc") {
       auto* cb = button(ks.size() > 1 ? QObject::tr("＋ Create on %1 cocoons").arg(ks.size()) : ks.size() ? QObject::tr("＋ Create on %1").arg(on1) : QObject::tr("＋ Create"),
@@ -342,6 +376,11 @@ void shellModProps(QVBoxLayout* v, Viewport* vp, Scene* sc, int id) {
     tipControls(v, vp, sc, id);
     if (!painted(*k, false)) v->addWidget(warn(QObject::tr("Nothing painted yet — it does nothing. Paint with the Density brush.")));
     brushControls(v, vp, "tip", {id});
+  } else if (k->type == ItemType::Spiral) {
+    v->addWidget(muted(c ? QObject::tr("Where its mask is painted on %1 the cocoon is taken for a coil: its loops go by turns. Hide it (eye) to switch it off.").arg(c->name) : QObject::tr("A Spiral modifier on no cocoon — it does nothing.")));
+    spiralControls(v, vp, sc, id);
+    if (!painted(*k, false)) v->addWidget(warn(QObject::tr("Nothing painted yet — it does nothing. Paint with the Spiral brush.")));
+    brushControls(v, vp, "spiral", {id});
   } else if (k->type == ItemType::PInf) {
     v->addWidget(muted(c ? QObject::tr("Where its mask is painted, the influence of the cocoons %1 takes its loops from is weakened (red) or added (green). Hide it (eye) to switch it off.").arg(c->name) : QObject::tr("A Parent influence modifier on no cocoon — it does nothing.")));
     pinfControls(v, vp, sc, id);

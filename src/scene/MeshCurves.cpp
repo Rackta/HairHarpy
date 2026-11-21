@@ -27,8 +27,14 @@ struct OSet { std::vector<int> v; std::set<int> s; bool add(int x) { if (!s.inse
 std::shared_ptr<const Topo> topoOf(const PolyMesh& m) {
   static std::mutex mu; static std::map<const PolyMesh*, std::pair<size_t, std::shared_ptr<const Topo>>> cache;
   std::lock_guard<std::mutex> lk(mu);
-  auto it = cache.find(&m); size_t sig = m.pos.size() * 1000003 + m.faceVerts.size();
+  // (the signature: the counts and the polygons themselves — a mesh edited in place, or another one at a freed one's address, with
+  // the same counts gets its own edges)
+  size_t sig = m.pos.size() * 1000003 + m.faceVerts.size() * 7919 + m.faceStart.size();
+  for (int v : m.faceVerts) sig = (sig ^ size_t(uint32_t(v))) * size_t(1099511628211ull);
+  for (int s : m.faceStart) sig = (sig ^ size_t(uint32_t(s))) * size_t(1099511628211ull);
+  auto it = cache.find(&m);
   if (it != cache.end() && it->second.first == sig) return it->second.second;
+  if (it == cache.end() && cache.size() >= 64) cache.clear();   // (a topology per mesh ever looked at: not kept for ever)
   auto T = std::make_shared<Topo>(); T->n = int(m.pos.size()); T->nf = m.faceCount();
   auto addE = [&](int a, int b) { if (a == b) return; long long k = T->key(a, b); if (!T->E.count(k)) { T->E[k] = int(T->ea.size()); T->ea.push_back(a); T->eb.push_back(b); } };
   for (int f = 0; f < T->nf; f++) { int s = m.faceStart[size_t(f)], e = m.faceStart[size_t(f) + 1]; for (int k = s; k < e; k++) addE(m.faceVerts[size_t(k)], m.faceVerts[size_t(k + 1 < e ? k + 1 : s)]); }
@@ -141,7 +147,9 @@ std::vector<FitPt> fitPolyline(const std::vector<Vec3>& pts, bool closed) {
   for (int iter = 0; iter < 12; iter++) {
     std::vector<int> ids; for (int i = 0; i < N; i++) if (keep[size_t(i)]) ids.push_back(i);
     std::vector<int> list = ids; if (closed) list.pop_back();
-    Scene tmp; Item c; c.id = 1; c.type = ItemType::Curve; c.closed = closed; c.roundSet = c.fairSet = true;
+    // (the curve as it will be made — a new curve's roundness and fairing, edit::makeUserCurve: checked with 0 / 0 the fit held, the
+    // rounder curve made of it bulged off the line between its anchors)
+    Scene tmp; Item c; c.id = 1; c.type = ItemType::Curve; c.closed = closed; c.round = 0.6; c.fair = 0.5; c.roundSet = c.fairSet = true;
     for (size_t k = 0; k < list.size(); k++) { Anchor a; a.id = 100 + int(k); a.pos = P[size_t(list[k])]; a.smooth = sharpAt(list[k]) ? 0 : 1; tmp.anchors.emplace(a.id, a); c.anchors.push_back(a.id); }
     tmp.items.emplace(1, c); tmp.reindex();
     auto sm = sampleCurve(tmp, *tmp.item(1), 12);
@@ -156,6 +164,13 @@ std::vector<FitPt> fitPolyline(const std::vector<Vec3>& pts, bool closed) {
         double d = 1e300; for (size_t j = 0; j + 1 < seg.size(); j++) d = std::min(d, segDist3(P[size_t(q)], seg[j], seg[j + 1]));
         if (d > md) { md = d; k = q; }
       }
+      // (and the other way: the curve's own points off the polyline — it bulges away between two anchors, the vertices all still near
+      // some part of it): the vertex nearest the worst point is kept too
+      if (k < 0) { double wd = tol * 1.5; int wq = -1;
+        for (const Vec3& x : seg) { double d = 1e300; int nq = -1;
+          for (int q = ids[s]; q < ids[s + 1]; q++) { const double dd = segDist3(x, P[size_t(q)], P[size_t(q + 1)]); if (dd < d) { d = dd; nq = q; } }
+          if (d > wd && nq > ids[s] && nq < ids[s + 1]) { wd = d; wq = nq; } else if (d > wd && nq == ids[s] && nq + 1 < ids[s + 1]) { wd = d; wq = nq + 1; } }
+        k = wq; }
       if (k >= 0) { keep[size_t(k)] = 1; added = true; }
     }
     if (!added) { std::vector<FitPt> o; for (int i : list) o.push_back(mark(P[size_t(i)], i)); return o; }
@@ -216,6 +231,28 @@ std::vector<int> polylinesToCurves(Scene& sc, const std::vector<std::vector<Vec3
     Item& ci = *sc.item(cid); ci.anchors = an; if (closed) ci.closed = true; made.push_back(cid);
   }
   if (!made.empty()) sc.reindex();
+  return made;
+}
+
+std::vector<int> nodeLinesToCurves(Scene& sc, const std::vector<std::vector<Vec3>>& lines, const std::vector<std::array<int, 2>>& ends, const std::vector<Vec3>& nodes, const QString& groupName) {
+  std::vector<int> made; int g = -1; std::map<int, int> nodeAnchor;
+  auto anchorOf = [&](int n) { auto it = nodeAnchor.find(n); if (it != nodeAnchor.end()) return it->second; const int id = sc.addAnchor(nodes[size_t(n)]).id; nodeAnchor[n] = id; return id; };
+  for (size_t li = 0; li < lines.size(); li++) {
+    std::vector<Vec3> L; for (const Vec3& p : lines[li]) if (L.empty() || p.distanceTo(L.back()) > 1e-9) L.push_back(p);
+    if (L.size() < 2 || ends[li][0] == ends[li][1]) continue;                               // (a line that began and ended in one node: not a curve)
+    auto fit = fitPolyline(L, false); if (fit.size() < 2) continue;
+    // (the line's own anchors not right next to its ends — the nodes' anchors are there, shared with the lines meeting in them: a
+    // fitted one beside one would be a second anchor in the same place)
+    double len = 0; for (size_t i = 1; i < L.size(); i++) len += L[i].distanceTo(L[i - 1]);
+    const double gap = 0.005 * len; std::vector<FitPt> keep{fit.front()};                  // (only right beside it: more would take away what holds the curve on the line there)
+    for (size_t k = 1; k + 1 < fit.size(); k++) if (fit[k].sharp || (fit[k].p.distanceTo(L.front()) > gap && fit[k].p.distanceTo(L.back()) > gap)) keep.push_back(fit[k]);
+    keep.push_back(fit.back());
+    if (g < 0) g = newGroup(sc, groupName);
+    Item& c = edit::makeUserCurve(sc, g); const int cid = c.id; std::vector<int> an;
+    for (size_t k = 0; k < keep.size(); k++) an.push_back(k == 0 ? anchorOf(ends[li][0]) : k + 1 == keep.size() ? anchorOf(ends[li][1]) : fitAnchor(sc, keep[k]));
+    sc.item(cid)->anchors = an; made.push_back(cid);
+  }
+  if (!made.empty()) { sc.item(g)->expanded = true; sc.reindex(); }
   return made;
 }
 
@@ -545,8 +582,6 @@ std::pair<int, int> buildLockCurves(Scene& sc, int g, LockRes res, std::map<QStr
 
 QString meshToCurves(Scene& sc, Selection& sel, int meshId, const M2C& opt) {
   Item* it = sc.item(meshId); if (!it || !it->poly) return QObject::tr("!Select an imported or a converted mesh");
-  int tris = 0; for (int f = 0; f < it->poly->faceCount(); f++) tris += it->poly->faceStart[size_t(f) + 1] - it->poly->faceStart[size_t(f)] - 2;
-  if (tris >= meshmods::heavyTris()) return QObject::tr("!%1: Over 300 000 triangles: no wireframe and not editable (it can be moved, rotated, scaled)").arg(it->name);
   auto Tp = topoOf(*it->poly); const Topo& T = *Tp; const auto& W = it->poly->pos;
   auto fn = faceNormals(T, *it->poly); auto comps = meshComponents(T);
   // points on the head (for "the root — the end nearest the head")

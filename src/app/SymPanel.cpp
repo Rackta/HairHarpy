@@ -45,9 +45,9 @@ void openSymPanel(Viewport* vp, QWidget* anchor, bool uv) {
 
   QLabel* offHint = nullptr;                                   // (Show Planes ticked, Symmetry off: why no plane is seen)
   auto hint = [&] { if (offHint) offHint->setVisible(!vp->tset.sym && vp->symo.planes); };
-  check(QObject::tr("Symmetry"), vp->tset.sym, QObject::tr("Shift+X — what is done to one side done mirrored to the other (each mirror / turn below)"), [vp, p](bool b) { vp->setSymmetry(b); if (auto* h = p->findChild<QLabel*>("symOffHint")) h->setVisible(!b && vp->symo.planes); });
+  check(QObject::tr("Symmetry"), vp->tset.sym, QObject::tr("Shift+S — what is done to one side done mirrored to the other (each mirror / turn below)"), [vp, p](bool b) { vp->setSymmetry(b); if (auto* h = p->findChild<QLabel*>("symOffHint")) h->setVisible(!b && vp->symo.planes); });
   check(QObject::tr("Show Planes"), S.planes, QObject::tr("The symmetry's planes (the radial axis) shown over the active object while Symmetry is on"), [vp, p](bool b) { vp->symo.planes = b; if (auto* h = p->findChild<QLabel*>("symOffHint")) h->setVisible(!vp->tset.sym && b); });
-  offHint = new QLabel(QObject::tr("Symmetry is off — the planes show once it is on (Shift+X)")); offHint->setObjectName("symOffHint"); offHint->setStyleSheet("color:#e0b060;font-size:11px"); g->addWidget(offHint, row++, 1); hint();
+  offHint = new QLabel(QObject::tr("Symmetry is off — the planes show once it is on (Shift+S)")); offHint->setObjectName("symOffHint"); offHint->setStyleSheet("color:#e0b060;font-size:11px"); g->addWidget(offHint, row++, 1); hint();
   { label(QObject::tr("Context"))->setToolTip(QObject::tr("Where the plane lies along its axis: Auto — at the space's origin when the object is symmetric about it, else through its middle; Origin — always at the origin; Box — through the middle of the object's box"));
     auto* cb = new QComboBox; cb->addItem(QObject::tr("Auto"), "auto"); cb->addItem(QObject::tr("Origin"), "origin"); cb->addItem(QObject::tr("Box"), "box");
     cb->setCurrentIndex(std::max(0, cb->findData(S.context))); cb->setToolTip(QObject::tr("Where the plane lies along its axis"));

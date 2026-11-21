@@ -1,4 +1,4 @@
-// Edits of the Hair room's curves and items, ported from the HTML version (Tools / State): deleting anchors (keep shape —
+﻿// Edits of the Hair room's curves and items, ported from the HTML version (Tools / State): deleting anchors (keep shape —
 // the neighbours' handles fitted to the old shape), recalculating handles, merging anchors at one place, unwelding an
 // anchor from the selected curves, deleting items, a new curve's look. Each works on the scene; the caller rebuilds the
 // geometry and commits.
@@ -42,7 +42,8 @@ struct Step { int c, from; };
 using Path = std::vector<Step>;
 std::vector<Path> pathsFor(Scene& sc, const CurveCache& samples, const std::vector<int>& sel, bool all = false);
 std::optional<std::vector<Path>> pathCover(Scene& sc, const CurveCache& samples, const std::vector<int>& sel, bool loose = false);
-std::vector<int> wallsAlongPaths(Scene& sc, const CurveCache& samples, const std::vector<Path>& paths, QString* msg);
+// (closeRing: the paths go round a tube — the last one lying by the first as the neighbours lie — the wall between them too)
+std::vector<int> wallsAlongPaths(Scene& sc, const CurveCache& samples, const std::vector<Path>& paths, QString* msg, bool closeRing = false);
 std::vector<Vec3> pathPts(const Scene& sc, const CurveCache& samples, const Path& p);
 QString fillCycle(Scene& sc, const CurveCache& samples, const std::vector<int>& P, const std::vector<int>& V, int parent, int* wall);
 QString fillHole(Scene& sc, const CurveCache& samples, const std::vector<int>& curves, int* wall);   // (msg)
@@ -56,7 +57,12 @@ bool segNetCurve(const Item& c);
 std::vector<int> lockCurves(const Scene& sc, const Selection& sel);
 // its strands: [root, tip, …the anchors between] — the paths through the forks lying on its curves; a lock splitting into
 // branches — its main branch only (dropped: how many strands of the others were left out)
-std::vector<std::vector<int>> lockEnds(Scene& sc, const CurveCache& samples, const std::vector<int>& cs, int* dropped = nullptr);
+std::vector<std::vector<int>> lockEnds(Scene& sc, const CurveCache& samples, const std::vector<int>& cs, int* dropped = nullptr, std::vector<std::vector<int>>* all = nullptr);
+// ✂ Scissors → Branches: the lock (the group) the item lies in, split by its branches — each branch other than the main one
+// (the tip most strands go to) into a group of its own beside it: the curves only its strands run along, the service curves
+// and walls between them; the trunk they share stays. A cocoon already made of the lock forgets the curves that left →
+// the message ("!…" — nothing done)
+QString splitLockBranches(Scene& sc, const CurveCache& samples, int item, Selection& sel);
 // a group's loop settings (groupConv): its own conv, the step and the missing keys filled from the project's — kept in
 // the group (g null: the project's alone)
 QJsonObject groupConv(Scene& sc, Item* g);

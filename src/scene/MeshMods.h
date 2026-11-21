@@ -28,18 +28,14 @@ Vec3 vsymWeld(const QJsonObject& vs, Vec3 local);
 // the shown geometry made again where its modifiers changed (sig: per mesh, what it was made from); weightsShown(mesh) —
 // the weights coloured (the modifier selected / its brush on) → the meshes remade
 std::vector<int> refresh(Scene& sc, std::map<int, QByteArray>& sig, const std::function<bool(int)>& weightsShown);
-int newMeshExtra(Scene& sc, int mesh, const QString& kind, QString* msg);   // xform / thick / mask (−1: none — a heavy mesh)
+int newMeshExtra(Scene& sc, int mesh, const QString& kind, QString* msg);   // xform / thick / mask (−1: none)
 int meshThick(Scene& sc, int mesh);                                  // its Thickness modifier, made when missing
 // the gizmo's change M (world) on top of the Transform it had (X0) → the Transform modifier's settings
 void setMeshMatrix(Scene& sc, int mesh, const Affine& W);
 // the polygons not shown: their polygroups hidden (hidGroups) or themselves (hidF — H on the selection); empty — none
+extern bool paintVis;                                               // (the Paint room is shown: its own hidden polygons — pHidF — instead of the Topology room's)
 std::vector<char> hiddenFaces(const Item& m, const PolyMesh& B);
 QByteArray hiddenSig(const Item& m);                                 // (what they depend on — for caches)
-bool heavy(const Item& m);                                           // over heavyTris() triangles: no wireframe, nothing painted
-bool heavy(const PolyMesh& m);
-long long heavyTris();                                               // (none now; HM_HEAVY_TRIS sets one)
-bool wireless(const Item& m);                                        // over wireTris(): no wireframe, no overlay of every edge / vertex
-long long wireTris();
 // the weight brush on a mesh: vertices facing the camera inside the brush; W — the weights painted (mask or hold)
 using ScreenFn = std::function<bool(const Vec3& p, double& d)>;      // → in front of the camera, d — px from the brush centre
 bool paintWeights(Scene& sc, int xmod, bool hold, const QString& op, double target, double lo, double amt, bool absMode,

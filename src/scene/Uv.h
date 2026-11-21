@@ -10,6 +10,7 @@
 #include <QString>
 #include <array>
 #include <functional>
+#include <map>
 #include <optional>
 #include <set>
 #include <vector>
@@ -45,18 +46,27 @@ std::vector<int> autoSeams(const PolyMesh& m, const topo::TTopo& T, const std::v
 // unfolded symmetric: its middle line straight up, its sides mirror images; pairs: a shell whose mirror is another shell
 // — either of them asked, both done: the one on +X unfolded, the other its mirror image across U = axis
 using Pins = std::set<std::pair<int, int>>;
+// a pinned edge is two vertices (a, b), whichever shell it is seen from, or, for a constraint of ONE shell (the other side of the seam is free), the pair
+// (-1 - f, e): the polygon f of that shell, the edge e
+inline bool pointPinned(const Pins& p, int v, int f) { return p.count({v, v}) > 0 || p.count({-1 - f, -1 - v}) > 0; }   // (a point pinned on every shell at the vertex / on the shell of polygon f)
+inline bool edgePinned(const Pins& p, int a, int b, int f, int e) { return p.count({a < b ? a : b, a < b ? b : a}) > 0 || p.count({-1 - f, e}) > 0; }
+// an alignment constraint (horizontal: its two ends one V; vertical: one U) — not a pin: the edge kept straight, the shell free to move and to
+// unfold round it. Kept as (-1 - f, kAlignH + e) / (-1 - f, kAlignV + e); 1 — horizontal, 2 — vertical, 0 — none
+constexpr int kAlignH = 1 << 28, kAlignV = 1 << 29;
+inline int edgeAligned(const Pins& p, int f, int e) { return p.count({-1 - f, kAlignH + e}) ? 1 : p.count({-1 - f, kAlignV + e}) ? 2 : 0; }
 struct SymUnfold { std::vector<int> mc; bool pairs = false; double axis = 0.5; };   // (mc: mirrorCorners)
-struct UnfoldResult { int done = 0, closed = 0, holes = 0, pinned = 0, symmetric = 0, mirrored = 0, asym = 0, featured = 0; std::vector<int> closedFaces, asymFaces; };   // (asym: across the plane, but its seams not symmetric — unfolded as it is)
+struct UnfoldResult { int mended = 0, untangled = 0; int done = 0, closed = 0, holes = 0, pinned = 0, symmetric = 0, mirrored = 0, asym = 0, featured = 0, collapsed = 0, asymPair = 0, blown = 0, selfSym = 0; std::vector<int> closedFaces, asymFaces, collapsedFaces; };   // (collapsed: laid flat into a line — a ring with no seam across it — left as it was)   // (asym: across the plane, but its seams not symmetric — unfolded as it is)
 struct PackOpts;
 // Face features (UvFace.cpp — lips, eyelids): two chains of mesh vertices between the same two corners, a — the upper,
 // b — the lower; their points face each other in UV: open — each pair on one vertical (U the same), the gap kept;
 // closed — each pair one point (the hole zipped: lids and lips laid as if shut). straight: the corners level (V the same)
-struct Feature { std::vector<int> a, b; bool closed = false, straight = true; };
+struct Feature { std::vector<int> a, b; bool closed = false, straight = true; double gap = 0; };   // (gap: a closed one left with a slit — the lower rim moved down by this part of the rim's length)
 // the holes of the shells (cut along the seams) holding any of `faces` (empty — all): each inner border split at its two
 // points farthest apart (the corners); the chain higher in 3D the upper
 std::vector<Feature> detectFeatures(const PolyMesh& m, const topo::TTopo& T, const std::vector<int>& faces);
 // from edges: one closed loop (the upper chain and the lower between the same corners), split at its corners
 std::optional<Feature> featureFromEdges(const PolyMesh& m, const topo::TTopo& T, const std::vector<int>& edges);
+std::vector<Feature> featuresFromEdges(const PolyMesh& m, const topo::TTopo& T, const std::vector<int>& edges);   // (each closed loop of the edges — both eyes, the lips — a feature)
 std::optional<Feature> mirrorFeature(const Feature& f, const std::vector<int>& vpair);   // (by topo::symPairs)
 // the ties a shell's local vertices get from the features (vloc: mesh vertex → local, −1 none / more than one):
 // (lower, upper, both u and v) pairs and the corner pairs to level
@@ -68,6 +78,7 @@ UnfoldResult unfold(PolyMesh& m, const topo::TTopo& T, const std::vector<int>& f
 // the symmetry: each corner's mirror corner — the corner at the vertex's mirror (topo::symPairs) in the mirrored polygon
 // (a polygon lying across the plane: in itself); −1 none
 std::vector<int> mirrorCorners(const PolyMesh& m, const topo::TTopo& T);
+double selfSymError(const PolyMesh& m, const topo::TTopo& T, const std::vector<int>& shellFaces);   // a shell symmetric in itself: how far its UV is from symmetric (RMS, to its size); −1 — not symmetric in 3D
 std::vector<int> mirrorEdges(const PolyMesh& m, const topo::TTopo& T);   // each edge's mirror edge (−1)
 // Symmetrize: the UV of the corners `from` put on their mirror corners, mirrored across U = axis — in a shell lying across
 // the plane across its own middle (where its pairs meet now); corners on the plane put on that middle → the corners set
@@ -83,18 +94,21 @@ int optimize(PolyMesh& m, const topo::TTopo& T, const std::vector<int>& faces, c
 // rest wherever they fit
 // a shell's own settings (per polygon — all of a shell's alike): locked — never moved (Pack: in the way); noTurn — Pack
 // doesn't turn it; scale — its size against the rest (texel density × scale); group — Pack lays a group's shells together
-struct ShellAttr { bool lock = false, noTurn = false; double scale = 1; int group = 0; };
-struct PackOpts { int w = 2048, h = 2048; double pad = 8; bool rotate = true; const std::vector<int>* mc = nullptr; double axis = 0.5; const std::vector<ShellAttr>* attr = nullptr; bool stacks = true; };   // (stacks: alike shells one on another packed as one)
+struct ShellAttr { bool lock = false, noTurn = false, sym = false, ovl = false, level = false;   /* (level: holds h / v constraints — turned by 90° steps at most) */ double scale = 1; int group = 0; int turn = 0; int stack = 0; };   /* (stack: an Overlap stack — its shells lie on each other, Pack moves them as one; apart from the pack group, which may hold stacks) */   /* (ovl: the group is an overlap — its shells lie on each other as they are, Pack moves them as one) */   // (turn: Pack's own mode for the shell — 0 by the global Turn, 1 keep as it lies, 2 only by 90°, 3 only by 180°)
+struct PackOpts { int w = 2048, h = 2048; double pad = 8; bool rotate = true; bool freeTurn = false; const std::map<int, double>* gpad = nullptr; bool equalize = false;   /* (gpad: a pack group's own padding inside its block, px — so its gaps come out at the padding after the block is scaled) */   /* (freeTurn: slanted turns too — 45° steps; off: 90° only) */   /* (equalize: every shell scaled to the same texel density before it is packed — else the shells keep their sizes against each other) */ const std::vector<int>* mc = nullptr; double axis = 0.5; const std::vector<ShellAttr>* attr = nullptr; bool stacks = true; int passes = 1; bool final = false; double keepDensity = 0; bool symAll = true; std::map<int, double>* gpadOut = nullptr; double margin = 0; };   /* (margin: the part of the tile left free along each edge — the pack goes into the frame inside it) */   /* (gpadOut: only the groups' inner paddings wanted — the pack's own result not used) */   /* (symAll: with mc — every shell packed with its mirror; off — only those tagged "Pack symmetrically") */   // (keepDensity: below 0 — the shells packed at the size they lie, smaller only when they do not fit; above — the shells packed at this texel density (texture-space UV area to 3D area) — the room among the locked ones — a smaller one only when they do not fit; 0 — as big as the tile takes) (final: the Final pack — several ways of placing tried (the place rule, the order, upright only), the best one's scale then refined on a grid as fine as the texture: slower, tighter. It never turns a shell more than Quick may)   // (stacks: alike shells one on another packed as one; passes: 1 — one try; more — the orders and the finer search tried too, the best kept: slower, tighter)
 struct PackResult { double fill = 0, scale = 0, axis = 0.5; int shells = 0, centred = 0, offAxis = 0, pairs = 0, split = 0, free = 0, locked = 0, stacked = 0; bool ok = false; };   // (offAxis: across the plane, but no room on the axis — upright elsewhere; split: a pair too wide for its side — both anywhere)
 PackResult packShapes(PolyMesh& m, const topo::TTopo& T, const std::vector<int>& faces, const PackOpts& o);
+int mendSelfOverlap(PolyMesh& m, const topo::TTopo& T, const std::vector<int>& faces, const PackOpts* po = nullptr);   // shells that fold over themselves after an Unfold unbent step by step (Straighten 35 / 65 / 100%) until nothing lies on itself; how many were mended
+int healTears(PolyMesh& m, const topo::TTopo& T, const std::vector<int>& faces);   // the UV torn where no seam is (a part of a shell dragged off): each torn-off piece set back onto the biggest piece of its shell along the tear, its inside relaxed; faces: those worked on (empty — all); how many pieces set back
+int nudgeOffOthers(PolyMesh& m, const topo::TTopo& T, const std::vector<std::vector<int>>& shells);   // shells that came to lie on other shells moved sideways by the least that takes them off
 // ---- lining up (UvAlign.cpp; po: the texture — worked on texel-square in it) ----
 // Grid: the quads of the shells holding any of `faces` laid as a grid — across each quad strip level (V the same), along
 // it upright (U the same), as LSCM then SLIM find the lengths; each where it lay, its size kept → the shells done
 int rectify(PolyMesh& m, const topo::TTopo& T, const std::vector<int>& faces, const PackOpts* po = nullptr);
 // Straighten: a chain of edges — its points on the line from its first end to its last, spaced as the 3D lengths → points
-int straightenChain(PolyMesh& m, const topo::TTopo& T, const std::vector<int>& edges, const PackOpts* po = nullptr);
+int straightenChain(PolyMesh& m, const topo::TTopo& T, const std::vector<int>& edges, const PackOpts* po = nullptr, int sideFace = -1);   // (sideFace: a polygon of the shell to work on — else the first edge's first)
 // Orient: the shell of the edge turned so the edge lies level or upright (the nearer) → the angle turned (degrees)
-double orientByEdge(PolyMesh& m, const topo::TTopo& T, int edge, const PackOpts* po = nullptr);
+double orientByEdge(PolyMesh& m, const topo::TTopo& T, int edge, const PackOpts* po = nullptr, int sideFace = -1);
 // Upright: the shells holding any of `faces` turned so the 3D up runs up their V → the shells turned
 int orientUpright(PolyMesh& m, const topo::TTopo& T, const std::vector<int>& faces, const PackOpts* po = nullptr);
 // Stack: the shells holding any of `faces` laid over the shell of `refFace` (scaled to its size, turned / mirrored to fit
@@ -126,7 +140,8 @@ double pack(PolyMesh& m, const topo::TTopo& T, const std::vector<int>& faces, do
 int straighten(PolyMesh& m, const topo::TTopo& T, const std::vector<int>& faces, double amount, bool upright);
 // Rectangle (hair strands): each shell holding any of `faces` (empty — all) laid out as a strip — along its middle line
 // (V) and across it, the width made one all along (U); a fork's arm sticks out → the shells done
-int rectangle(PolyMesh& m, const topo::TTopo& T, const std::vector<int>& faces);
+enum { RectGrid = 0, RectRelax = 1 };   // (Rectangle: an even lattice — a plane subdivided; or the border straight, the inside relaxed)
+int rectangle(PolyMesh& m, const topo::TTopo& T, const std::vector<int>& faces, int mode = RectRelax);
 
 // the UV points of these corners and those welded to them (a corner moved — its point moves)
 std::vector<int> pointCorners(const Points& P, const std::vector<int>& corners);
@@ -135,8 +150,13 @@ void transform(PolyMesh& m, const std::vector<int>& corners, const std::function
 std::array<double, 4> box(const PolyMesh& m, const std::vector<int>& corners);   // u0, v0, u1, v1
 // the polygons turned over (their UV wound against the most of their shell's area)
 std::vector<int> flipped(const PolyMesh& m, const topo::TTopo& T, const Shells& S);
+std::vector<char> windingFlips(const topo::TTopo& T, const std::function<bool(int)>& joined);   // (faces wound against their neighbours: a ribbon turned over halfway — 1 for the second kind)
 double faceArea(const PolyMesh& m, int f);                   // signed, in UV
 double faceArea3(const PolyMesh& m, int f);                  // in 3D
+// how full the 0…1 tile is: the part of it under the polygons (hidden[f] — left out), each place counted once — shells lying on
+// each other and what lies off the tile add nothing (the sum of the areas said 98% of a tile a quarter empty, 2026-11-12)
+struct Covered { const PolyMesh* m = nullptr; std::vector<char> hidden; };
+double tileCoverage(const std::vector<Covered>& ms, int n = 1024);
 // how much of the 0…1 tile the UV covers (the polygons' areas, overlaps counted twice)
 double coverage(const PolyMesh& m);
 

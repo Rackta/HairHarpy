@@ -5,6 +5,8 @@
 #pragma once
 #include "core/Math.h"
 #include <QJsonArray>
+#include <QColor>
+#include <QImage>
 #include <QJsonObject>
 #include <QString>
 #include <array>
@@ -37,10 +39,20 @@ struct RefPlane {
   Vec3 pos; Quat quat; Vec3 scl{1, 1, 1};
   // an ortho plane: its place in the camera's frame (loc); 📌 locked to the model — the frame turns at a fixed point
   bool hasLoc = false; M4 loc = m4Identity();
+  int canvas = -1;                   // the canvas (a smart object in Scene::refSketches) it shows; several planes may share one (-1 — none)
+  bool sheet = false;                // a screen-sized canvas sheet: no grey placeholder, Opacity applies to its drawing (older planes: an image with a drawing over it)
   QJsonValue lock;                   // { anchor [x,y,z], view { pos, quat, zoom, pivot } } or null
   bool follows() const { return view == "ortho"; }
   M4 matrix() const { return m4Compose(pos, quat, scl); }
 };
+
+// a canvas, a smart object of the project (the ✏ canvas — the Paint room's layers and brushes): every plane bound to it shows it, a change reaches them all; kept in the project, NOT in the undo
+// history (the canvas has its own Ctrl+Z); data — the layer document with its pixels (Document::packJson), flat — the
+// composed picture the viewport shows over the plane's image, rev — changed with every stroke
+struct RefSketch { QJsonObject data; QImage flat; qint64 rev = 0; QString name; };
+// a marker: a point in the world seen on every view — each reference canvas (projected onto its plane, with a guide line at its
+// height) and every pane of the viewport; put and moved on a canvas (only the canvas's two directions change, its depth stays)
+struct RefMarker { int id = 0; Vec3 pos; QColor color; };
 
 namespace refs {
 
@@ -60,7 +72,17 @@ Vec3 pivotWorld(const RefPlane& rp);
 // shown by this camera: visible, and — "only in its view" — the camera in that view; the free Orthographic camera turned to
 // that view (within some 8°) shows the side views' planes too
 bool shownIn(const RefPlane& rp, const Camera& cam);
-RefPlane copyTo(const RefPlane& src, const QString& view, const Scene& sc, const Camera& cam, int newId, const QString& name);
+RefPlane copyTo(const RefPlane& src, const QString& view, const Scene& sc, const Camera& cam, int newId, const QString& name);   // (the same canvas: shared; copyCanvas makes it a separate one)
+// canvases: a new one (W×H px, one clear layer), an independent copy of one (all its layers), how many planes show one
+int newCanvas(Scene& sc, int W, int H, const QString& name);
+int copyCanvas(Scene& sc, int id);
+int canvasUsers(const Scene& sc, int id);
+// a sheet in its view at the camera's middle, one canvas pixel to one pixel of the screen at this zoom
+void placeSheet(RefPlane& rp, const Scene& sc, const Camera& cam, int W, int H);
+
+QColor markerColor(int n);            // the n-th marker's colour (a set of 8 that stand apart)
+QJsonObject markerJson(const RefMarker& m);
+RefMarker markerFromJson(const QJsonObject& o, int id);
 
 RefPlane fromJson(const QJsonObject& o, int id);
 QJsonObject toJson(const RefPlane& rp);

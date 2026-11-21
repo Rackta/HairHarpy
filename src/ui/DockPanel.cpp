@@ -17,7 +17,7 @@ namespace hm::ui {
 
 DockPanel::DockPanel(const QString& title, DockColumn* column, bool collapsible, bool pin, bool grow)
     : QFrame(column), column_(column), grow_(grow) {
-  setObjectName("dpanel");
+  setObjectName("dpanel"); setProperty("dpTitle", title);   // (dpTitle: the panel's name for the session's record — which panel a click fell on)
   setStyleSheet("#dpanel{background:#262626;border-bottom:1px solid #3a3a3a}"
                 "#dpanel[float=\"true\"]{border:1px solid #555;border-radius:6px}"
                 "#dhead{background:#2b2b2b;border-bottom:1px solid #3a3a3a}");
@@ -63,6 +63,7 @@ void DockPanel::setBody(QWidget* w) {
   scroll_->setWidget(w); body_ = w;
   if (keepY > 0) { scroll_->verticalScrollBar()->setValue(keepY); QTimer::singleShot(0, scroll_, [s = QPointer<QScrollArea>(scroll_), keepY] { if (s) s->verticalScrollBar()->setValue(keepY); }); }
   foldHelp();
+  QTimer::singleShot(0, column_, [c = QPointer<DockColumn>(column_)] { if (c) c->relayout(); });   // (the help paragraphs folded: the panel's height made anew — not left as it was)
 }
 
 // the grey paragraphs of 90+ characters (no colour of their own, no children) leave the window — under the ?
@@ -90,12 +91,12 @@ void DockPanel::showHelp(bool on) {
   pop->move(x, y); pop->show(); pop->raise();
 }
 
-void DockPanel::setTitle(const QString& t) { title_->setText(t); }
+void DockPanel::setTitle(const QString& t) { title_->setText(t); setProperty("dpTitle", t); }
 
 // (docked, not growing: as tall as its content, up to 30 % of the column — the rest scrolls)
 QSize DockPanel::sizeHint() const {
   int h = head_->height() + 2;
-  if (!collapsed_ && body_) h += std::min(body_->sizeHint().height(), int(column_->height() * 0.3));
+  if (!collapsed_ && body_) h += std::min(body_->sizeHint().height(), int(column_->height() * 0.5));
   return QSize(QFrame::sizeHint().width(), h);
 }
 

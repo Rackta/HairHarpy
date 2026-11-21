@@ -1,3 +1,4 @@
+#include "ui/Keymap.h"
 #include "app/RefBoard.h"
 #include "app/RefPanels.h"
 #include "scene/Scene.h"
@@ -54,14 +55,15 @@ struct RefBoard::Impl {
       i.l = c.value("l").toDouble(); i.t = c.value("t").toDouble(); i.r = c.value("r").toDouble(); i.b = c.value("b").toDouble(); items.push_back(i); }
     QJsonObject pn = B.value("pan").toObject(); panX = pn.value("x").toDouble(); panY = pn.value("y").toDouble(); zoom = B.value("zoom").toDouble(1);
     uid = 1; for (auto& i : items) uid = std::max(uid, i.id + 1);
+    open = B.value("open").toBool(false); locked = B.value("locked").toBool(false);   // (whether the board is shown, and locked, belongs to the project too: a new project starts with it closed)
   }
   void store() {
     QJsonArray a; for (auto& i : items) a.append(QJsonObject{{"id", i.id}, {"src", i.src}, {"w", i.w}, {"h", i.h}, {"x", i.x}, {"y", i.y}, {"s", i.s}, {"rot", i.rot}, {"op", i.op}, {"flip", i.flip},
                                                            {"crop", QJsonObject{{"l", i.l}, {"t", i.t}, {"r", i.r}, {"b", i.b}}}});
-    sc->refBoard = QJsonObject{{"items", a}, {"pan", QJsonObject{{"x", panX}, {"y", panY}}}, {"zoom", zoom}};
+    sc->refBoard = QJsonObject{{"items", a}, {"pan", QJsonObject{{"x", panX}, {"y", panY}}}, {"zoom", zoom}, {"open", open}, {"locked", locked}};
     if (changed) changed();
   }
-  void saveWin() const { QSettings st; st.setValue("board/x", bx); st.setValue("board/y", by); st.setValue("board/w", bw); st.setValue("board/h", bh); st.setValue("board/op", op); st.setValue("board/locked", locked); st.setValue("board/open", open); }
+  void saveWin() const { QSettings st; st.setValue("board/x", bx); st.setValue("board/y", by); st.setValue("board/w", bw); st.setValue("board/h", bh); st.setValue("board/op", op); }   // (the window's place, size and see-through are the program's; open / locked are the project's — see store())
   const QPixmap& pixmap(const BItem& i) { auto it = pix.find(i.id); if (it == pix.end()) it = pix.emplace(i.id, pixOf(i.src)).first; return it->second; }
   // the item under a point of the window (the topmost)
   int itemAt(const QPointF& p) {
@@ -88,7 +90,7 @@ RefBoard::RefBoard(QWidget* host, Scene* sc, std::function<void()> changed)
     : QWidget(host->window(), Qt::Tool | Qt::FramelessWindowHint | Qt::NoDropShadowWindowHint), d(new Impl{host, sc, std::move(changed)}) {
   setAttribute(Qt::WA_TranslucentBackground); setAcceptDrops(true); setMouseTracking(true); setFocusPolicy(Qt::StrongFocus); setMinimumSize(200, 150);
   QSettings st; d->bx = st.value("board/x", 60).toInt(); d->by = st.value("board/y", 50).toInt(); d->bw = st.value("board/w", 380).toInt(); d->bh = st.value("board/h", 300).toInt();
-  d->op = st.value("board/op", 1.0).toDouble(); d->locked = st.value("board/locked", false).toBool(); d->open = st.value("board/open", false).toBool();
+  d->op = st.value("board/op", 1.0).toDouble();
   d->lockBtn = new QPushButton("🔒", host->window()); d->lockBtn->setWindowFlags(Qt::Tool | Qt::FramelessWindowHint | Qt::NoDropShadowWindowHint); d->lockBtn->setFixedSize(22, 20);
   d->lockBtn->setToolTip(tr("Locked — the window lets the mouse through. Double-click to unlock"));
   QObject::connect(d->lockBtn, &QPushButton::clicked, this, [] {});
@@ -99,6 +101,8 @@ RefBoard::RefBoard(QWidget* host, Scene* sc, std::function<void()> changed)
   d->follow = new QTimer(this); d->follow->setInterval(50);
   QObject::connect(d->follow, &QTimer::timeout, this, [this] {
     QWidget* w = d->host->window(); bool want = d->open && d->host->isVisible() && w->isVisible() && !w->isMinimized();
+    if (QWidget* mw = QApplication::activeModalWidget()) { bool own = false; for (QWidget* p = mw; p; p = p->parentWidget()) own |= p == this; if (!own) want = false; }   // (a modal window up — the reference canvas: the board stays hidden under it; its own file dialog keeps it)
+    if (want) for (QWidget* tw : QApplication::topLevelWidgets()) if (tw->objectName() == "fwin" && tw->isVisible()) { want = false; break; }   // (the start / File window is up: no board, and no 🔒 of it, over it)
     if (!want) { if (isVisible()) hide(); d->lockBtn->hide(); return; }
     QRect hr(d->host->mapToGlobal(QPoint(0, 0)), d->host->size());
     if (hr.width() > 100 && hr.height() > 100) { d->bw = std::clamp(d->bw, 200, hr.width()); d->bh = std::clamp(d->bh, 150, hr.height()); d->bx = std::clamp(d->bx, 0, hr.width() - 80); d->by = std::clamp(d->by, 0, hr.height() - 24); }
@@ -115,14 +119,14 @@ RefBoard::RefBoard(QWidget* host, Scene* sc, std::function<void()> changed)
 
 bool RefBoard::isOpen() const { return d->open; }
 bool RefBoard::isLocked() const { return d->locked; }
-void RefBoard::showBoard(bool on) { d->open = on; d->saveWin(); if (!on) hide(); update(); }
+void RefBoard::showBoard(bool on) { if (d->open != on) { d->open = on; d->store(); } if (!on) hide(); update(); }
 void RefBoard::setLocked(bool on) {
-  d->locked = on; d->saveWin();
+  if (d->locked != on) { d->locked = on; d->store(); }
   bool vis = isVisible(); setWindowFlag(Qt::WindowTransparentForInput, on); if (vis) show();
   if (on) ui::toast(tr("Board locked — the mouse goes through it. Double-click 🔒 to unlock"));
   update();
 }
-void RefBoard::reload() { d->load(); update(); }
+void RefBoard::reload() { d->load(); const bool vis = isVisible(); setWindowFlag(Qt::WindowTransparentForInput, d->locked); if (vis) show(); if (!d->open) hide(); update(); }   // (another project: its own board, open or shut, locked or not)
 
 void RefBoard::addFiles(const QStringList& files, const QPointF* at) {
   QRectF B = d->body(this); double z = d->zoom;
@@ -264,7 +268,7 @@ void RefBoard::wheelEvent(QWheelEvent* e) {
   if ((e->modifiers() & Qt::AltModifier) && it) { it->op = std::clamp(it->op - (dy > 0 ? 1 : -1) * 0.05, 0.05, 1.0); d->store(); update(); return; }
   QPointF m = e->position() - QPointF(0, HEAD); double z = d->zoom, z2 = std::clamp(z * std::pow(1.0015, -dy), 0.02, 20.0);
   d->panX = m.x() - (m.x() - d->panX) / z * z2; d->panY = m.y() - (m.y() - d->panY) / z * z2; d->zoom = z2;
-  update();
+  d->store(); update();   // (the zoom kept with the project, as a drag's pan)
 }
 void RefBoard::keyPressEvent(QKeyEvent* e) {
   if (d->locked) return;
@@ -275,7 +279,7 @@ void RefBoard::keyPressEvent(QKeyEvent* e) {
     return;
   }
   if (e->modifiers() & (Qt::ControlModifier | Qt::AltModifier)) return;
-  int k = e->key(); BItem* it = d->selItem();
+  int k = ui::Keymap::latinKey(e); BItem* it = d->selItem();
   if (k == Qt::Key_F) {                                         // fit all
     if (d->items.empty()) return;
     double x0 = 1e300, y0 = 1e300, x1 = -1e300, y1 = -1e300;

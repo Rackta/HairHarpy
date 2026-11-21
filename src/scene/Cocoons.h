@@ -1,4 +1,4 @@
-// ◍ Cocoons (item 'cocoon'), ported from the HTML version: a see-through shell of a lock's shape (k.shape — per station
+﻿// ◍ Cocoons (item 'cocoon'), ported from the HTML version: a see-through shell of a lock's shape (k.shape — per station
 // along it: c the spine point, u the oval's long axis, a / b its radii) with rings where the loops will be. A live
 // cocoon (k.live — the strands as root / tip anchor pairs) is reshaped from its strands' curves as they are now
 // (cocoonLivePolys → cocoonShape). Rings (cocoonRings): the loop step and Deviation of its lock's group — closer on bends
@@ -59,10 +59,10 @@ struct LockInput {
 // every cocoon (live ones reshaped first); walls: buildWalls(…, includeHidden = true) — the rings cut every wall
 // a cocoon's station at arc length s (cocoonF), a point of its shell (cocoonPt); CMASK_N — a mask's weights along it
 double cocoonStation(const CocoonGeo& G, double s);
+double coilTurns(const std::vector<Vec3>& polyline);   // how many turns it winds one way (a wavy line: about none)
 Vec3 cocoonPoint(const CocoonGeo& G, int i, double th);
 constexpr int CMASK_N = 64;
 
-std::vector<CocoonResult> buildCocoons(const Scene& sc, const CurveCache& cc, const std::vector<WallMesh>& walls);
 
 // The cocoons kept between edits (their reshaped shapes, rings, strands): reads the scene, the curve samples and the
 // walls by reference — they must outlive it and be updated in place
@@ -78,7 +78,7 @@ public:
   bool liveState(int id, QJsonObject& shape, QJsonArray& ends) const;
   // Convert to geometry
   bool lockInput(int id, LockInput& out);
-  std::vector<int> deps(int id);                                // the cocoons it takes loops from: its parent first, its links
+  std::vector<int> deps(int id);                                // the cocoons it takes loops from: its parent first (it rules inside it), then its links
   bool dependsOn(int a, int b);                                 // a takes loops from b, any steps away
   int lockGroup(int id);                                        // its lock's group (-1: none)
   double loopStep(int id);                                      // cocoonConv(k).step || defaultStep()

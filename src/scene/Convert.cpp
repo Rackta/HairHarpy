@@ -4,6 +4,9 @@
 #include "scene/TopoEdit.h"
 #include <QJsonArray>
 #include <QJsonObject>
+#include <QStringList>
+#include <QtGlobal>
+#include <cstdio>
 #include <QRegularExpression>
 #include <algorithm>
 #include <array>
@@ -166,7 +169,7 @@ double sceneScale(const Scene& sc) {
 }
 
 // ======================= ringMeshOf: a lock's mesh from its cocoon's rings =======================
-LockMesh ringMeshOf(const LockInput& in, const std::map<int, WallMesh>& wallOf, const WeldSettings& weld, double scale) {
+static LockMesh ringMeshOfX(const LockInput& in, const std::map<int, WallMesh>& wallOf, const WeldSettings& weld, double scale, const std::set<int>* relaxSet) {
   LockMesh res; const CocoonGeo& G = in.G; const double h = in.h; const auto& rings = in.rings; const auto& tipP = in.tipP;
   res.ringList = rings;
   // the walls and their twins (wallsOf), each a grid of its wall's mesh; a twin runs back from b to a
@@ -180,7 +183,7 @@ LockMesh ringMeshOf(const LockInput& in, const std::map<int, WallMesh>& wallOf, 
   if (walls.empty()) { res.err = "no walls"; return res; }
 
   // the columns: { key, P (root → tip), A (arc) }; a curve's column once (key 'c' + its id)
-  struct Col { std::string key; std::vector<Vec3> P; std::vector<double> A; };
+  struct Col { std::string key; std::vector<Vec3> P; std::vector<double> A, V; };   // (V: each point's cross-section along the lock, when the wall knows it)
   std::vector<Col> cols; std::unordered_map<std::string, int> colIx;
   std::vector<std::vector<int>> wallCols;
   auto minTip = [&](const Vec3& p) { double m = INF; for (auto& t : tipP) m = std::min(m, t.distanceTo(p)); return m; };
@@ -206,23 +209,59 @@ LockMesh ringMeshOf(const LockInput& in, const std::map<int, WallMesh>& wallOf, 
                                 : "w" + std::to_string(wr.id) + (wr.twin ? "t" : "") + ":" + std::to_string(j);
       auto f = colIx.find(key); if (f != colIx.end()) { keys.push_back(f->second); continue; }
       Col c; c.key = key;
-      for (int r = R0_; r < NR; r++) c.P.push_back(d[r * M + j]);
-      if (nearestF(G.c, c.P.front()) > nearestF(G.c, c.P.back())) std::reverse(c.P.begin(), c.P.end());   // (root first)
+      for (int r = R0_; r < NR; r++) { c.P.push_back(d[r * M + j]); if (int(g.rowV.size()) == g.R) c.V.push_back(g.rowV[size_t(r)]); }
+      if (nearestF(G.c, c.P.front()) > nearestF(G.c, c.P.back())) { std::reverse(c.P.begin(), c.P.end()); std::reverse(c.V.begin(), c.V.end()); for (double& x : c.V) x = 1 - x; }   // (root first)
       c.A.push_back(0); for (size_t i = 1; i < c.P.size(); i++) c.A.push_back(c.A[i - 1] + c.P[i].distanceTo(c.P[i - 1]));
       colIx[key] = int(cols.size()); keys.push_back(int(cols.size())); cols.push_back(std::move(c));
     }
     wallCols.push_back(keys);
   }
   if (wallCols.empty()) { res.err = "no walls built"; return res; }
+  // (the lock's tip: the point where most of its curves end. A column ending a little short of it — under 0.6 of a loop
+  // step — is carried on to it: else the tip's fan closes it on a point of its own, the tip split in two with a notch)
+  { std::vector<Vec3> ends; for (auto& c : cols) if (c.key[0] == 'c' && !c.P.empty()) ends.push_back(c.P.back());
+    Vec3 tipPt; int best = 0;
+    for (const Vec3& e : ends) { int k = 0; for (const Vec3& f : ends) if (e.distanceTo(f) < 1e-3 * h) k++; if (k > best) { best = k; tipPt = e; } }
+    if (best >= 2) for (auto& c : cols) {
+      if (c.P.empty()) continue; const double dd = c.P.back().distanceTo(tipPt);
+      if (dd < 1e-3 * h || dd > 0.6 * h) continue;
+      // (only a curve ending alone — no other curve's end there (a few ending together: a fork of the tip, left as it is)
+      // — and going on toward the tip: its last stretch pointing there)
+      int with = 0; for (const Vec3& e : ends) if (e.distanceTo(c.P.back()) < 1e-3 * h) with++;
+      if (c.key[0] == 'c' && with > 1) continue;
+      double cosT = 1; if (c.P.size() >= 2) { Vec3 a = c.P.back() - c.P[c.P.size() - 2]; for (size_t q = c.P.size() - 2; q > 0 && a.length() < 0.2 * h; q--) a = c.P.back() - c.P[q - 1];
+        const Vec3 b = tipPt - c.P.back(); if (a.length() > 1e-9 && b.length() > 1e-9) cosT = a.normalized().dot(b.normalized()); }
+      if (qEnvironmentVariableIsSet("HM_CONVDBG3")) if (FILE* df = std::fopen(qPrintable(qEnvironmentVariable("HM_CONVDBG3")), "a")) { std::fprintf(df, "extend %s by %.1f from (%.1f %.1f %.1f) to tip (%.1f %.1f %.1f) [%d at tip] cos %.2f\n", c.key.c_str(), dd, c.P.back().x, c.P.back().y, c.P.back().z, tipPt.x, tipPt.y, tipPt.z, best, cosT); std::fclose(df); }
+      if (cosT < 0.7) continue;
+      c.P.push_back(tipPt); c.A.push_back(c.A.back() + dd); if (!c.V.empty()) c.V.push_back(c.V.back());
+    } }
   const int nC = int(cols.size()), nR = int(rings.size());
+  if (qEnvironmentVariableIsSet("HM_CONVDBG3")) if (FILE* df = std::fopen(qPrintable(qEnvironmentVariable("HM_CONVDBG3")), "a")) {   // (a check: the columns' ends)
+    std::fprintf(df, "lock: %d columns, %d rings, tip (%.1f %.1f %.1f)\n", nC, nR, G.c.back().x, G.c.back().y, G.c.back().z);
+    for (auto& c : cols) if (c.key[0] == 'c') std::fprintf(df, "  %s len %.1f end (%.1f %.1f %.1f)\n", c.key.c_str(), c.A.back(), c.P.back().x, c.P.back().y, c.P.back().z);
+    for (int r = std::max(0, nR - 5); r < nR; r++) std::fprintf(df, "  ring %d s %.1f p (%.1f %.1f %.1f)\n", r, rings[size_t(r)].s, rings[size_t(r)].p.x, rings[size_t(r)].p.y, rings[size_t(r)].p.z);
+    std::fclose(df); }
 
   // where a ring's plane crosses a column, near the ring: its length along the column (none — it doesn't)
-  auto cross = [&](const Col& c, const CocoonRing& R, double lim) -> std::optional<double> {
+  // (a lock wound into a coil: only on the turn the ring is on — the next turn's band may lie nearer the ring than this one's own edge)
+  const double turnsN = coilTurns(G.c), coilHw = turnsN >= 2 ? 0.45 / turnsN : 2.0;
+  std::map<const void*, std::vector<double>> colV;   // (each column's points: how far along by the turns, as the cocoon's stations are)
+  auto vOf = [&](const std::vector<Vec3>& Q) -> const std::vector<double>& { auto& o = colV[&Q]; if (!o.empty()) return o; std::vector<double> a{0}, l{0}; Vec3 p; bool have = false; for (size_t i = 1; i < Q.size(); i++) { const Vec3 d = Q[i] - Q[i - 1]; const double n = d.length(); double da = 0; if (n > 1e-12) { const Vec3 u = d * (1 / n); if (have) da = std::acos(clamp(p.dot(u), -1, 1)); p = u; have = true; } a.push_back(a.back() + da); l.push_back(l.back() + n); } const double A = a.back() > 1e-9 ? a.back() : 1, L = l.back() > 1e-12 ? l.back() : 1; for (size_t i = 0; i < a.size(); i++) o.push_back(0.85 * a[i] / A + 0.15 * l[i] / L); return o; };
+  // (relax — beyond lim (the cocoon narrower there than the lock's curves are apart) a crossing still counts up to 3 lim
+  // when it lies where the ring is along the curve too: as far along it as the ring is along the cocoon, within a loop
+  // step. Taken only for a ring whose walls close round the lock that way and not without it — see crossAt)
+  double Lg = 0; for (int i = 1; i < G.N; i++) Lg += G.c[size_t(i)].distanceTo(G.c[size_t(i - 1)]); if (!(Lg > 0)) Lg = 1;
+  auto cross = [&](const Col& c, const CocoonRing& R, double lim, bool relax) -> std::optional<double> {
     Vec3 PP = R.pp ? *R.pp : R.p, PN = R.pn ? *R.pn : R.n; std::optional<double> best; double bd = INF;
+    const double fR = cocoonF(G, R.s) / std::max(G.N - 1, 1);
+    const double uExp = R.s * c.A.back() / Lg, tolU = std::max(h, 0.1 * c.A.back());
     for (size_t i = 0; i + 1 < c.P.size(); i++) {
+      if (coilHw < 1 && std::abs((c.V.empty() ? vOf(c.P)[i] : c.V[i]) - fR) > coilHw) continue;
       double d0 = (c.P[i] - PP).dot(PN), d1 = (c.P[i + 1] - PP).dot(PN); if (d0 == d1 || d0 * d1 > 0) continue;
-      double f = d0 / (d0 - d1); double dd = c.P[i].lerp(c.P[i + 1], f).distanceTo(R.p); if (dd > lim || dd >= bd) continue;
-      bd = dd; best = c.A[i] + (c.A[i + 1] - c.A[i]) * f;
+      double f = d0 / (d0 - d1); double dd = c.P[i].lerp(c.P[i + 1], f).distanceTo(R.p); if (dd >= bd) continue;
+      const double at = c.A[i] + (c.A[i + 1] - c.A[i]) * f;
+      if (dd > lim && !(relax && dd < 3 * lim && std::abs(at - uExp) < tolU)) continue;
+      bd = dd; best = at;
     }
     return best;
   };
@@ -230,11 +269,14 @@ LockMesh ringMeshOf(const LockInput& in, const std::map<int, WallMesh>& wallOf, 
   std::vector<double> lims(nR);
   for (int r = 0; r < nR; r++) { const CocoonRing& R = rings[r]; int i = clampi(int(jsRound(cocoonF(G, R.s))), 0, G.N - 1); lims[r] = R.lim ? *R.lim : std::max(2.5 * std::max({G.a[i], G.b[i], 1e-3}), 0.5 * h); }
   std::vector<signed char> xcSet(size_t(nC) * nR, 0); std::vector<double> xcVal(size_t(nC) * nR, 0);
-  auto crossAt = [&](int ci, int ri) -> std::optional<double> {
-    size_t k = size_t(ci) * nR + ri;
-    if (!xcSet[k]) { auto v = cross(cols[ci], rings[ri], lims[ri]); xcSet[k] = v ? 1 : 2; xcVal[k] = v ? *v : 0; }
-    return xcSet[k] == 1 ? std::optional<double>(xcVal[k]) : std::nullopt;
+  std::vector<signed char> xrSet(size_t(nC) * nR, 0); std::vector<double> xrVal(size_t(nC) * nR, 0);
+  auto rawX = [&](int ci, int ri, bool relax) -> std::optional<double> {
+    size_t k = size_t(ci) * nR + ri; auto& S = relax ? xrSet : xcSet; auto& Vv = relax ? xrVal : xcVal;
+    if (!S[k]) { auto v = cross(cols[ci], rings[ri], lims[ri], relax); S[k] = v ? 1 : 2; Vv[k] = v ? *v : 0; }
+    return S[k] == 1 ? std::optional<double>(Vv[k]) : std::nullopt;
   };
+  auto crossAt = [&](int ci, int ri) -> std::optional<double> { return rawX(ci, ri, relaxSet && relaxSet->count(ri)); };
+
   std::vector<Vec3> pos; std::unordered_map<I64, int> vid; std::vector<std::pair<int, int>> vidKeys;   // (col, row) of each made point
   auto ptAt = [&](const Col& c, double u) {
     size_t i = 1; while (i < c.A.size() - 1 && c.A[i] < u) i++;
@@ -267,17 +309,24 @@ LockMesh ringMeshOf(const LockInput& in, const std::map<int, WallMesh>& wallOf, 
   for (int ri = 0; ri < nR; ri++) {
     const CocoonRing& R = rings[ri];
     std::fill(pres.begin(), pres.end(), 0); presOrder.clear();
+    auto dbgDrop = [&](int why) { if (!qEnvironmentVariableIsSet("HM_CONVDBG")) return; FILE* df = std::fopen(qPrintable(qEnvironmentVariable("HM_CONVDBG")), "a"); if (!df) return; double mx = 0; for (int a : presOrder) for (int b : presOrder) mx = std::max(mx, ptAt(cols[a], presU[a]).distanceTo(ptAt(cols[b], presU[b]))); std::fprintf(df, "drop ring %d why %d crossing %zu columns, spread %.4f, h %.4f\n", ri, why, presOrder.size(), mx, h); std::fclose(df); };
     for (int ci = 0; ci < nC; ci++) {
       auto u = crossAt(ci, ri); if (!u) continue; double Lc = cols[ci].A.back();
       if (*u - lastU[ci] < gap || *u < gap || Lc - *u < gap) continue;
       pres[ci] = 1; presU[ci] = *u; presOrder.push_back(ci);
     }
+    if (qEnvironmentVariableIsSet("HM_CONVDBG2")) if (FILE* df = std::fopen(qPrintable(qEnvironmentVariable("HM_CONVDBG2")), "a")) {   // (a check: the columns a ring misses, and why)
+      for (int ci = 0; ci < nC; ci++) { if (pres[ci] || cols[ci].key[0] != 'c') continue; auto any = cross(cols[ci], R, 1e300, false); auto u = crossAt(ci, ri);
+        std::fprintf(df, "ring %d s %.0f misses %s: %s", ri, R.s, cols[ci].key.c_str(), !any ? "no crossing" : !u ? "beyond lim" : "gap/order");
+        if (any) std::fprintf(df, " (u %.1f of %.1f, lastU %.1f, dist %.1f, lim %.1f)", *any, cols[ci].A.back(), lastU[ci], ptAt(cols[ci], *any).distanceTo(R.p), lims[ri]);
+        std::fprintf(df, " start (%.0f %.0f %.0f)\n", cols[ci].P.front().x, cols[ci].P.front().y, cols[ci].P.front().z); }
+      std::fclose(df); }
     // (a ring right at the lock's open end — every curve it crosses ending under a third of a loop step on, the ends
     // apart (not a tip where they meet — its fan): a thin loop next to the end row, junk)
     if (presOrder.size() >= 2 && ri > 0) {
       bool nearE = true, meet = true; const Vec3& e0 = cols[presOrder[0]].P.back();
       for (int ci : presOrder) { if (!(cols[ci].A.back() - presU[ci] < 0.33 * h)) nearE = false; if (!(cols[ci].P.back().distanceTo(e0) < 0.1 * h)) meet = false; }
-      if (nearE && !meet) { dropped++; continue; }
+      if (nearE && !meet) { dbgDrop(1); dropped++; continue; }
     }
     auto P = [&](int ci) { return ptAt(cols[ci], presU[ci]); };
     Vec3 PN = (R.pn ? *R.pn : R.n).normalized();
@@ -300,11 +349,14 @@ LockMesh ringMeshOf(const LockInput& in, const std::map<int, WallMesh>& wallOf, 
     for (auto& w : wallsK) {
       int sa = subK(w.a), sb = subK(w.b); if (sa < 0 || sb < 0) continue;
       int ra = repOf[sa], rb = repOf[sb]; if (ra == rb || ra < 0 || rb < 0) continue;
-      WS x{ra, rb, {ra}}; for (size_t q = 1; q + 1 < w.keys.size(); q++) if (pres[w.keys[q]]) x.poly.push_back(w.keys[q]); x.poly.push_back(rb);
+      // (a point of the wall's inside at one place with its edge — the wall closing to a fork: left out, no flap there)
+      WS x{ra, rb, {ra}}; const Vec3 pa = P(ra), pb = P(rb);
+      for (size_t q = 1; q + 1 < w.keys.size(); q++) if (pres[w.keys[q]]) { const Vec3 pq = P(w.keys[q]); if (pq.distanceTo(pa) < tol || pq.distanceTo(pb) < tol) continue; x.poly.push_back(w.keys[q]); }
+      x.poly.push_back(rb);
       ws.push_back(std::move(x));
     }
     if (ws.empty() && reps.size() == 1 && presOrder.size() >= 2) single.insert(ri);   // (all its curves at one point here)
-    if (ws.empty()) { dropped++; continue; }
+    if (ws.empty()) { dbgDrop(2); dropped++; continue; }
     Vec3 e1 = std::abs(PN.y) < 0.9 ? Vec3(0, 1, 0).cross(PN).normalized() : Vec3(1, 0, 0).cross(PN).normalized(), e2 = PN.cross(e1);
     for (int ci : presOrder) { Vec3 p = P(ci); p2[ci] = {p.dot(e1), p.dot(e2)}; }
     // the graph: from each curve its walls, each with its keys running from that curve
@@ -387,8 +439,32 @@ LockMesh ringMeshOf(const LockInput& in, const std::map<int, WallMesh>& wallOf, 
     // (a closed contour of two points — a wall and its twin with no column between — has no width: left out)
     std::vector<Sec*> pieces;
     for (auto& n : comps) for (Sec* p : contourOf(n)) { std::set<int> u(p->keys.begin(), p->keys.end()); if (!(p->closed && u.size() < 3)) pieces.push_back(p); }
-    if (pieces.empty()) { dropped++; continue; }
+    if (pieces.empty()) { dbgDrop(3); dropped++; continue; }
+    // (a contour all within a tenth of a loop step — the lock's curves running as one there, its walls of no width: a
+    // point, not a loop; zipped to the loops far on it made a long thin sliver along the line. Left out as a point — the
+    // root's cap finds it)
+    { double spread = 0; std::vector<Vec3> qs; for (Sec* p : pieces) for (int k : p->keys) qs.push_back(P(k));
+      for (size_t a = 0; a < qs.size(); a++) for (size_t b = a + 1; b < qs.size(); b++) spread = std::max(spread, qs[a].distanceTo(qs[b]));
+      if (spread < 0.1 * h) { single.insert(ri); dbgDrop(5); dropped++; continue; } }
+    // (a ring that comes out open after a closed one — the lock a tube, narrowing here or bent tight, its walk round the
+    // walls not closing: zipped to its closed neighbours it would flatten the tube into a strip there and fold the
+    // polygons. It is closed in the order of the ring before, over the columns it crosses — or, when the columns it misses go on past it (the rings
+    // closing up on a tight bend), left out)
+    if (pieces.size() == 1 && !pieces[0]->closed && !ringSecs.empty()) {
+      const auto& pp = ringSecs.back().pieces;
+      if (pp.size() == 1 && pp[0]->closed) {
+        std::vector<int> ks; std::set<int> seen;
+        for (int k : pp[0]->keys) { if (!pres[k]) continue; const int r = k < int(repOf.size()) && repOf[k] >= 0 ? repOf[k] : k; if (!pres[r] || seen.count(r)) continue; seen.insert(r); ks.push_back(r); }
+        std::set<int> here(pieces[0]->keys.begin(), pieces[0]->keys.end()); bool goesOn = false;
+        for (int ci : pp[0]->keys) if (!here.count(ci))
+          for (int r2 = ri + 1; r2 < std::min(nR, ri + 4) && !goesOn; r2++) if (auto u2 = crossAt(ci, r2); u2 && *u2 > lastU[ci] + gap && cols[ci].A.back() - *u2 > gap) goesOn = true;
+        if (goesOn) { dbgDrop(4); dropped++; continue; }                     // (the rings closing up on a bend: the next one has them again)
+        if (ks.size() >= 3) pieces = {newSec(ri, ks, true)};                // (the tube narrowing: kept a tube)
+      }
+    }
     ringSecs.push_back({ri, pieces});
+    { bool cl = true; for (Sec* p : pieces) if (!p->closed) cl = false; if (res.ringClosed.size() < size_t(nR)) res.ringClosed.assign(size_t(nR), -1); res.ringClosed[size_t(ri)] = cl ? 1 : 0; }
+    if (qEnvironmentVariableIsSet("HM_CONVDBG")) for (Sec* p : pieces) { QStringList ks; for (int k : p->keys) ks << QString::fromStdString(cols[k].key); Vec3 c = P(p->keys[0]); double sp = 0; for (int a : p->keys) for (int b : p->keys) sp = std::max(sp, P(a).distanceTo(P(b))); ks << QString("spread=%1").arg(sp, 0, 'f', 3); FILE* df = std::fopen(qPrintable(qEnvironmentVariable("HM_CONVDBG")), "a"); if (df) { std::fprintf(df, "ring %d %s [%s] at (%.2f %.2f %.2f)\n", ri, p->closed ? "closed" : "open", qPrintable(ks.join(' ')), c.x, c.y, c.z); std::fclose(df); } }
     for (Sec* p : pieces) for (int k : p->keys) lastU[k] = presU[k];
   }
   const int rowsN = int(ringSecs.size());
@@ -592,6 +668,21 @@ LockMesh ringMeshOf(const LockInput& in, const std::map<int, WallMesh>& wallOf, 
   return res;
 }
 
+// The lock's mesh: the rings as they are; where some came out an open strip (or were left out) while the lock is a tube on others (its
+// cocoon narrower there than its curves are apart — the far curves left out, the tube flattened), those made again
+// taking the far crossings too (ringMeshOfX's relax) — kept for the rings that close that way
+LockMesh ringMeshOf(const LockInput& in, const std::map<int, WallMesh>& wallOf, const WeldSettings& weld, double scale) {
+  LockMesh a = ringMeshOfX(in, wallOf, weld, scale, nullptr);
+  const auto& C = a.ringClosed; if (std::find(C.begin(), C.end(), 1) == C.end()) return a;
+  std::set<int> R; for (size_t i = 0; i < C.size(); i++) if (C[i] != 1) R.insert(int(i));   // (an open strip, or a ring left out)
+  if (R.empty()) return a;
+  LockMesh b = ringMeshOfX(in, wallOf, weld, scale, &R);
+  std::set<int> keep; for (int i : R) if (size_t(i) < b.ringClosed.size() && b.ringClosed[size_t(i)] == 1) keep.insert(i);
+  if (keep.empty() || !b.err.isEmpty() || b.faces.empty()) return a;
+  if (keep != R) { LockMesh c = ringMeshOfX(in, wallOf, weld, scale, &keep); if (c.err.isEmpty() && !c.faces.empty()) return c; return a; }
+  return b;
+}
+
 // ======================= the fold pass, Convert =======================
 // The folds (ringMeshOf → folds): a loop forced in halfway between the two rings of each, then that mesh made again (up
 // to 3 times). Into the cocoon whose lock folds — every cocoon taking its loops gets it too. The sources first.
@@ -631,7 +722,7 @@ struct OkMark { Vec3 c; std::vector<int> ks; QString kind; };
 // S.weldOk / S.weldSnap as the weld reads them; grow — DBG.lockWeldGrow (how far (1b) reaches, in weld distances)
 // (radius: how far apart two locks' points may be to be stitched — in loop steps: S.lockWeldR, 0.1 by default)
 struct WeldCtx { std::vector<OkMark> ok, snap; double grow = 4; bool classifying = false; double radius = 0.1; };
-struct LockInfo { int id; const LockMesh* m; double h; int parent; std::vector<int> links; CocoonGeo G; };
+struct LockInfo { int id; const LockMesh* m; double h; int parent; std::vector<int> links; CocoonGeo G; std::vector<int> anc; };   // (anc: every cocoon above it)
 
 std::vector<OkMark> readMarks(const QJsonValue& v) {
   std::vector<OkMark> out;
@@ -675,6 +766,56 @@ void weldOkClassify(const std::vector<LockInfo>& list, WeldCtx& W) {
   W.classifying = false;
 }
 
+// Two locks only touching along a line after the weld (each edge there: two faces of each lock, one lock's pair side by
+// side round the edge, not between the other's): parted — the line's points copied for the second lock's faces there,
+// so each lock stays a closed surface of its own along it (left joined, the manifold pass would split those points
+// itself and leave cracks). lockOf: each face's lock. → the points copied
+static int partTouching(std::vector<Vec3>& pos, std::vector<std::vector<int>>& faces, const std::vector<int>& lockOf) {
+  const I64 NV = I64(pos.size()) + 1;
+  auto ek = [&](int a, int b) { return a < b ? I64(a) * NV + b : I64(b) * NV + a; };
+  std::unordered_map<I64, std::vector<int>> EF;
+  for (int f = 0; f < int(faces.size()); f++) { const auto& F = faces[size_t(f)]; for (size_t q = 0; q < F.size(); q++) EF[ek(F[q], F[(q + 1) % F.size()])].push_back(f); }
+  auto touch = [&](I64 k, const std::vector<int>& fs) {
+    if (fs.size() != 4) return false;
+    std::vector<int> L; for (int f : fs) if (std::find(L.begin(), L.end(), lockOf[size_t(f)]) == L.end()) L.push_back(lockOf[size_t(f)]);
+    if (L.size() != 2) return false;
+    for (int l : L) if (std::count_if(fs.begin(), fs.end(), [&](int f) { return lockOf[size_t(f)] == l; }) != 2) return false;
+    const int a = int(k / NV), b = int(k % NV); const Vec3 e = (pos[size_t(b)] - pos[size_t(a)]).normalized();
+    const Vec3 u = std::abs(e.x) < 0.9 ? Vec3(1, 0, 0).cross(e).normalized() : Vec3(0, 1, 0).cross(e).normalized(), w = e.cross(u);
+    std::vector<std::pair<double, int>> at;
+    for (int f : fs) { Vec3 c(0, 0, 0); int m = 0; for (int v : faces[size_t(f)]) if (v != a && v != b) { c = c + pos[size_t(v)]; m++; } if (!m) return false;
+      Vec3 r = c * (1.0 / m) - pos[size_t(a)]; r = r - e * r.dot(e); at.push_back({std::atan2(r.dot(w), r.dot(u)), lockOf[size_t(f)]}); }
+    std::sort(at.begin(), at.end());
+    return at[0].second != at[1].second ? at[1].second == at[2].second && at[3].second == at[0].second : at[2].second == at[3].second;
+  };
+  std::unordered_set<I64> T; std::vector<int> verts;
+  for (auto& [k, fs] : EF) if (touch(k, fs)) { T.insert(k); for (int v : {int(k / NV), int(k % NV)}) if (std::find(verts.begin(), verts.end(), v) == verts.end()) verts.push_back(v); }
+  if (T.empty()) return 0;
+  std::sort(verts.begin(), verts.end());
+  std::unordered_map<int, std::vector<int>> VF; for (int f = 0; f < int(faces.size()); f++) for (int v : faces[size_t(f)]) VF[v].push_back(f);
+  int made = 0;
+  for (int v : verts) {
+    const auto& fs = VF[v]; std::vector<int> grp(fs.size()); for (size_t i = 0; i < fs.size(); i++) grp[i] = int(i);
+    std::function<int(int)> gf = [&](int x) { return grp[size_t(x)] == x ? x : grp[size_t(x)] = gf(grp[size_t(x)]); };
+    for (size_t i = 0; i < fs.size(); i++) for (size_t j = i + 1; j < fs.size(); j++) {
+      const auto &A = faces[size_t(fs[i])], &B = faces[size_t(fs[j])];
+      for (int w : A) { if (w == v || std::find(B.begin(), B.end(), w) == B.end()) continue;
+        const I64 k = ek(v, w); const auto& es = EF[k];
+        if (T.count(k) ? lockOf[size_t(fs[i])] == lockOf[size_t(fs[j])] : es.size() == 2) grp[size_t(gf(int(i)))] = gf(int(j)); }
+    }
+    // (the fans round the point: the first keeps it, each other one — whole of one lock — gets a copy)
+    std::vector<int> roots; for (size_t i = 0; i < fs.size(); i++) { const int r = gf(int(i)); if (std::find(roots.begin(), roots.end(), r) == roots.end()) roots.push_back(r); }
+    if (roots.size() < 2) continue;
+    for (size_t ri = 1; ri < roots.size(); ri++) {
+      int lk = -1; bool one = true; for (size_t i = 0; i < fs.size(); i++) if (gf(int(i)) == roots[ri]) { if (lk < 0) lk = lockOf[size_t(fs[i])]; else if (lk != lockOf[size_t(fs[i])]) one = false; }
+      if (!one) continue;
+      const int nv = int(pos.size()); pos.push_back(pos[size_t(v)]); made++;
+      for (size_t i = 0; i < fs.size(); i++) if (gf(int(i)) == roots[ri]) for (int& x : faces[size_t(fs[i])]) if (x == v) x = nv;
+    }
+  }
+  return made;
+}
+
 LockWeldResult weldLocksRun(const std::vector<LockInfo>& list, WeldCtx& W) {
   LockWeldResult res;
   const int n = int(list.size());
@@ -688,11 +829,11 @@ LockWeldResult weldLocksRun(const std::vector<LockInfo>& list, WeldCtx& W) {
   }
   double h = INF; for (auto& x : list) h = std::min(h, x.h);
   const double d = W.radius * h;
-  // (only a cocoon and its child, or two linked cocoons, are welded)
+  // (only a cocoon and one of its descendants (a child, a child's child…), or two linked cocoons, are welded)
   std::vector<std::vector<char>> rel(n, std::vector<char>(n, 0));
   for (int x = 0; x < n; x++) for (int y = 0; y < n; y++) {
     const auto &X = list[x], &Y = list[y];
-    rel[x][y] = x != y && (X.parent == Y.id || Y.parent == X.id || has(X.links, Y.id) || has(Y.links, X.id));
+    rel[x][y] = x != y && (has(X.anc, Y.id) || has(Y.anc, X.id) || has(X.links, Y.id) || has(Y.links, X.id));
   }
   auto relIn = [&](const std::vector<int>& L) { for (int x : L) for (int y : L) if (rel[x][y]) return true; return false; };
   const int N = int(pos.size());
@@ -728,9 +869,21 @@ LockWeldResult weldLocksRun(const std::vector<LockInfo>& list, WeldCtx& W) {
   auto idxOf = [&](int id) { for (int l = 0; l < n; l++) if (list[l].id == id) return l; return -1; };
   // the places marked "correct": nothing of those locks welded or removed there — its zone grown a loop step at a time
   weldOkClassify(list, W);
+  // (a crossing marked correct counts only while the weld would still leave a fault there without the mark — a mark put
+  // against an older weld that now joins the place cleanly is passed over, not to keep those locks apart for nothing)
+  std::vector<char> stale(W.ok.size(), 0);
+  if (!W.classifying) for (size_t oi = 0; oi < W.ok.size(); oi++) {
+    if (W.ok[oi].kind == "off") continue;
+    std::vector<LockInfo> sub; for (auto& x : list) if (has(W.ok[oi].ks, x.id)) sub.push_back(x);
+    if (sub.size() < 2) continue;
+    WeldCtx c = W; c.ok.erase(c.ok.begin() + long(oi)); c.classifying = true;
+    const double hh = sub[0].h; bool left = false;
+    for (auto& q : weldLocksRun(sub, c).problems) if (q.c.distanceTo(W.ok[oi].c) < 0.5 * hh && std::any_of(q.edges.begin(), q.edges.end(), [](auto& e) { return e.kind != "off"; })) left = true;
+    stale[oi] = !left;
+  }
   struct Sp { Vec3 c; std::vector<int> L; };
   std::vector<Sp> okSp, offIgn, snapSp;
-  for (auto& o : W.ok) {
+  for (size_t oi = 0; oi < W.ok.size(); oi++) { const auto& o = W.ok[oi]; if (stale[oi]) continue;
     if (o.kind != "off") { Sp s{o.c, {}}; for (int id : o.ks) { int l = idxOf(id); if (l >= 0) s.L.push_back(l); } if (s.L.size() >= 2) okSp.push_back(s); }
     else { Sp s{o.c, {}}; bool all = true; for (int id : o.ks) { int l = idxOf(id); if (l < 0) all = false; s.L.push_back(l); } if (all) offIgn.push_back(s); }
   }
@@ -765,7 +918,7 @@ LockWeldResult weldLocksRun(const std::vector<LockInfo>& list, WeldCtx& W) {
     par[b] = a; for (int l : locks[b]) addU(locks[a], l); merged++;
     int la = lfind(own[pr.i]), lb = lfind(own[pr.j]); if (la != lb) lpar[lb] = la;
   }
-  // (1b) a wall the two locks share, a little off: reported ('off'); welded only where approved (S.weldSnap)
+  // (1b) a wall the two locks share, a little off: welded (its corners snapped together) — not where marked correct
   struct Bad { int a, b; QString kind; std::vector<int> L; };
   std::vector<Bad> offs; std::unordered_set<int> snapRoots;
   const double gk = W.grow;
@@ -779,8 +932,14 @@ LockWeldResult weldLocksRun(const std::vector<LockInfo>& list, WeldCtx& W) {
     return false;
   };
   if (gk > 1) {
-    auto freeV = [&](int u) { if (find(u) != u || locks[u].size() != 1) return false; for (auto& p : zonePts) if (p.distanceTo(pos[u]) < h) return false; return true; };
-    auto pc = [&](int a, int b) { return list[a].parent == list[b].id || list[b].parent == list[a].id; };
+    auto inZone = [&](int u) { for (auto& p : zonePts) if (p.distanceTo(pos[u]) < h) return true; return false; };
+    auto freeV = [&](int u) { return find(u) == u && locks[u].size() == 1 && !inZone(u); };
+    // (two corners snapped together: one of them still alone (the other may be a point where locks met already) and no
+    // lock in both — two points of one lock never become one)
+    auto joinable = [&](int u, int v) {
+      const int a = find(u), b = find(v); if (a == b || inZone(u) || inZone(v) || !(freeV(u) || freeV(v))) return false;
+      for (int l : locks[b]) if (has(locks[a], l)) return false; return true; };
+    auto pc = [&](int a, int b) { return has(list[a].anc, list[b].id) || has(list[b].anc, list[a].id); };
     for (int round = 0; round < 50; round++) {
       std::vector<I64> eOrder; std::unordered_map<I64, std::vector<int>> byE;
       for (int fi = 0; fi < int(faces.size()); fi++) {
@@ -797,26 +956,33 @@ LockWeldResult weldLocksRun(const std::vector<LockInfo>& list, WeldCtx& W) {
         const auto& fs = byE[key];
         for (int x : fs) for (int y : fs) {
           const F &A = faces[x], &B = faces[y]; if (A.li >= B.li || !pc(A.li, B.li) || A.f.size() != B.f.size()) continue;
+          static const QStringList dbgAt = qEnvironmentVariable("HM_WELDAT").split(',');
+          const bool dbg = dbgAt.size() == 3 && faceCenter(pos, A.f).distanceTo(Vec3(dbgAt[0].toDouble(), dbgAt[1].toDouble(), dbgAt[2].toDouble())) < h;
+          auto why = [&](const char* w) { if (dbg) std::fprintf(stderr, "1b round %d faces %d/%d (locks %d %d): %s\n", round, x, y, list[A.li].id, list[B.li].id, w); };
           int ca = 0, cb = 0; for (int z : fs) { if (faces[z].li == A.li) ca++; if (faces[z].li == B.li) cb++; }
-          if (ca != 2 || cb != 2) continue;
+          if (ca != 2 || cb != 2) { why("ca/cb"); continue; }
           std::vector<int> ra, rb; for (int v : A.f) addU(ra, find(v)); for (int v : B.f) addU(rb, find(v));
           std::vector<int> ua, ub; for (int v : A.f) if (!has(rb, find(v))) ua.push_back(v); for (int v : B.f) if (!has(ra, find(v))) ub.push_back(v);
-          if (ua.empty() || ua.size() != ub.size() || ua.size() > 2) continue;
-          bool allFree = true; for (int v : ua) if (!freeV(v)) allFree = false; for (int v : ub) if (!freeV(v)) allFree = false; if (!allFree) continue;
+          if (ua.empty() || ua.size() != ub.size() || ua.size() > 2) { why("ua/ub"); continue; }
           std::vector<std::pair<int, int>> pr;
           if (ua.size() == 1) pr = {{ua[0], ub[0]}};
           else if (pos[ua[0]].distanceTo(pos[ub[0]]) + pos[ua[1]].distanceTo(pos[ub[1]]) <= pos[ua[0]].distanceTo(pos[ub[1]]) + pos[ua[1]].distanceTo(pos[ub[0]])) pr = {{ua[0], ub[0]}, {ua[1], ub[1]}};
           else pr = {{ua[0], ub[1]}, {ua[1], ub[0]}};
-          // (not where a third lock comes in)
-          auto third = [&](int o) { for (int j = 0; j < N; j++) if (own[j] != A.li && own[j] != B.li && (rel[own[j]][A.li] || rel[own[j]][B.li]) && pos[j].distanceTo(pos[o]) < 0.5 * h) return true; return false; };
-          bool th = false; for (int v : A.f) if (third(v)) { th = true; break; } if (!th) for (int v : B.f) if (third(v)) { th = true; break; } if (th) continue;
-          bool within = true; for (auto& [u, v] : pr) if (!(pos[u].distanceTo(pos[v]) < gk * d)) within = false; if (!within) continue;
+          { bool ok = true; for (auto& [u, v] : pr) if (!joinable(u, v)) ok = false; if (!ok) { why("free"); continue; } }
+          // (not where a third lock comes in: a point of it, not yet one with either corner, nearer to a corner than that
+          // corner's partner is — the corner may be that lock's to meet)
+          auto third = [&](int o, int other) { const double lim = pos[o].distanceTo(pos[other]);
+            for (int j = 0; j < N; j++) if (own[j] != A.li && own[j] != B.li && find(j) != find(o) && find(j) != find(other) && (rel[own[j]][A.li] || rel[own[j]][B.li]) && pos[j].distanceTo(pos[o]) < lim) { if (dbg) std::fprintf(stderr, "   third: lock %d point %d at %.1f\n", list[own[j]].id, j, pos[j].distanceTo(pos[o])); return true; } return false; };
+          bool th = false; for (auto& [u, v] : pr) if (third(u, v) || third(v, u)) { th = true; break; } if (th) { why("third"); continue; }
+          bool within = true; for (auto& [u, v] : pr) if (!(pos[u].distanceTo(pos[v]) < gk * d)) within = false; if (!within) { why("within"); continue; }
           std::vector<int> fr; for (int x2 : ra) if (has(rb, x2)) fr.push_back(x2);
           if (!snapOk(pr, A.li, B.li, fr)) {
             bool ign = false;
             for (auto& s : offIgn) if (has(s.L, A.li) && has(s.L, B.li)) { bool nr = true; for (auto& [u, v] : pr) if (!(pos[u].distanceTo(s.c) < 3 * h)) nr = false; if (nr) ign = true; }
-            if (!ign) for (auto& [u, v] : pr) offs.push_back({u, v, "off", {A.li, B.li}});
-            continue;
+            if (ign) continue;                                              // (marked "correct as it is": left apart, not reported)
+            // (the shared wall a little off: snapped as an approved place is — only the marks of an older file being
+            // classified see it reported, as when they were put)
+            if (W.classifying) { for (auto& [u, v] : pr) offs.push_back({u, v, "off", {A.li, B.li}}); continue; }
           }
           double m = 0; for (auto& [u, v] : pr) m = std::max(m, pos[u].distanceTo(pos[v]));
           cand.push_back({m, pr});
@@ -826,12 +992,39 @@ LockWeldResult weldLocksRun(const std::vector<LockInfo>& list, WeldCtx& W) {
       std::stable_sort(cand.begin(), cand.end(), [](const Cand& a, const Cand& b) { return a.m < b.m; });
       int k = 0;
       for (auto& c : cand) {
-        bool ok = true; for (auto& [u, v] : c.pr) if (!freeV(u) || !freeV(v)) ok = false; if (!ok) continue;
-        for (auto& [u, v] : c.pr) { par[v] = u; locks[u] = {own[u]}; addU(locks[u], own[v]); merged++; k++; snapRoots.insert(u); int la = lfind(own[u]), lb = lfind(own[v]); if (la != lb) lpar[lb] = la; }
+        bool ok = true; for (auto& [u, v] : c.pr) if (!joinable(u, v)) ok = false; if (!ok) continue;
+        for (auto& [u, v] : c.pr) {
+          if (!joinable(u, v)) continue;
+          int a = find(u), b = find(v); if (!freeV(v)) std::swap(a, b);           // (the one alone joins the other)
+          par[b] = a; for (int l : locks[b]) addU(locks[a], l); merged++; k++; snapRoots.insert(a);
+          int la = lfind(own[u]), lb = lfind(own[v]); if (la != lb) lpar[lb] = la; }
       }
       if (!k) break;
     }
   }
+  // (1d) a point where locks only touch — no edge there of two of them (a lock's tip ending against another's side): parted
+  // again, each lock its own point where it was — welded, the thin tip was pulled onto the other lock ("a vertex glued by
+  // itself"). Locks that share an edge at the point stay one there
+  { for (int i = 0; i < N; i++) par[i] = find(i);                      // (each point straight to its welded point: parted below without the chains crossing)
+    std::map<std::pair<int, int>, std::vector<int>> eL;                // (an edge of the welded points → the locks with a face on it)
+    for (auto& o : faces) { const auto& f = o.f; for (size_t q = 0; q < f.size(); q++) { int a = find(f[q]), b = find(f[(q + 1) % f.size()]); if (a == b) continue;
+      auto& L = eL[{std::min(a, b), std::max(a, b)}]; if (!has(L, o.li)) L.push_back(o.li); } }
+    std::map<int, std::vector<int>> mem; for (int i = 0; i < N; i++) { const int r = find(i); if (r != i || locks[r].size() > 1) mem[r].push_back(i); }
+    std::map<int, std::vector<std::pair<int, int>>> pairsAt;            // (the lock pairs sharing an edge at each welded point)
+    for (auto& [e, L] : eL) if (L.size() >= 2) for (int v : {e.first, e.second}) if (locks[v].size() > 1) for (size_t x = 0; x < L.size(); x++) for (size_t y = x + 1; y < L.size(); y++) pairsAt[v].push_back({L[x], L[y]});
+    for (auto& [r, ms] : mem) {
+      if (locks[r].size() < 2) continue;
+      std::map<int, int> lp; for (int l : locks[r]) lp[l] = l;
+      auto lf = [&](int x) { while (lp[x] != x) x = lp[x]; return x; };
+      for (auto& [a, b] : pairsAt[r]) if (lp.count(a) && lp.count(b)) lp[lf(a)] = lf(b);
+      const int keepC = lf(own[r]);
+      std::map<int, int> newRoot;                                        // (each other component of the locks: a point of its own)
+      for (int j : ms) { const int c = lf(own[j]); if (c == keepC) continue;
+        auto it = newRoot.find(c); if (it == newRoot.end()) { newRoot[c] = j; par[j] = j; locks[j] = {own[j]}; }
+        else { par[j] = it->second; addU(locks[it->second], own[j]); } }
+      if (!newRoot.empty()) { std::vector<int> kept; for (int l : locks[r]) if (lf(l) == keepC) kept.push_back(l); locks[r] = kept; }
+    }
+    for (int i = 0; i < N; i++) par[i] = find(i); }
   // ((1c), a child's thin tube welded flat onto its parent, is off in the HTML version — DBG.lockWeldThin 0)
   struct KF { int li, fi; std::vector<int> f; };
   std::vector<KF> Fs;
@@ -881,7 +1074,22 @@ LockWeldResult weldLocksRun(const std::vector<LockInfo>& list, WeldCtx& W) {
     res.filled = filled; res.open = open; }
   // the joints that didn't come out: an edge left open that is no root, or one of 3+ faces where two locks meet
   std::vector<I64> efOrder; std::unordered_map<I64, std::vector<int>> EF;
-  for (auto& o : keep) for (size_t q = 0; q < o.f.size(); q++) { I64 k = ek(o.f[q], o.f[(q + 1) % o.f.size()]); if (!EF.count(k)) efOrder.push_back(k); EF[k].push_back(o.li); }
+  std::unordered_map<I64, std::vector<int>> EFk;                       // (the kept faces at each edge)
+  for (int ki = 0; ki < int(keep.size()); ki++) { const auto& o = keep[size_t(ki)]; for (size_t q = 0; q < o.f.size(); q++) { I64 k = ek(o.f[q], o.f[(q + 1) % o.f.size()]); if (!EF.count(k)) efOrder.push_back(k); EF[k].push_back(o.li); EFk[k].push_back(ki); } }
+  // (two locks only touching along an edge — two faces of each there, one lock's pair side by side round the edge, not
+  // between the other's: no lock cuts into the other; Convert's manifold pass parts them there. Not a joint to redo)
+  auto touchOnly = [&](I64 k) {
+    const auto& fs = EFk[k]; if (fs.size() != 4) return false;
+    std::vector<int> L; for (int f : fs) addU(L, keep[size_t(f)].li); if (L.size() != 2) return false;
+    for (int l : L) if (std::count_if(fs.begin(), fs.end(), [&](int f) { return keep[size_t(f)].li == l; }) != 2) return false;
+    const int a = int(k / N), b = int(k % N); const Vec3 e = (pos[b] - pos[a]).normalized();
+    Vec3 u = std::abs(e.x) < 0.9 ? Vec3(1, 0, 0).cross(e).normalized() : Vec3(0, 1, 0).cross(e).normalized(), w = e.cross(u);
+    std::vector<std::pair<double, int>> at;
+    for (int f : fs) { const auto& F = keep[size_t(f)].f; Vec3 c(0, 0, 0); int m = 0; for (int v : F) if (v != a && v != b) { c = c + pos[v]; m++; } if (!m) return false;
+      Vec3 r = c * (1.0 / m) - pos[a]; r = r - e * r.dot(e); at.push_back({std::atan2(r.dot(w), r.dot(u)), keep[size_t(f)].li}); }
+    std::sort(at.begin(), at.end());
+    return at[0].second != at[1].second ? at[1].second == at[2].second && at[3].second == at[0].second : at[2].second == at[3].second;
+  };
   auto nearZone = [&](const Vec3& m) { for (auto& p : zonePts) if (p.distanceTo(m) < h) return true; return false; };
   std::vector<Bad> bad;
   for (I64 k : efOrder) {
@@ -890,6 +1098,7 @@ LockWeldResult weldLocksRun(const std::vector<LockInfo>& list, WeldCtx& W) {
     if (ls.size() == 1 && origE.count(k)) continue;
     if (ls.size() == 2) continue;
     if (ls.size() > 2) { std::vector<int> s; for (int l : ls) addU(s, l); if (!relIn(s)) continue; }   // (one lock's own — a fork)
+    if (ls.size() == 4 && touchOnly(k)) continue;
     Vec3 m = (pos[a] + pos[b]) * 0.5;
     if (nearZone(m)) continue;                                          // (marked correct)
     if (!relIn(L)) {
@@ -908,11 +1117,23 @@ LockWeldResult weldLocksRun(const std::vector<LockInfo>& list, WeldCtx& W) {
     bad.push_back({a, b, ls.size() == 1 ? "open" : "many", L});
   }
   for (auto& e : offs) { bool dup = false; for (auto& x : bad) if (x.a == e.a && x.b == e.b) dup = true; if (!dup) bad.push_back(e); }
+  if (qEnvironmentVariableIsSet("HM_WELDDUMP")) {                    // (a check: the locks before, the faces kept, the bad edges)
+    if (FILE* df = std::fopen(qPrintable(qEnvironmentVariable("HM_WELDDUMP")), "w")) {
+      std::fprintf(df, "{\"locks\":["); for (int l = 0; l < n; l++) std::fprintf(df, "%s%d", l ? "," : "", list[l].id);
+      std::fprintf(df, "],\"pos\":["); for (int i = 0; i < N; i++) std::fprintf(df, "%s[%.3f,%.3f,%.3f]", i ? "," : "", pos[i].x, pos[i].y, pos[i].z);
+      auto fl = [&](const char* nm, auto& L, bool mapped) { std::fprintf(df, "],\"%s\":[", nm); bool first = true;
+        for (auto& o : L) { std::fprintf(df, "%s{\"li\":%d,\"f\":[", first ? "" : ",", o.li); first = false; for (size_t q = 0; q < o.f.size(); q++) std::fprintf(df, "%s%d", q ? "," : "", mapped ? find(o.f[q]) : o.f[q]); std::fprintf(df, "]}"); } };
+      fl("orig", faces, false); fl("keep", keep, false);
+      std::fprintf(df, "],\"root\":["); for (int i = 0; i < N; i++) std::fprintf(df, "%s%d", i ? "," : "", find(i));
+      std::fprintf(df, "],\"own\":["); for (int i = 0; i < N; i++) std::fprintf(df, "%s%d", i ? "," : "", own[i]);
+      std::fprintf(df, "],\"bad\":["); for (size_t q = 0; q < bad.size(); q++) std::fprintf(df, "%s[%d,%d,\"%s\"]", q ? "," : "", bad[q].a, bad[q].b, qPrintable(bad[q].kind));
+      std::fprintf(df, "]}"); std::fclose(df); } }
   // a child lock not touching its parent at all: shown where the two come nearest
   { std::set<std::pair<int, int>> met;
     for (int i = 0; i < N; i++) if (find(i) == i && locks[i].size() > 1) for (int a : locks[i]) for (int b : locks[i]) met.insert({a, b});
     for (int l = 0; l < n; l++) {
       int p = idxOf(list[l].parent); if (p < 0 || met.count({l, p})) continue;
+      { bool any = false; for (int o = 0; o < n && !any; o++) if (rel[l][o] && met.count({l, o})) any = true; if (any) continue; }   // (welded to another of its kin — its parent's parent, a link)
       double bd = INF; int bi = -1, bj = -1;
       for (int i = 0; i < N; i++) { if (own[i] != l) continue; for (int j = 0; j < N; j++) if (own[j] == p) { double dd = (pos[i] - pos[j]).lengthSq(); if (dd < bd) { bd = dd; bi = i; bj = j; } } }
       if (bi < 0 || std::sqrt(bd) > 2 * h) continue;
@@ -934,16 +1155,17 @@ LockWeldResult weldLocksRun(const std::vector<LockInfo>& list, WeldCtx& W) {
     LockWeldResult::Group g; std::vector<int> mem; for (int l = 0; l < n; l++) if (lfind(l) == r) mem.push_back(l);
     std::unordered_map<int, int> idx; Mesh data;
     for (auto& o : keep) {
-      if (!has(mem, o.li)) continue; std::vector<int> f;
+      if (!has(mem, o.li)) continue; std::vector<int> f; g.faceLock.push_back(list[o.li].id);
       for (int v : o.f) { auto it = idx.find(v); if (it == idx.end()) { it = idx.emplace(v, int(data.pos.size())).first; data.pos.push_back(pos[v]); } f.push_back(it->second); }
       data.faces.push_back(f);
     }
+    res.parted += partTouching(data.pos, data.faces, g.faceLock);
     orientFaces(data, list[mem[0]].G);
     for (int l : mem) g.fam.push_back(list[l].id);
     g.pos = std::move(data.pos); g.faces = std::move(data.faces);
     res.groups.push_back(std::move(g));
   }
-  res.merged = merged;
+  res.merged = merged; res.keptApart = int(okSp.size());
   for (auto* S : {&okSp, &offIgn}) for (auto& s : *S) { WeldProblem q; q.c = s.c; for (int l : s.L) q.locks.push_back(list[l].id); q.ok = true; res.accepted.push_back(q); }
   return res;
 }
@@ -953,6 +1175,7 @@ std::vector<LockInfo> lockInfos(Scene& sc, HairState& hs, const std::vector<Lock
   for (auto& x : in) {
     const Item* k = sc.item(x.id); LockInfo li{x.id, x.m, cs->loopStep(x.id), -1, {}, cs->geo(x.id)};
     const Item* p = k && k->parent >= 0 ? sc.item(k->parent) : nullptr; if (p && p->type == ItemType::Cocoon) li.parent = p->id;
+    for (const Item* a = p; a && a->type == ItemType::Cocoon && li.anc.size() < 64; a = a->parent >= 0 ? sc.item(a->parent) : nullptr) li.anc.push_back(a->id);
     if (k) for (const QJsonValue& v : k->raw.value("links").toArray()) { const Item* L = sc.item(v.toInt()); if (L && L->type == ItemType::Cocoon && L != k) li.links.push_back(L->id); }
     out.push_back(std::move(li));
   }
@@ -1068,6 +1291,27 @@ std::vector<int> convChecked(const Scene& sc, HairState& hs, const std::vector<i
   return out;
 }
 
+namespace {
+// a converted mesh's polygroups: one per lock (faceLock — each face's cocoon or crown; none — all one), named by the
+// lock's group (two cocoons of one group in the mesh — by the cocoon)
+void lockGroups(const Scene& sc, CocoonSystem* cs, PolyMesh& m, const std::vector<int>* faceLock, int whole) {
+  const int nf = m.faceCount(); std::vector<int> ids; std::vector<int> fl(size_t(std::max(0, nf)), whole);
+  if (faceLock && int(faceLock->size()) == nf) fl = *faceLock;
+  for (int x : fl) if (std::find(ids.begin(), ids.end(), x) == ids.end()) ids.push_back(x);
+  auto gname = [&](int id) { const Item* it = sc.item(id); if (!it) return QString("Lock"); if (it->type == ItemType::Cocoon && cs) { const int g = cs->lockGroup(id); if (const Item* G = g >= 0 ? sc.item(g) : nullptr) return G->name; } return it->name; };
+  std::vector<QString> names; for (int id : ids) names.push_back(gname(id));
+  { const std::vector<QString> g = names; for (size_t i = 0; i < ids.size(); i++) if (std::count(g.begin(), g.end(), g[i]) > 1) if (const Item* it = sc.item(ids[i])) names[i] = it->name; }
+  m.groupNames = names; m.faceGroup.resize(size_t(std::max(0, nf)));
+  for (int f = 0; f < nf; f++) m.faceGroup[size_t(f)] = int(std::find(ids.begin(), ids.end(), fl[size_t(f)]) - ids.begin());
+}
+// the polygroups into a mesh's saved data ("fg" — each face's, "groups" — their names)
+QJsonObject groupsJson(const PolyMesh& m, QJsonObject d) {
+  if (m.groupNames.empty() || m.faceGroup.size() != size_t(m.faceCount())) return d;
+  QJsonArray fg, gs; for (int g : m.faceGroup) fg.append(g); for (const QString& n : m.groupNames) gs.append(n);
+  d.insert("fg", fg); d.insert("groups", gs); return d;
+}
+}  // namespace
+
 ConvertResult convertCocoons(Scene& sc, HairState& hs, const std::vector<int>& sel, const Vec3& center) {
   ConvertResult out; CocoonSystem* cs = hs.cocoonSystem();
   // ⌇ the braids going with them: a selected braid, its folder, its curve or connector
@@ -1090,13 +1334,14 @@ ConvertResult convertCocoons(Scene& sc, HairState& hs, const std::vector<int>& s
   struct Made { int m, top; std::vector<int> fam; };
   std::vector<Made> made;
   // Weld locks: the converted locks that touch — one mesh (weldLocks); off — each its own
-  struct Grp { std::vector<int> fam; const std::vector<Vec3>* pos; const std::vector<std::vector<int>>* faces; int crown = -1; };
+  struct Grp { std::vector<int> fam; const std::vector<Vec3>* pos; const std::vector<std::vector<int>>* faces; int crown = -1; const std::vector<int>* faceLock = nullptr; };   // (faceLock: each face's cocoon (a crown's own: the crown) — none: all fam[0]'s)
+  std::vector<std::unique_ptr<std::vector<int>>> ownedFl;
   std::vector<Grp> groups;
   std::vector<std::unique_ptr<std::pair<std::vector<Vec3>, std::vector<std::vector<int>>>>> owned;
   if (sc.fileRaw.value("lockWeld").toBool()) {
     std::vector<LockIn> list; for (auto& [k, dep] : good) list.push_back({k, &rms[k]});
     out.lockWeld = weldLocks(sc, hs, list);
-    for (auto& g : out.lockWeld->groups) groups.push_back({g.fam, &g.pos, &g.faces});
+    for (auto& g : out.lockWeld->groups) groups.push_back({g.fam, &g.pos, &g.faces, -1, &g.faceLock});
   } else for (auto& [k, dep] : good) groups.push_back({{k}, &rms[k].pos, &rms[k].faces});
   auto parentOf = [&](int k) { const Item* it = sc.item(k); const Item* p = it && it->parent >= 0 ? sc.item(it->parent) : nullptr; return p && p->type == ItemType::Cocoon ? p->id : -1; };
   // the crowns: their own mesh (no cocoon); with Weld locks on, the locks on the lower connector welded to it — the
@@ -1110,7 +1355,8 @@ ConvertResult convertCocoons(Scene& sc, HairState& hs, const std::vector<int>& s
     if (att.empty() && !has(crownsSel, kid)) continue;
     auto M = crown::crownData(sc, hs.curves, *K); if (!M || M->faces.empty()) { out.bad << K->name; continue; }
     auto own = std::make_unique<std::pair<std::vector<Vec3>, std::vector<std::vector<int>>>>(M->pos, M->faces);
-    Grp cg{{}, &own->first, &own->second, kid};
+    auto fl = std::make_unique<std::vector<int>>(own->second.size(), kid);
+    Grp cg{{}, &own->first, &own->second, kid, fl.get()};
     if (sc.fileRaw.value("lockWeld").toBool() && !att.empty()) {
       double tol = 0.6 * loopStep(sc, *K);
       std::vector<Grp> rest;
@@ -1123,13 +1369,13 @@ ConvertResult convertCocoons(Scene& sc, HairState& hs, const std::vector<int>& s
         std::vector<int> map(g.pos->size(), -1);
         for (int v : bnd) { int best = -1; double bd = tol; for (int r : M->root) { double d = (*g.pos)[size_t(v)].distanceTo(own->first[size_t(r)]); if (d < bd) { bd = d; best = r; } } if (best >= 0) { map[size_t(v)] = best; out.welded++; } }
         for (size_t v = 0; v < map.size(); v++) if (map[v] < 0) { map[v] = int(own->first.size()); own->first.push_back((*g.pos)[v]); }
-        for (auto& f : *g.faces) { std::vector<int> nf; for (int v : f) { int x = map[size_t(v)]; if (nf.empty() || nf.back() != x) nf.push_back(x); }
-          if (nf.size() > 1 && nf.front() == nf.back()) nf.pop_back(); if (nf.size() >= 3) own->second.push_back(nf); }
+        for (size_t fi = 0; fi < g.faces->size(); fi++) { const auto& f = (*g.faces)[fi]; std::vector<int> nf; for (int v : f) { int x = map[size_t(v)]; if (nf.empty() || nf.back() != x) nf.push_back(x); }
+          if (nf.size() > 1 && nf.front() == nf.back()) nf.pop_back(); if (nf.size() >= 3) { own->second.push_back(nf); fl->push_back(g.faceLock && fi < g.faceLock->size() ? (*g.faceLock)[fi] : g.fam[0]); } }
         cg.fam.insert(cg.fam.end(), g.fam.begin(), g.fam.end());
       }
       groups = rest;
     }
-    groups.push_back(cg); owned.push_back(std::move(own));
+    groups.push_back(cg); owned.push_back(std::move(own)); ownedFl.push_back(std::move(fl));
   }
   for (auto& grp : groups) {
     if (grp.fam.empty() && grp.crown >= 0) {                 // (a crown alone)
@@ -1150,11 +1396,12 @@ ConvertResult convertCocoons(Scene& sc, HairState& hs, const std::vector<int>& s
     nextNumber(sc, ItemType::Mesh, "Mesh", "mesh");
     Item& m = sc.addItem(ItemType::Mesh, gid, (g ? gname : kname) + " mesh");
     auto poly = std::make_shared<PolyMesh>(); poly->pos = *grp.pos; for (auto& f : *grp.faces) poly->addFace(f.data(), int(f.size()));
+    lockGroups(sc, cs, *poly, grp.faceLock, grp.fam.empty() ? grp.crown : k);   // (each lock a polygroup of its own)
     m.poly = poly;
     QJsonArray P, F, S; for (auto& p : *grp.pos) P.append(QJsonArray{p.x, p.y, p.z});
     for (auto& f : *grp.faces) { QJsonArray q; for (int i : f) q.append(i); F.append(q); }
     for (auto& w : walls) S.append(w.id);
-    m.raw = QJsonObject{{"data", QJsonObject{{"pos", P}, {"faces", F}}}, {"srcSurfs", S}, {"srcCrowns", grp.crown >= 0 ? QJsonArray{grp.crown} : QJsonArray()}, {"symBaked", false}, {"fromCocoon", k}};
+    m.raw = QJsonObject{{"data", groupsJson(*poly, QJsonObject{{"pos", P}, {"faces", F}})}, {"srcSurfs", S}, {"srcCrowns", grp.crown >= 0 ? QJsonArray{grp.crown} : QJsonArray()}, {"symBaked", false}, {"fromCocoon", k}};
     made.push_back({m.id, k, grp.fam});
     if (grp.crown >= 0) { const Item* K = sc.item(grp.crown); if (K->parent >= 0) sc.item(K->parent)->visible = false; }   // (the crown's group hidden too)
     // (the locks' groups hidden — their curves and walls stay as they are; a wall outside any lock group — its own
@@ -1188,7 +1435,12 @@ ConvertResult convertCocoons(Scene& sc, HairState& hs, const std::vector<int>& s
   cocoonFoldClear(hs, folded);
   meshesIntoGroup(sc);
   // (the meshes made manifold: no edge of three polygons or more, no parts touching only at a vertex, no doubled polygon)
-  for (auto& x : made) if (Item* mi = sc.item(x.m); mi && mi->poly) { auto p = std::make_shared<PolyMesh>(*mi->poly); if (tedit::makeManifold(*p)) { const bool same = mi->base == mi->poly; mi->poly = p; if (same || !mi->base) mi->base = p; } }
+  for (auto& x : made) if (Item* mi = sc.item(x.m); mi && mi->poly) { auto p = std::make_shared<PolyMesh>(*mi->poly); if (tedit::makeManifold(*p)) { const bool same = mi->base == mi->poly; mi->poly = p; if (same || !mi->base) mi->base = p;
+      // (the record the project keeps: written again from the mended mesh — a reopened project gets this one, not the one before the pass)
+      QJsonArray P, F; for (auto& q : p->pos) P.append(QJsonArray{q.x, q.y, q.z});
+      for (int f = 0; f < p->faceCount(); f++) { QJsonArray c; for (int k = p->faceStart[size_t(f)]; k < p->faceStart[size_t(f) + 1]; k++) c.append(p->faceVerts[size_t(k)]); F.append(c); }
+      QJsonObject d = mi->raw.value("data").toObject(); d.insert("pos", P); d.insert("faces", F); mi->raw.insert("data", groupsJson(*p, d)); } }
+  for (auto& x : made) if (Item* mi = sc.item(x.m)) plainMesh(*mi);   // (an ordinary mesh: the Topology room and the Inspector take it as any other)
   for (auto& x : made) out.meshes.push_back(x.m);
   for (auto& [k, r] : rms) { out.flips += r.flips; out.dropped += r.dropped; out.welded += r.welded; }
   int n = int(made.size());
@@ -1196,7 +1448,8 @@ ConvertResult convertCocoons(Scene& sc, HairState& hs, const std::vector<int>& s
   if (weld.on) out.message += QString(" · %1 point%2 welded").arg(out.welded).arg(out.welded == 1 ? "" : "s");
   out.message += out.flips ? QString(" · normals: %1 face%2 turned").arg(out.flips).arg(out.flips == 1 ? "" : "s") : QString(" · normals OK");
   if (out.folds) out.message += QString(" · %1 loop%2 added where the lock folded (%3)").arg(out.folds).arg(out.folds == 1 ? "" : "s").arg(out.folded.join(", "));
-  if (out.lockWeld) { auto& lw = *out.lockWeld; out.message += QString(" · locks welded: %1 points joined, %2 faces of double walls and %3 inside other locks removed, %4 faces closing holes").arg(lw.merged).arg(lw.doubled).arg(lw.inside).arg(lw.filled); }
+  if (out.lockWeld) { auto& lw = *out.lockWeld; out.message += QString(" · locks welded: %1 points joined, %2 faces of double walls and %3 inside other locks removed, %4 faces closing holes").arg(lw.merged).arg(lw.doubled).arg(lw.inside).arg(lw.filled);
+    if (lw.keptApart) out.message += QString(" · %1 crossing%2 marked correct left unwelded, inner walls stay there (Ctrl+Z, Check connections, right-click the green pin → Weld again)").arg(lw.keptApart).arg(lw.keptApart == 1 ? "" : "s"); }
   if (out.dropped) out.message += QString(" · %1 ring%2 left out (no wall of the lock crosses it near it, in order)").arg(out.dropped).arg(out.dropped == 1 ? "" : "s");
   if (!out.bad.isEmpty()) out.message += " · not converted: " + out.bad.join(", ");
   return out;

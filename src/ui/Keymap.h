@@ -23,6 +23,7 @@ class QLineEdit;
 class QListWidget;
 class QLabel;
 class QAbstractButton;
+class QAction;
 
 namespace hm::ui {
 
@@ -35,6 +36,10 @@ struct NavScheme {
   QString preset = "standard";
   NavBind orbit{1, 4}, pan{2, 4}, pan2{2, 0}, zoom{3, 4}, mainPie{3, 2}, opsPie{3, 1};
   QString rotation = "turntable";                                    // turntable (the up stays up) / trackball (free)
+  // the Paint room's brush on the mouse: coat - as 3D-Coat (RMB drag: the size; LMB on empty space: the camera turns; V: the colour);
+  // ps - as Photoshop / Substance ([ ] and Ctrl + RMB drag: the size sideways, the hardness up and down; Alt + click: the colour,
+  // Alt + drag: the camera; LMB on empty space does nothing). V and [ ] work in both
+  QString paint = "coat";
 };
 
 class Keymap {
@@ -61,6 +66,7 @@ public:
   void setCustomTool(const QString& id, const QString& tool);
   // (false: no such button on screen now; justMade: a button not shown yet counts — its panel was just made)
   QAbstractButton* customButton(const QString& id, bool justMade = false) const;
+  QAction* customAction(const QString& id, bool justMade = false) const;
   bool triggerCustom(const QString& id, bool justMade = false) const;
   // pies of one's own
   const std::vector<CustomPie>& pies() const { return pies_; }
@@ -80,6 +86,7 @@ public:
 
   static QString codeOf(const QKeyEvent* e);              // "KeyA", "Digit1", "F2", "Space", "BracketLeft", … ("" — none)
   static QString comboOf(const QKeyEvent* e);             // modifiers + code
+  static int latinKey(const QKeyEvent* e);                 // the key as Qt::Key_A…Key_Z by the physical key (a Russian layout gives Qt::Key_M for the key it types М on); any other key — Qt's own
   static QString label(const QString& combo);             // "Ctrl + H"
   static bool assignable(const QString& combo);           // (Esc and End — never)
 

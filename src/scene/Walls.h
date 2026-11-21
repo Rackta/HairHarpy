@@ -1,4 +1,4 @@
-// NURBS walls (item 'surface': a wall between curves a and b) as the HTML version builds them for the viewport:
+﻿// NURBS walls (item 'surface': a wall between curves a and b) as the HTML version builds them for the viewport:
 // wallShapeRows — the wall's own adaptive rows along both curves (the new logic: the shape only, no loops), then
 // surfaceData — a grid of quads between them with Width segments and Bulge (and the twin wall back, p.b2on).
 // (Only the new logic: old-logic projects aren't supported.)
@@ -22,7 +22,7 @@ struct WallMesh {
   std::vector<std::array<int, 4>> quads;     // (a quad collapsed at a pointed end keeps its 4 indices)
   std::vector<int> vrow;                     // each vertex's row (an edge within one row runs across the lock)
   // the grids in pos: the wall's own, then its twin's (back from b to a) — R rows of M points from pos[start]
-  struct Grid { int start = 0, R = 0, M = 0; bool twin = false; };
+  struct Grid { int start = 0, R = 0, M = 0; bool twin = false; std::vector<double> rowV; };   // (rowV: of a converted modifier's walls — each row's cross-section, a share 0…1 of the anchors)
   std::vector<Grid> grids;
 };
 

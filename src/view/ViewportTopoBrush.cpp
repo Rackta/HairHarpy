@@ -1,5 +1,6 @@
 ﻿// The Topology room's brush, as the Hair room's: its circle (radius) and its hard core (hardness) — Ctrl+RMB drag: ←→
-// the radius, ↑↓ the hardness; Ctrl + wheel the radius. RMB — its mode for LMB: Move (what lies within the circle
+// the radius, ↑↓ the hardness; Ctrl + wheel the radius. RMB — the same stroke along the normals (Move: each vertex along its own
+// normal, not the screen's plane; Smooth / Relax: only the part along the normal). Its mode (Tool Options): Move (what lies within the circle
 // dragged — Screen: in the view's plane; Surface: sliding along each mesh's own surface; Topology surface: as Surface,
 // only the mesh under the centre), Smooth (each vertex towards its neighbours' middle), Relax (the same, kept on the
 // surface: the shape stays, the polygons even out; the stars — vertices of other than four edges — evened too or left),
@@ -27,27 +28,15 @@ double falloff(double d, double R, double hard) {
 int kindOf(const QString& k) { return k == "smooth" ? 1 : k == "relax" ? 2 : k == "inflate" ? 3 : k == "shrink" ? 4 : 0; }
 }  // namespace
 
-// RMB on the brush: its modes (what LMB does)
-void Viewport::tbModePie(const QPoint& global) {
-  ui::PieSpec s; s.title = tr("Brush");
-  auto it = [this](const QString& k, const QString& label, const QString& tip) {
-    ui::PieItem i; i.label = (tset.brushKind == k ? "● " : "") + label; i.tip = tip; i.cur = tset.brushKind == k;
-    i.act = [this, k, label] { tset.brushKind = k; saveTopoPrefs(); emit topoState(); ui::hud(tr("Brush: %1").arg(label), 1000); }; return i; };
-  s.top = {it("move", tr("Move"), tr("Drags what lies within the circle")), it("smooth", tr("Smooth"), tr("Each vertex towards its neighbours' middle (also Shift)")),
-           it("relax", tr("Relax"), tr("Smooth kept on the surface — the polygons even out, the shape stays (also Shift+Ctrl)"))};
-  s.bottom = {it("inflate", tr("Inflate"), tr("Pushed out along the surface's normal")), it("shrink", tr("Shrink"), tr("Pulled in along the surface's normal"))};
-  QWidget* mw = nullptr; for (QWidget* w : QApplication::topLevelWidgets()) if (w->inherits("QMainWindow")) mw = w;
-  if (mw) ui::Pie::open(mw, global, s, true);
-}
-
-void Viewport::tbPress(const QPointF& mp, bool shift, bool ctrl, int kind, double radPx, int only) {
+void Viewport::tbPress(const QPointF& mp, bool shift, bool ctrl, int kind, double radPx, int only, bool alongN) {
   const int am = topoMesh();
   const bool selOnly = topoMode != "object" && am >= 0 && tsel_.id == am && (tsel_.f.size() + tsel_.e.size() + tsel_.v.size()) > 0;   // (with the selection: only it)
   std::vector<int> cands;
-  if (only >= 0) cands = {only}; else if (selOnly || (!tset.brushAll && am >= 0 && !topoHeavy(am))) cands = {am}; else for (int m : topoMeshes()) if (!topoHeavy(m)) cands.push_back(m);   // (All meshes off: the active one only)
+  if (only >= 0) cands = {only}; else if (selOnly || (!tset.brushAll && am >= 0)) cands = {am}; else for (int m : topoMeshes()) cands.push_back(m);   // (All meshes off: the active one only)
   auto hit = tPick(mp, cands); if (!hit) { ui::hud(tr("Start the stroke on a mesh"), 900); return; }
   if (!selOnly && only < 0 && tset.brushMode == "topo") cands = {hit->m};   // (Topology surface: the mesh under the centre only)
   tb_ = {}; tb_.kind = kind >= 0 ? kind : shift && ctrl ? 2 : shift ? 1 : ctrl ? 6 : kindOf(tset.brushKind); tb_.hit0 = hit->point; tb_.n = cam_.dir(); tb_.p0 = mp;   // (Ctrl: moved along the surface's normals)
+  tb_.alongN = alongN; if (alongN && tb_.kind == 0) tb_.kind = 6;   // (RMB: Move along each vertex's own normal, not the screen's plane)
   { Projector P = projector(); ScreenPt a = P.toScreen(hit->point); const double u = cam_.sceneScale * 0.01; ScreenPt b = P.toScreen(hit->point + cam_.upVec() * u);   // (the circle's radius in the world, at the centre's depth)
     tb_.Rw = (radPx > 0 ? radPx : brushR) * u / std::max(1e-9, std::hypot(b.x - a.x, b.y - a.y)); }
   for (int m : cands) {
@@ -71,6 +60,7 @@ void Viewport::tbPress(const QPointF& mp, bool shift, bool ctrl, int kind, doubl
   if (tb_.meshes.empty()) { ui::hud(tr("Nothing under the brush"), 900); return; }
   td_ = {}; td_.type = 8; drag_ = Drag::Topo;
   const char* names[] = {"", "Smooth", "Relax", "Inflate", "Shrink", "Pinch", "Along the normals"};
+  if (alongN && tb_.kind != 6) ui::hud(tr("%1 — along the normals").arg(tr(names[tb_.kind]))); else
   ui::hud(tb_.kind ? tr(names[tb_.kind]) : tset.brushMode == "screen" ? tr("Move (screen)") : tset.brushMode == "surface" ? tr("Move along the surface") : tr("Move along the surface — this mesh only"));
   if (tb_.kind) tbMove(mp);
 }
@@ -107,7 +97,7 @@ void Viewport::tbMove(const QPointF& mp) {
       auto T = topo::ttopo(baseSp(*it)); const std::vector<Vec3> Pc = baseOf(*it)->pos; std::vector<Vec3> P = Pc;
       std::vector<char> ok(Pc.size(), t.vs.empty() ? 1 : 0); for (int v : t.vs) ok[size_t(v)] = 1;
       std::vector<Vec3> vn;                                       // (inflate / shrink: the vertices' normals, from their polygons)
-      if (tb_.kind >= 2) { vn.assign(Pc.size(), Vec3());
+      if (tb_.kind >= 2 || tb_.alongN) { vn.assign(Pc.size(), Vec3());
         for (int f = 0; f < T->nf; f++) { const int s = T->fo[size_t(f)], e = T->fo[size_t(f) + 1]; Vec3 n;
           for (int k = s; k < e; k++) { const Vec3& a = Pc[size_t(T->fv[size_t(k)])]; const Vec3& b = Pc[size_t(T->fv[size_t(k + 1 < e ? k + 1 : s)])];
             n.x += (a.y - b.y) * (a.z + b.z); n.y += (a.z - b.z) * (a.x + b.x); n.z += (a.x - b.x) * (a.y + b.y); }
@@ -128,9 +118,13 @@ void Viewport::tbMove(const QPointF& mp) {
           if (tb_.kind == 2 && !tset.relaxStars && e - s != 4) continue;   // (relax, the stars left in place)
           Vec3 avg; for (int j = s; j < e; j++) avg += t.M.apply(Pc[size_t(T->other(T->vE[size_t(j)], v))]); avg = avg * (1.0 / (e - s));
           Vec3 dl = tb_.kind == 5 ? (hit->point - wv) * 0.15 : avg - wv;   // (pinch: towards the centre)
-          if (tb_.kind >= 2) { Vec3 n = t.M.lin(vn[size_t(v)]); if (n.lengthSq() > 0) { n = n.normalized(); dl = dl - n * dl.dot(n); } }   // (relax / pinch: along the surface only — not off it)
+          if (tb_.alongN) {                                       // (RMB: only the part along the normal — the bumps flattened, nothing slides along the surface)
+            Vec3 n = t.M.lin(vn[size_t(v)]); if (n.lengthSq() <= 0) continue; n = n.normalized();
+            if (tb_.kind == 2 || tb_.kind == 5) dl = avg - wv;    // (relax / pinch along the normal: the neighbours' middle, its height off the surface)
+            dl = n * dl.dot(n);
+          } else if (tb_.kind >= 2) { Vec3 n = t.M.lin(vn[size_t(v)]); if (n.lengthSq() > 0) { n = n.normalized(); dl = dl - n * dl.dot(n); } }   // (relax / pinch: along the surface only — not off it)
           w = wv + dl * (f * str);
-          if ((tb_.kind == 2 || tb_.kind == 5) && t.surf) { double dd; if (auto q = t.surf->closest(w, nullptr, &dd)) w = *q; }   // (relax: kept on the surface)
+          if ((tb_.kind == 2 || tb_.kind == 5) && t.surf && !tb_.alongN) { double dd; if (auto q = t.surf->closest(w, nullptr, &dd)) w = *q; }   // (relax: kept on the surface)
         }
         P[size_t(v)] = t.Mi.apply(w); moved.push_back(v);
       }

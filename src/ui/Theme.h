@@ -8,8 +8,14 @@
 #include <QIcon>
 #include <QPixmap>
 #include <QString>
+#include <functional>
 
+class QAbstractButton;
+class QAction;
 class QApplication;
+class QMenu;
+class QObject;
+class QPushButton;
 
 namespace hm::ui {
 
@@ -26,5 +32,13 @@ QPixmap eyePix(bool open, const QColor& c = QColor(0xcf, 0xcf, 0xcf));
 QIcon eyeIcon(bool open);
 // the pointer of a tool: the arrow with the tool's picture beside it, lower right (the hot spot — the arrow's tip)
 QCursor badgeCursor(const QString& image);
+
+// The commands used rarely, behind one button: a menu. What is pressed again and again while working stays a button of its own.
+// An item keeps the caption and the tip the command had as a button, so a key given to it (End over it) goes on working
+// (Keymap::triggerCustom looks through the menus of the buttons on screen). moreMenu: the button gets the menu (its tips shown);
+// moreButton: a small button with the "more" dots and no words — tip says what is in it
+QMenu* moreMenu(QAbstractButton* b);
+QAction* menuItem(QMenu* m, const QString& text, const QString& tip, QObject* ctx, std::function<void()> f, const QString& icon = {});
+QPushButton* moreButton(const QString& tip, QMenu** menu);
 
 }  // namespace hm::ui

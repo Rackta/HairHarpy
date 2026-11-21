@@ -2,10 +2,14 @@
 #include "io/MeshImport.h"
 #include "scene/Topo.h"
 #include "scene/Refs.h"
+#include "paint/PaintDoc.h"
 #include "scene/Cocoons.h"
 #include "scene/Walls.h"
 #include "scene/Crown.h"
+#include "scene/Looks.h"
 #include <QSaveFile>
+#include <QCryptographicHash>
+#include <map>
 #ifdef Q_OS_WIN
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -13,6 +17,7 @@
 #include <windows.h>
 #endif
 #include <algorithm>
+#include <cstdio>
 #include <set>
 #include <QDir>
 #include <QFile>
@@ -121,7 +126,10 @@ Item itemFromJson(const QJsonObject& o, const QString& path, LoadResult& res) {
         face.clear(); for (const QJsonValue& x : fv.toArray()) face.push_back(x.toInt());
         if (face.size() >= 3) m->addFace(face.data(), int(face.size()));
       }
+      { const QJsonArray fg = d.value("fg").toArray(), gs = d.value("groups").toArray();   // (a converted mesh's polygroups: one per lock)
+        if (fg.size() == m->faceCount() && !gs.isEmpty()) { for (const QJsonValue& g : gs) m->groupNames.push_back(g.toString()); for (const QJsonValue& g : fg) m->faceGroup.push_back(std::clamp(g.toInt(), 0, int(gs.size()) - 1)); } }
       if (m->faceCount()) it.poly = m;
+      plainMesh(it);                                           // (an older file's converted mesh: an ordinary one from now on)
       break;
     }
     case ItemType::IMesh:
@@ -131,6 +139,48 @@ Item itemFromJson(const QJsonObject& o, const QString& path, LoadResult& res) {
     default: break;
   }
   return it;
+}
+
+namespace {
+// every imported mesh's map ({ name, data | img | path… }) of the items of a project and of its other rooms
+template <class Fn> void eachLookMap(QJsonArray& items, Fn fn) {
+  for (int i = 0; i < items.size(); i++) {
+    QJsonObject o = items[i].toObject(); if (!o.value("look").isObject()) continue;
+    QJsonObject L = o.value("look").toObject(); QJsonArray S = L.value("sets").toArray(); bool ch = false;
+    for (int s = 0; s < S.size(); s++) { QJsonObject so = S[s].toObject(); QJsonObject m = so.value("maps").toObject(); bool mc = false;
+      for (const char* k : {"map", "alphaMap"}) { const QJsonValue v = m.value(k); if (!v.isObject()) continue; QJsonObject mo = v.toObject(); if (fn(mo)) { m.insert(k, mo); mc = true; } }
+      if (mc) { so.insert("maps", m); S[s] = so; ch = true; } }
+    if (ch) { L.insert("sets", S); o.insert("look", L); items[i] = o; }
+  }
+}
+template <class Fn> void eachItemList(QJsonObject& P, Fn fn) {
+  if (P.value("items").isArray()) { QJsonArray a = P.value("items").toArray(); fn(a); P.insert("items", a); }
+  if (P.value("rooms").isObject()) { QJsonObject R = P.value("rooms").toObject();
+    for (const QString& k : R.keys()) { QJsonObject r = R.value(k).toObject(); if (!r.value("items").isArray()) continue; QJsonArray a = r.value("items").toArray(); fn(a); r.insert("items", a); R.insert(k, r); }
+    P.insert("rooms", R); }
+}
+// (an image several maps hold — one texture on several models — written once into "images" { key: data URL }, the maps
+// naming it by "img"; an image held once stays in its map, as before)
+QJsonObject shareImages(QJsonObject& T) {
+  std::map<QString, int> n;
+  eachItemList(T, [&](QJsonArray& a) { eachLookMap(a, [&](QJsonObject& m) { const QString d = m.value("data").toString(); if (!d.isEmpty()) n[d]++; return false; }); });
+  bool any = false; for (auto& [d, c] : n) if (c > 1) any = true;
+  if (!any) return {};
+  QJsonObject images; std::map<QString, QString> keyOf;
+  eachItemList(T, [&](QJsonArray& a) { eachLookMap(a, [&](QJsonObject& m) {
+    const QString d = m.value("data").toString(); if (d.isEmpty() || n[d] < 2) return false;
+    QString& k = keyOf[d]; if (k.isEmpty()) { k = QString::fromLatin1(QCryptographicHash::hash(d.toLatin1(), QCryptographicHash::Sha1).toHex().left(16)); images.insert(k, d); }
+    m.remove("data"); m.insert("img", k); return true; }); });
+  return images;
+}
+}  // namespace
+
+void expandSharedImages(QJsonObject& P) {
+  if (!P.value("images").isObject()) return;
+  const QJsonObject I = P.value("images").toObject();
+  eachItemList(P, [&](QJsonArray& a) { eachLookMap(a, [&](QJsonObject& m) {
+    if (!m.contains("img")) return false; m.insert("data", I.value(m.value("img").toString()).toString()); m.remove("img"); return true; }); });
+  P.remove("images");
 }
 
 LoadResult loadProject(const QString& path, Scene& scene) {
@@ -146,6 +196,7 @@ LoadResult loadProjectData(const QByteArray& bytes, const QString& path, Scene& 
   if (doc.isNull()) { res.error = QStringLiteral("Not a project file (%1)").arg(pe.errorString()); return res; }
   QJsonObject P = doc.object();
   if (P.value("app").toString() != "anime-hair-modeler") { res.error = QStringLiteral("Not a HairHarpy project"); return res; }
+  expandSharedImages(P);                                       // (the textures kept once: back into each map)
   if (P.value("preset").toBool()) { res.error = QStringLiteral("This is a preset — migrate it into a project instead of opening it"); return res; }
 
   scene.clear();
@@ -188,8 +239,14 @@ LoadResult loadProjectData(const QByteArray& bytes, const QString& path, Scene& 
 
   // the references (planes: ids of their own, as the HTML version's RP_UID)
   { QJsonObject R = P.value("refs").toObject(); scene.refBoard = R.value("board").toObject();
+    for (const QJsonValue& v : R.value("canvases").toArray()) { const QJsonObject c = v.toObject(); const int cid = c.value("id").toInt(-1); paint::Document d;   // (the canvases: smart objects with all their layers)
+      if (cid >= 0 && d.unpackJson(c.value("data").toObject())) { RefSketch& s = scene.refSketches[cid]; s.data = c.value("data").toObject(); s.flat = d.compose(paint::Channel::Color); s.rev = 1; s.name = c.value("name").toString(); scene.nextCanvasId = std::max(scene.nextCanvasId, cid + 1); } }
     for (const QJsonValue& v : R.value("planes").toArray()) { QString view = v.toObject().value("view").toString(); bool ok = false; for (const char* k : refs::VIEWS) if (view == k) ok = true;
-      if (ok) scene.refPlanes.push_back(refs::fromJson(v.toObject(), scene.nextRefId++)); } }
+      if (!ok) continue; const int pid = scene.nextRefId++; scene.refPlanes.push_back(refs::fromJson(v.toObject(), pid));
+      const QJsonObject sk = v.toObject().value("sketch").toObject();   // (its ✏ drawing: the layers with their pixels)
+      if (!sk.isEmpty()) { paint::Document d; if (d.unpackJson(sk)) { const int cid = scene.nextCanvasId++; RefSketch& s = scene.refSketches[cid]; s.data = sk; s.flat = d.compose(paint::Channel::Color); s.rev = 1; s.name = scene.refPlanes.back().name; scene.refPlanes.back().canvas = cid; } } }   // (a file from before the canvases: its drawing becomes the plane's own canvas)
+    for (const QJsonValue& v : R.value("markers").toArray()) scene.refMarkers.push_back(refs::markerFromJson(v.toObject(), scene.nextMarkerId++));
+    scene.refMarkersShown = R.value("markersShown").toBool(true); scene.refMarkRev++; }
 
   QJsonObject cam = P.value("camera").toObject();
   if (!cam.isEmpty()) {
@@ -246,7 +303,10 @@ void sceneRecords(const Scene& sc, const SaveExtras& x, QJsonArray& items, QJson
         QJsonArray ch; for (int c : it->children) ch.append(c); o.insert("children", ch);
         o.insert("expanded", it->expanded);
         QJsonObject shape; QJsonArray ends;
-        if (x.cocoons && x.cocoons->liveState(it->id, shape, ends)) {
+        bool have = false;
+        if (x.cocoonSnap) { auto f = x.cocoonLive.find(it->id); if (f != x.cocoonLive.end()) { shape = f->second.first; ends = f->second.second; have = true; } }
+        else have = x.cocoons && x.cocoons->liveState(it->id, shape, ends);
+        if (have) {
           o.insert("shape", shape);
           if (o.value("live").isObject()) { QJsonObject live = o.value("live").toObject(); live.insert("ends", ends); o.insert("live", live); }
         }
@@ -259,6 +319,7 @@ void sceneRecords(const Scene& sc, const SaveExtras& x, QJsonArray& items, QJson
           if (!anchorSeen.insert(a).second) continue;
           const Anchor* A = sc.anchor(a); if (!A) continue;
           QJsonObject r = A->raw; r.insert("id", a); r.insert("p", vec3j(A->pos)); r.insert("s", A->smooth);
+          if (A->pass) r.insert("ps", QJsonArray{A->pass->first, A->pass->second}); else r.remove("ps");   // (a junction rotated in this session: it was read from the file but never written)
           anchors.append(r);
         }
         o.insert("anchors", an);
@@ -276,8 +337,29 @@ void sceneRecords(const Scene& sc, const SaveExtras& x, QJsonArray& items, QJson
       }
       case ItemType::Surface: o.insert("a", it->a); o.insert("b", it->b); break;
       case ItemType::IMesh:                                    // (edited in the Topology room: its geometry as a packed source)
-        if (o.value("src").toObject().value("live").toBool() && it->base) o.insert("src", QJsonObject{{"ext", "pmesh"}, {"b64", QString::fromLatin1(topo::packPMesh(*it->base).toBase64())}, {"blobKind", "b64"}});
-        if (it->headTag) o.insert("headTag", true); else o.remove("headTag");
+        if (o.value("src").toObject().value("live").toBool() && it->base) {
+          o.insert("src", QJsonObject{{"ext", "pmesh"}, {"b64", QString::fromLatin1(topo::packPMesh(*it->base).toBase64())}, {"blobKind", "b64"}});
+          // (the packed source has no textures, colours or see-through of the file's own: they go into the look's sets
+          // where the look does not set its own)
+          const PolyMesh& B = *it->base; const std::vector<TexSet> ts = texSets(B);
+          QJsonObject L = looks::norm(o.value("look"), ts); QJsonArray S = L.value("sets").toArray(); bool baked = false;
+          for (int i = 0; i < S.size() && size_t(i) < ts.size(); i++) {
+            const int mat = ts[size_t(i)].mat; QJsonObject s = S[i].toObject(), maps = s.value("maps").toObject(); bool ch = false;
+            for (int slot = 0; slot < 2; slot++) {
+              const char* k = looks::SLOT_KEY[slot]; if (maps.contains(k) || mat < 0 || size_t(mat) >= B.matMaps.size()) continue;
+              const PolyMesh::Map& own = B.matMaps[size_t(mat)][size_t(slot)]; if (own.data.isEmpty()) continue;
+              const QString e = QFileInfo(own.name).suffix().toLower();
+              const QString mime = e == "jpg" || e == "jpeg" ? "image/jpeg" : e == "webp" ? "image/webp" : e == "bmp" ? "image/bmp" : e == "tga" ? "image/x-tga" : "image/png";
+              maps.insert(k, QJsonObject{{"name", own.name.isEmpty() ? QString("texture") : own.name}, {"data", "data:" + mime + ";base64," + QString::fromLatin1(own.data.toBase64())}}); ch = true;
+            }
+            const bool hasMap = maps.value("map").isObject();
+            if (!hasMap && !s.contains("color") && !ts[size_t(i)].color.isEmpty()) { s.insert("color", ts[size_t(i)].color); ch = true; }
+            if (!s.contains("alpha") && ts[size_t(i)].alpha) { s.insert("alpha", true); ch = true; }
+            if (ch) { s.insert("maps", maps); S[i] = s; baked = true; }
+          }
+          if (baked) { L.insert("sets", S); o.insert("look", L); }
+        }
+        o.remove("headTag");                                   // (the head mark is no more: Head Collision's objects are its group's)
         break;
       default: break;
     }
@@ -295,6 +377,8 @@ QByteArray projectJson(const Scene& sc, const SaveExtras& x) {
   const QJsonObject& F = sc.fileRaw;
   QJsonArray items, anchors; sceneRecords(sc, x, items, anchors);
   QJsonArray roots; for (int r : sc.roots) roots.append(r);
+  QJsonObject shared{{"items", items}}; if (F.value("rooms").isObject()) shared.insert("rooms", F.value("rooms"));
+  const QJsonObject images = shareImages(shared); items = shared.value("items").toArray();   // (a texture on several models: kept once)
 
   // settings as loadProject leaves them: the loop step the walls use (when the saved one is off by over 2 %), the logic
   // outside the groups
@@ -323,13 +407,17 @@ QByteArray projectJson(const Scene& sc, const SaveExtras& x) {
   top.push_back({"settings", settings});
   top.push_back({"camera", x.camera.isEmpty() ? F.value("camera") : QJsonValue(x.camera)});
   { // the references: the board as kept, the planes as they are now
-    QJsonArray planes; for (const RefPlane& rp : sc.refPlanes) planes.append(refs::toJson(rp));
-    top.push_back({"refs", QJsonObject{{"board", sc.refBoard.isEmpty() ? QJsonValue(QJsonObject{{"items", QJsonArray()}, {"pan", QJsonObject{{"x", 0}, {"y", 0}}}, {"zoom", 1}}) : QJsonValue(sc.refBoard)}, {"planes", planes}}});
+    QJsonArray planes, canvases; std::set<int> usedCanvas;
+    for (const RefPlane& rp : sc.refPlanes) { planes.append(refs::toJson(rp)); if (rp.canvas >= 0) usedCanvas.insert(rp.canvas); }
+    for (int cid : usedCanvas) if (auto f = sc.refSketches.find(cid); f != sc.refSketches.end() && !f->second.data.isEmpty()) canvases.append(QJsonObject{{"id", cid}, {"name", f->second.name}, {"data", f->second.data}});   // (one record however many planes show it; no plane left — not kept)
+    QJsonArray marks; for (const RefMarker& m : sc.refMarkers) marks.append(refs::markerJson(m));
+    top.push_back({"refs", QJsonObject{{"board", sc.refBoard.isEmpty() ? QJsonValue(QJsonObject{{"items", QJsonArray()}, {"pan", QJsonObject{{"x", 0}, {"y", 0}}}, {"zoom", 1}}) : QJsonValue(sc.refBoard)}, {"planes", planes}, {"canvases", canvases}, {"markers", marks}, {"markersShown", sc.refMarkersShown}}});
   }
   if (F.contains("credits")) top.push_back({"credits", F.value("credits")});
-  if (F.contains("rooms")) top.push_back({"rooms", F.value("rooms")});
+  if (F.contains("rooms")) top.push_back({"rooms", shared.contains("rooms") ? shared.value("rooms") : F.value("rooms")});
+  if (!images.isEmpty()) top.push_back({"images", images});
   std::set<QString> done; for (auto& [k, v] : top) done.insert(k);
-  for (auto it = F.begin(); it != F.end(); ++it) if (!done.count(it.key()) && it.key() != "head") top.push_back({it.key(), it.value()});
+  for (auto it = F.begin(); it != F.end(); ++it) if (!done.count(it.key()) && it.key() != "head" && it.key() != "images") top.push_back({it.key(), it.value()});
 
   QByteArray out = "{";
   bool first = true;
@@ -346,6 +434,12 @@ QByteArray projectJson(const Scene& sc, const SaveExtras& x) {
 // the project written whole next to it first (<name>.saving), then put in the old one's place — Windows refuses that
 // while something still holds the old file (an antivirus reading the last save — hundreds of MB —, a backup, an
 // indexer): tried again for up to 10 s; refused still — the written copy kept and named in the error, nothing lost
+void snapCocoons(SaveExtras& x, const Scene& scene) {
+  x.cocoonLive.clear(); x.cocoonSnap = true;
+  if (x.cocoons) for (const auto& [id, it] : scene.items) if (it.type == ItemType::Cocoon) { QJsonObject shape; QJsonArray ends; if (x.cocoons->liveState(id, shape, ends)) x.cocoonLive[id] = {shape, ends}; }
+  x.cocoons = nullptr;
+}
+
 bool saveProject(const QString& path, const Scene& sc, const SaveExtras& x, QString* error) {
   const QString tmp = path + ".saving";
   { QFile f(tmp); if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate)) { if (error) *error = f.errorString(); return false; }
@@ -362,7 +456,7 @@ bool saveProject(const QString& path, const Scene& sc, const SaveExtras& x, QStr
                         .arg(qt_error_string(int(e)), QFileInfo(tmp).fileName(), QFileInfo(path).fileName());
   return false;
 #else
-  QFile::remove(path); if (QFile::rename(tmp, path)) return true;
+  if (std::rename(QFile::encodeName(tmp).constData(), QFile::encodeName(path).constData()) == 0) return true;   // (POSIX rename replaces the old file at once: never a moment without the project)
   if (error) *error = QString("Could not replace %1; the project is saved as %2").arg(QFileInfo(path).fileName(), QFileInfo(tmp).fileName());
   return false;
 #endif

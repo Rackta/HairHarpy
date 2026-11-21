@@ -1,11 +1,13 @@
 #include "scene/AnchorOps.h"
 #include "scene/CurveMath.h"
+#include "scene/Crown.h"
 #include "scene/Edit.h"
 #include "scene/HairState.h"
 #include <QJsonArray>
 #include <algorithm>
 #include <cmath>
 #include <deque>
+#include <optional>
 
 namespace hm::aops {
 
@@ -80,7 +82,8 @@ QString curveBetween(Scene& sc, const CurveCache& cc, int a, int b, int fallback
   // an anchor of a crown's parting line: the new curve gets its own one ATTACHED there (a lower connector's — shared)
   auto end = [&](int x) {
     for (int k : curvesWithOrd(sc, x)) { const Item* h = sc.item(k); if (h->conn.isEmpty()) continue; if (h->conn == "low") return x;
-      Anchor& n = sc.addAnchor(P(sc, x)); n.raw.insert("at", QJsonObject{{"c", h->id}, {"t", 0}}); return n.id; }
+      const double t = crown::nearestT(fresh(sc, cc, h->id), P(sc, x));   // (where on the connector the picked anchor lies — not its start)
+      Anchor& n = sc.addAnchor(P(sc, x)); n.raw.insert("at", QJsonObject{{"c", h->id}, {"t", t}}); return n.id; }
     return x;
   };
   std::map<int, int> E{{a, end(a)}, {b, end(b)}};
@@ -190,7 +193,7 @@ QString zipApply(Scene& sc, const CurveCache& cc, Selection& sel, int J, bool up
 
 // ---- ⚙ optimize anchors: every inner anchor that can go without the curve leaving its shape (3 % of a loop step or
 // 0.3 % of its length) goes — the cheapest first; trunk mates go together; a junction stays ----
-QString optimizeAnchors(Scene& sc, const CurveCache& cc, const std::vector<int>& cs, const std::set<int>* only) {
+QString optimizeAnchors(Scene& sc, const CurveCache& cc, const std::vector<int>& cs, const std::set<int>* only, double tolScale) {
   (void)cc;
   auto all = byOrder(sc, ItemType::Curve);
   std::set<int> touched(cs.begin(), cs.end());
@@ -198,7 +201,7 @@ QString optimizeAnchors(Scene& sc, const CurveCache& cc, const std::vector<int>&
   struct Info { std::vector<Vec3> ref; double tol; std::map<int, int> refIdx; };
   std::map<int, Info> info;
   for (int id : touched) { const Item* c = sc.item(id); Info I; for (auto& s : sampleCurve(sc, *c, 8)) I.ref.push_back(s.p);
-    I.tol = std::max(polyLen(I.ref) * 0.003, loopStep(sc, *c) * 0.03); for (size_t k = 0; k < c->anchors.size(); k++) I.refIdx[c->anchors[k]] = int(k) * 8; info[id] = I; }
+    I.tol = std::max(polyLen(I.ref) * 0.003, loopStep(sc, *c) * 0.03) * tolScale; for (size_t k = 0; k < c->anchors.size(); k++) I.refIdx[c->anchors[k]] = int(k) * 8; info[id] = I; }
   auto localDev = [&](const Item& c, int i) {                          // c.anchors: the trial list (anchor i of the old one removed)
     const auto& A = c.anchors; const Info& I = info[c.id]; int lo = std::max(0, i - 2), hi = std::min(int(A.size()) - 1, i + 1);
     std::map<int, Handles> H; for (int k = lo; k <= hi; k++) H[k] = curveHandles(sc, c, k);
@@ -377,7 +380,7 @@ QString snapApply(Scene& sc, const CurveCache& cc, Selection& sel, int a, const 
   for (size_t q = 0; q < o.segs.size(); q++) seq.push_back({sc.item(o.segs[q].c)->anchors[size_t(o.segs[q].k1)], o.segs[q].c, o.segs[q].k1, q + 1 < o.segs.size() ? &o.segs[q + 1] : nullptr});
   auto users = [&](int an) { int n = 0; for (const Item* c : sc.curves()) if (!c->junc && !c->hasPath() && idxOf(c->anchors, an) >= 0) n++; return n; };
   std::vector<X> keep; for (size_t q = 0; q < seq.size(); q++) { auto& x = seq[q]; if (q == 0 || q + 1 == seq.size() || users(x.an) > 1 || (x.next && x.next->c != x.c)) keep.push_back(x); }
-  std::map<int, int> pair; int prev = -1; double lh = levelH(sc);
+  std::map<int, int> pair; int prev = -1; double lh = levelH(sc); std::vector<int> inserted; std::optional<CurveCache> own;
   auto atA = [&](int an) -> const SnapTrack::Anc* { for (auto& e : T->A) if (e.an == an) return &e; return nullptr; };
   for (auto& x : keep) {
     const SnapTrack::Anc* pe = prev >= 0 ? atA(prev) : nullptr;
@@ -387,11 +390,17 @@ QString snapApply(Scene& sc, const CurveCache& cc, Selection& sel, int a, const 
     int Q = (T->arc[size_t(si2)] - T->arc[size_t(lo.si)]) <= 0.2 * span ? lo.an : (T->arc[size_t(hi->si)] - T->arc[size_t(si2)]) < 0.2 * span ? hi->an : -1;
     if (Q >= 0) { bool taken = Q == prev; for (auto& [k, v] : pair) if (v == Q) taken = true; if (taken) Q = -1; }
     if (Q < 0 && pe && std::abs(T->arc[size_t(si2)] - T->arc[size_t(pe->si)]) < 0.02 * lh) continue;
-    if (Q < 0) { auto m = T->meta[size_t(si2)]; Anchor& nq = sc.addAnchor(T->pts[size_t(si2)]); nq.smooth = 1; Q = nq.id; net.insertOnSegment(m.first, m.second, Q); sc.reindex(); T = snapTrack(sc, cc, trackIds); }
+    if (Q < 0) { auto m = T->meta[size_t(si2)]; Anchor& nq = sc.addAnchor(T->pts[size_t(si2)]); nq.smooth = 1; Q = nq.id; net.insertOnSegment(m.first, m.second, Q); sc.reindex(); inserted.push_back(Q);
+      // (the track made again from the curves as they are now: the cache still holds their samples from before the new anchor)
+      if (!own) own = cc; for (int c : curvesWithOrd(sc, Q)) own->erase(c);
+      T = snapTrack(sc, *own, trackIds); if (!T) break; }
     pair[x.an] = Q; prev = Q;
   }
   std::vector<X> K; for (auto& x : keep) if (pair.count(x.an)) K.push_back(x);
-  if (K.size() < 2) return "!" + QObject::tr("⇶ The part and the target don't run along each other");
+  if (K.size() < 2 || !T) {                                     // (nothing done: the anchors put into the track taken out again — the scene as it was)
+    for (int q : inserted) { for (auto& [id, it] : sc.items) if (it.type == ItemType::Curve) { auto& A = it.anchors; A.erase(std::remove(A.begin(), A.end(), q), A.end()); it.ovr.erase(q); } sc.anchors.erase(q); }
+    if (!inserted.empty()) sc.reindex();
+    return "!" + QObject::tr("⇶ The part and the target don't run along each other"); }
   struct G { int an; std::optional<SnapTrack::Anc> e; }; std::vector<G> glued;
   for (size_t q = 0; q + 1 < K.size(); q++) {
     auto &x = K[q], &y = K[q + 1]; Item* c = sc.item(y.c); int i = idxOf(c->anchors, x.an), j = idxOf(c->anchors, y.an);
@@ -587,13 +596,16 @@ QString splitWall(Scene& sc, const CurveCache& cc, Selection& sel, int w) {
     if (st) s2 = *st; else if (!sc.item(c)->hasPath()) s2 = {{c, lo, hi}};
     return s2.empty() ? -1 : net.pathCurve(s2, par);
   };
-  std::vector<int> made;
+  std::vector<int> made; const int id0 = sc.nextId;               // (what is made from here on: taken away again if the split fails)
   for (size_t k = 0; k < Z.size(); k++) {
     int a = side(A, Z[k].a0, Z[k].a1), b = side(B, Z[k].b0, Z[k].b1); if (a < 0 || b < 0 || a == b) continue;
     int sn = edit::nextNumber(sc, ItemType::Surface); Item& s = sc.addItem(ItemType::Surface, par, QString("Surface %1").arg(sn));
     s.a = a; s.b = b; s.raw = QJsonObject{{"p", p}}; s.name = QString("%1_%2").arg(wn).arg(k + 1); if (!col.isEmpty()) s.color = col; made.push_back(s.id);
   }
-  if (made.size() < 2) { for (int s : made) net.deleteItem(s); return "!" + QObject::tr("%1: the parts couldn't be laid on its curves").arg(wn); }
+  if (made.size() < 2) { for (int s : made) net.deleteItem(s);
+    std::vector<int> newCurves; for (auto& [id, it] : sc.items) if (id >= id0 && it.type == ItemType::Curve) newCurves.push_back(id);   // (the side curves laid for the parts: gone with them)
+    for (int c : newCurves) if (sc.item(c)) net.deleteItem(c);
+    return "!" + QObject::tr("%1: the parts couldn't be laid on its curves").arg(wn); }
   // (the new walls in the old one's place in its group)
   auto& arr = par >= 0 ? sc.item(par)->children : sc.roots;
   for (int s : made) arr.erase(std::remove(arr.begin(), arr.end(), s), arr.end());

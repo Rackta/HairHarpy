@@ -23,10 +23,10 @@ namespace hm {
 void Viewport::loadInspect() {
   const QJsonObject o = QJsonDocument::fromJson(QSettings().value("inspect").toByteArray()).object();
   insp.ngons = o.value("ngons").toBool(); insp.open = o.value("open").toBool(); insp.nonPlanar = o.value("nonPlanar").toBool();
-  insp.nonManifold = o.value("nonManifold").toBool(); insp.interior = o.value("interior").toBool(); insp.hard = o.value("hard").toBool(); insp.doubles = o.value("doubles").toBool(); insp.planarTol = std::clamp(o.value("planarTol").toDouble(0.06), 0.0, 1.0);
+  insp.nonManifold = o.value("nonManifold").toBool(); insp.interior = o.value("interior").toBool(); insp.hard = o.value("hard").toBool(); insp.doubles = o.value("doubles").toBool(); insp.asym = o.value("asym").toBool(); insp.planarTol = std::clamp(o.value("planarTol").toDouble(0.06), 0.0, 1.0);
 }
 void Viewport::inspChanged() {
-  QSettings().setValue("inspect", QJsonDocument(QJsonObject{{"ngons", insp.ngons}, {"open", insp.open}, {"nonPlanar", insp.nonPlanar}, {"nonManifold", insp.nonManifold}, {"doubles", insp.doubles}, {"interior", insp.interior}, {"hard", insp.hard}, {"planarTol", insp.planarTol}}).toJson(QJsonDocument::Compact));
+  QSettings().setValue("inspect", QJsonDocument(QJsonObject{{"ngons", insp.ngons}, {"open", insp.open}, {"nonPlanar", insp.nonPlanar}, {"nonManifold", insp.nonManifold}, {"doubles", insp.doubles}, {"interior", insp.interior}, {"hard", insp.hard}, {"asym", insp.asym}, {"planarTol", insp.planarTol}}).toJson(QJsonDocument::Compact));
   topoRev_++; requestUpdate();
 }
 
@@ -37,7 +37,7 @@ const Viewport::InspC& Viewport::inspOf(int m) const {
   InspC& c = inspC_[m];
   // (the slow checks — the double walls' overlaps, the rays of the interior — only while their highlight is on: each
   // edit of a mesh of tens of thousands of polygons made them again, near a second a step)
-  const int heavyNow = (insp.doubles ? 1 : 0) | (insp.interior ? 2 : 0);
+  const int heavyNow = (insp.doubles ? 1 : 0) | (insp.interior ? 2 : 0) | (insp.asym ? 4 : 0);
   if (c.key == key && c.shown == it->poly.get() && c.tol == insp.planarTol && c.heavy == heavyNow) return c;
   c = {}; c.key = key; c.shown = it->poly.get(); c.tol = insp.planarTol; c.heavy = heavyNow;
   auto T = topo::ttopo(B); const auto& P = it->poly->pos; if (P.size() < size_t(T->n)) return c;
@@ -105,6 +105,15 @@ const Viewport::InspC& Viewport::inspOf(int m) const {
             const double ov = poly.size() >= 3 ? std::abs(area2(poly)) : 0; if (ov <= 0) continue;
             if (ov > 0.1 * std::min(sa, sb)) { over.insert(A.f); over.insert(Bt.f); } } } }
       const std::set<int> had(c.doubles.begin(), c.doubles.end()); for (int f : over) if (!had.count(f)) c.doubles.push_back(f); } }
+  // asymmetry: the polygons with a corner that has no twin under the Symmetry settings' first mirror, or one off its
+  // twin's mirrored place by over a fiftieth of an edge — the side edited by hand apart from the other
+  if (insp.asym) { const SymSet S = symSet(m, B->pos);
+    if (!S.T.empty() && !S.pr.empty()) { const auto& pr = S.pr.front(); const Affine& Tm = S.T.front(); double el = 0; int ne = 0;
+      for (int e = 0; e < T->ne; e += std::max(1, T->ne / 4000)) { el += B->pos[size_t(T->ea[size_t(e)])].distanceTo(B->pos[size_t(T->eb[size_t(e)])]); ne++; }
+      const double tolA = std::max(1e-6, (ne ? el / ne : 1.0) * 0.02); std::vector<char> bad(B->pos.size(), 0);
+      for (size_t v = 0; v < B->pos.size() && v < pr.size(); v++) { const int w = pr[v]; if (w < 0 || size_t(w) >= B->pos.size() || Tm.apply(B->pos[v]).distanceTo(B->pos[size_t(w)]) > tolA) bad[v] = 1; }
+      for (int f = 0; f < T->nf; f++) { if (!shown(f)) continue; bool b = false; for (int k = T->fo[size_t(f)]; k < T->fo[size_t(f) + 1] && !b; k++) if (size_t(T->fv[size_t(k)]) < bad.size() && bad[size_t(T->fv[size_t(k)])]) b = true; if (b) c.asym.push_back(f); }
+      for (size_t v = 0; v < bad.size() && v < P.size(); v++) if (bad[v]) c.asymPts.push_back(P[v]); } }
   // the hard edges (shading broken along them)
   for (auto& h : B->hardEdges) if (h[0] < T->n && h[1] < T->n) if (int e = T->edgeOf(h[0], h[1]); e >= 0) c.hard.push_back(e);
   // open, non-manifold edges

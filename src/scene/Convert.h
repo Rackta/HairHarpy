@@ -31,6 +31,7 @@ struct LockMesh {
   struct Fold { int a, b; };                                   // two rings (indices into ringList) the lock folds between
   std::vector<Fold> folds;
   std::vector<CocoonRing> ringList;
+  std::vector<signed char> ringClosed;                         // (each ring: 1 — closed round the lock, 0 — an open strip, -1 — left out)
   QString err;
 };
 
@@ -57,9 +58,10 @@ struct WeldProblem {
   int fix = -1;                                                // an Auto-fix under review here (its index): blue / orange
 };
 struct LockWeldResult {
-  struct Group { std::vector<int> fam; std::vector<Vec3> pos; std::vector<std::vector<int>> faces; };
+  struct Group { std::vector<int> fam; std::vector<Vec3> pos; std::vector<std::vector<int>> faces; std::vector<int> faceLock; };   // (faceLock: each face's cocoon)
   std::vector<Group> groups;
   int merged = 0, doubled = 0, inside = 0, filled = 0, open = 0;
+  int keptApart = 0, parted = 0;                                // (parted: points copied where two locks only touch along a line)                                            // (crossings marked correct: nothing welded or removed there)
   std::vector<WeldProblem> problems, accepted;
 };
 // the locks (sources first): each cocoon's id and its ringMeshOf mesh; S.weldOk's places without a kind are classified

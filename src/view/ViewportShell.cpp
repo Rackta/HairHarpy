@@ -38,7 +38,7 @@ const QString NO_COCOON = QObject::tr("Shell modifiers go on a cocoon: select a 
 bool Viewport::shellBrushActive() const {
   if (tool_ != "guide") return false;
   auto has = [&](ItemType t) { for (auto& [id, it] : scene_->items) if (it.type == t && modCocoon(*scene_, &it)) return true; return false; };
-  return (shTab == "tip" && tipBrush.on && has(ItemType::Tip)) || (shTab == "pinf" && pinfBrush.on && has(ItemType::PInf));
+  return (shTab == "tip" && tipBrush.on && has(ItemType::Tip)) || (shTab == "pinf" && pinfBrush.on && has(ItemType::PInf)) || (shTab == "spiral" && spiralBrush.on && has(ItemType::Spiral));
 }
 
 // the cocoons a shell modifier goes on: the selected cocoons; else the cocoon of a selected shell modifier; else the
@@ -149,8 +149,9 @@ bool Viewport::shellPress(QMouseEvent* e) {
   if (tool_ != "guide" || e->button() != Qt::LeftButton) return false;
   bool alt = e->modifiers() & Qt::AltModifier, ctrl = e->modifiers() & Qt::ControlModifier, shift = e->modifiers() & Qt::ShiftModifier;
   QPointF m = e->position();
-  bool tip = shTab == "tip" && shellBrushActive(), pinf = shTab == "pinf" && shellBrushActive();
+  bool tip = shTab == "tip" && shellBrushActive(), pinf = shTab == "pinf" && shellBrushActive(), spir = shTab == "spiral" && shellBrushActive();
   // (Parent influence: signed — Ctrl inverted, Ctrl+Alt erase; Density: Ctrl+Shift — its Even spacing mask, +Alt — erasing it)
+  if (spir && !alt) { md_ = {}; md_.op = shift ? "smooth" : ctrl ? "erase" : "paint"; md_.last = m; drag_ = Drag::Mask; shellMove(m); md_.last = m; return true; }
   if ((tip || pinf) && (!alt || (ctrl && (pinf || (tip && shift))))) {
     QString op = tip && ctrl && shift ? (alt ? "evenErase" : "even") : shift ? "smooth" : pinf ? (ctrl ? (alt ? "erase" : "invert") : "paint") : ctrl ? "erase" : "paint";
     md_ = {}; md_.op = op; md_.last = m; drag_ = Drag::Mask;
@@ -175,6 +176,8 @@ void Viewport::shellMove(const QPointF& m) {
     else if (op == "evenErase") ch = paintCocoonMask(m, "erase", amt, "tip", 0, "emask");
     else if (op == "smooth") { bool a = paintCocoonMask(m, "smooth", amt, "tip", 0), b = paintCocoonMask(m, "smooth", amt, "tip", 0, "emask"); ch = a || b; }
     else ch = paintCocoonMask(m, op, amt, "tip", tipBrush.strength);
+  } else if (shTab == "spiral") {
+    ch = paintCocoonMask(m, op, amt, "spiral", spiralBrush.strength);
   } else {
     if (op == "paint") ch = paintCocoonMask(m, "paint", amt, "pinf", -pinfBrush.strength);
     else if (op == "invert") ch = paintCocoonMask(m, "paint", amt, "pinf", pinfBrush.strength);
@@ -250,13 +253,7 @@ void Viewport::createCocoonGuide(const QPointF& A, const QPointF& B) {
       g.raw = QJsonObject{{"kind", "line"}, {"hits", QJsonArray()}, {"on", QJsonObject{{"s", sv}, {"d", QJsonArray{d.dot(G.u[size_t(i)]), d.dot(G.v[size_t(i)]), d.dot(G.t[size_t(i)])}}}}, {"p", gp}};
       if (!link.isEmpty()) { g.raw.insert("link", link); g.raw.insert("linkOn", true); }
       s.item(h.k)->expanded = true; made.push_back(g.id); cks.push_back(h.k);
-      // where it takes the loops of its parent / a linked cocoon, theirs rule: the guide changes nothing there
-      auto R = hair_.cocoons().find(h.k);
-      if (R != hair_.cocoons().end() && !R->second.rings.empty()) {
-        double tgt = sv * G.D[size_t(G.N - 1)]; const CocoonRing* b = nullptr;
-        for (auto& r : R->second.rings) if (!b || std::abs(r.s - tgt) < std::abs(b->s - tgt)) b = &r;
-        if (b && b->par) ruled << k->name;
-      }
+      // (where it takes the loops of its parent / a linked cocoon, the guide rules within its reach — cocoonRings)
     }
     if (made.empty()) return QString("!") + (along.isEmpty() ? tr("The selected cocoon is not in view") : tr("Drag the line across the cocoon, not along it"));
     if (made.size() == 1) { s.item(made[0])->raw.remove("link"); s.item(made[0])->raw.remove("linkOn"); }
@@ -348,23 +345,23 @@ void Viewport::placeDisc(const QPointF& m) {
 // "Create": a disc across the middle of each targeted cocoon; none targeted — a scene disc at the middle height
 void Viewport::createDiscs() {
   auto ks = shellTargets(); if (ks.empty()) { sceneDiscAt(std::nullopt); return; }
-  CocoonSystem* cs = hair_.cocoonSystem();
-  for (int k : ks) { CocoonGeo G = cs->geo(k); discOnCocoon(k, (G.N - 1) / 2.0); }
+  // (each disc made rebuilds the hair, the cocoon system with it: asked for anew every time, not kept across the loop)
+  for (int k : ks) { CocoonSystem* cs = hair_.cocoonSystem(); if (!cs) break; CocoonGeo G = cs->geo(k); if (G.N < 2) continue; discOnCocoon(k, (G.N - 1) / 2.0); }
 }
 
 // ---- what is drawn ----
 std::vector<Viewport::MaskSeg> Viewport::maskLines() const {
   std::vector<MaskSeg> out; CocoonSystem* cs = const_cast<HairState&>(hair_).cocoonSystem(); if (!cs) return out;
-  QString tab = tool_ == "guide" && (shTab == "tip" || shTab == "pinf") ? shTab : QString();
+  QString tab = tool_ == "guide" && (shTab == "tip" || shTab == "pinf" || shTab == "spiral") ? shTab : QString();
   // (whose: the selected modifiers only; none selected — those of the tab on the targeted cocoons; nothing — all of the tab)
   std::vector<const Item*> all, selM;
-  for (auto& [id, it] : scene_->items) if ((it.type == ItemType::Tip || it.type == ItemType::PInf) && modCocoon(*scene_, &it) && (it.raw.value("cmask").isArray() || it.raw.value("emask").isArray())) { all.push_back(&it); if (sel_.hasItem(id)) selM.push_back(&it); }
+  for (auto& [id, it] : scene_->items) if ((it.type == ItemType::Tip || it.type == ItemType::PInf || it.type == ItemType::Spiral) && modCocoon(*scene_, &it) && (it.raw.value("cmask").isArray() || it.raw.value("emask").isArray())) { all.push_back(&it); if (sel_.hasItem(id)) selM.push_back(&it); }
   std::vector<int> ks = selM.empty() && !tab.isEmpty() ? shellTargets() : std::vector<int>{};
   std::vector<const Item*> list = selM;
   if (list.empty()) for (const Item* m : all) if (m->typeStr == tab && (ks.empty() || std::find(ks.begin(), ks.end(), modCocoon(*scene_, m)->id) != ks.end())) list.push_back(m);
   for (const Item* m : list) {
     CocoonGeo G = cs->geo(modCocoon(*scene_, m)->id); if (G.N < 2) continue; double L = G.D[size_t(G.N - 1)];
-    bool pin = m->type == ItemType::PInf;
+    bool pin = m->type == ItemType::PInf, spi = m->type == ItemType::Spiral;
     auto draw = [&](const std::vector<double>& M, const float c0[3], std::function<void(double, float*)> c1, bool off) {
       auto at = [&](int i) { return off ? G.c[size_t(i)].lerp(cocoonPoint(G, i, 0), 0.45) : G.c[size_t(i)]; };
       for (int i = 0; i < G.N - 1; i++) {
@@ -375,8 +372,8 @@ std::vector<Viewport::MaskSeg> Viewport::maskLines() const {
       }
     };
     if (m->raw.value("cmask").isArray()) {
-      static const float pinC0[3] = {0.2f, 0.12f, 0.12f}, tipC0[3] = {0.25f, 0.2f, 0.05f};
-      draw(maskOf(m->raw.value("cmask")), pin ? pinC0 : tipC0, [pin](double w, float* e) { if (pin) { if (w < 0) { e[0] = 1; e[1] = 0.3f; e[2] = 0.25f; } else { e[0] = 0.35f; e[1] = 1; e[2] = 0.45f; } } else { e[0] = 1; e[1] = 0.85f; e[2] = 0.2f; } }, false);
+      static const float pinC0[3] = {0.2f, 0.12f, 0.12f}, tipC0[3] = {0.25f, 0.2f, 0.05f}, spiC0[3] = {0.05f, 0.2f, 0.18f};
+      draw(maskOf(m->raw.value("cmask")), pin ? pinC0 : spi ? spiC0 : tipC0, [pin, spi](double w, float* e) { if (spi) { e[0] = 0.25f; e[1] = 1; e[2] = 0.8f; } else if (pin) { if (w < 0) { e[0] = 1; e[1] = 0.3f; e[2] = 0.25f; } else { e[0] = 0.35f; e[1] = 1; e[2] = 0.45f; } } else { e[0] = 1; e[1] = 0.85f; e[2] = 0.2f; } }, false);
     }
     if (m->raw.value("emask").isArray()) { static const float c0[3] = {0.05f, 0.18f, 0.22f}; draw(maskOf(m->raw.value("emask")), c0, [](double, float* e) { e[0] = 0.3f; e[1] = 0.9f; e[2] = 1; }, true); }
   }

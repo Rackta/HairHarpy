@@ -29,9 +29,17 @@ std::optional<Viewport::GzTargets> Viewport::gizmoTargets() const {
   // the Topology room, a component mode: the selected elements of the active mesh (their centre)
   if (room() == "topo" && topoMode != "object") {
     int m = topoMesh(); if (m < 0) return std::nullopt;
-    auto vs = tSelVerts(m); if (vs.empty()) return std::nullopt;
+    auto vs = tSelVerts(m);
     const auto& W = scene_->item(m)->poly->pos; Vec3 c; for (int v : vs) c += W[size_t(v)];
-    GzTargets t; t.topo = m; t.verts = vs; t.pivot = c * (1.0 / vs.size()); return t;
+    size_t n = vs.size(); std::vector<std::pair<int, std::vector<int>>> extra;
+    for (const auto& [xid, xs] : tselX_) {                    // (the other picked meshes: their vertices too)
+      const Item* xi = scene_->item(xid); if (!xi || !xi->poly || !sel_.hasItem(xid) || xid == m) continue;
+      auto T = topo::ttopo(baseSp(*xi)); if (!T) continue; const char key = tKey();
+      auto xv = topo::selVerts(*T, key, key == 'f' ? xs.f : key == 'e' ? xs.e : xs.v); if (xv.empty()) continue;
+      const auto& XW = xi->poly->pos; for (int v : xv) if (size_t(v) < XW.size()) { c += XW[size_t(v)]; n++; }
+      extra.push_back({xid, std::move(xv)}); }
+    if (n == 0) return std::nullopt;
+    GzTargets t; t.topo = m; t.verts = vs; t.extra = std::move(extra); t.pivot = c * (1.0 / double(n)); return t;
   }
   if (!sel_.anchors.empty()) return GzTargets{sel_.anchors, {}, scene_->anchor(sel_.anchors.back())->pos};
   std::set<int> anchors; std::vector<int> av; std::set<int> meshes, imeshes, groups;
@@ -146,6 +154,24 @@ void Viewport::storeMeshGizmo(int m, const std::optional<Vec3>& pivotWorld, cons
   x->raw.insert("p", p);
   if (pivotWorld) { setMeshPivot(m, meshmods::meshMatrix(*scene_, *it).inverse().apply(*pivotWorld)); return; }   // (its own undo step)
   scene_->revision++; commit(false); emit topoState(); updateGizmo();
+}
+
+// Custom → Local: the gizmo put by Alt + drag becomes what the picked groups (their point and axes) or the mesh (its pivot
+// and gizmo axes in its Transform) keep — Local then shows it. One undo step
+QString Viewport::gzBakeCustom() {
+  if (!gzCustom_.hasPivot || gzCustom_.key != gzKey()) { ui::toast(tr("Put the gizmo first: Alt + drag a handle (Custom)")); return "!"; }
+  const Vec3 p = gzCustom_.pivot; const Quat q = gzCustom_.q.normalized();
+  std::vector<int> gs; for (int id : sel_.items) if (const Item* it = scene_->item(id); it && it->type == ItemType::Group) gs.push_back(id);
+  const int m = room() == "topo" ? topoMesh() : -1;
+  if (gs.empty() && m < 0) { ui::toast(tr("Pick a group or a mesh to keep the gizmo in")); return "!"; }
+  gzCustom_.hasPivot = false; symCache_ = {}; tset.gzOrient = "local"; saveTopoPrefs();
+  if (gs.empty()) storeMeshGizmo(m, p, q);                    // (a mesh: its own undo step)
+  else {
+    for (int id : gs) { Item* g = scene_->item(id); g->raw.insert("gpivot", QJsonArray{p.x, p.y, p.z}); g->raw.insert("q", QJsonArray{q.x, q.y, q.z, q.w}); }
+    stepLabel_ = tr("Gizmo baked into Local"); scene_->revision++; commit(false);
+  }
+  emit topoState(); updateGizmo();
+  const QString msg = tr("The gizmo is kept — Local"); ui::toast(msg); return msg;
 }
 
 // Align: one axis of the gizmo (or the axis square to a plane of it) turned onto the selection — the vertices (X to the
@@ -289,10 +315,13 @@ bool Viewport::gizmoPress(const QPointF& m, bool ctrl, const QString& forced) {
     if (!gz_.visible()) return false;
   double W = paneW(), H = paneH();
   Gizmo::Handle h = forced.isEmpty() ? gz_.pick(cam_, W, H, m.x(), m.y()) : Gizmo::Handle{forced}; if (!h.valid()) return false;
-  std::shared_ptr<PolyMesh> pre; TSel preSel = tsel_;
+  std::shared_ptr<PolyMesh> pre; TSel preSel = tsel_; std::vector<std::pair<int, std::shared_ptr<PolyMesh>>> preX; std::map<int, TSel> preSelX;
   if (ctrl && room() == "topo" && topoMode != "object") {   // (Ctrl + a handle: extruded first, the new part moved)
     const int am = topoMesh(); if (am < 0) return false; pre = baseSp(*scene_->item(am));
     if (!tExtrudeSel(am)) return true;
+    { std::vector<int> others; for (const auto& [oid, os] : tselX_) if (oid != am && sel_.hasItem(oid)) others.push_back(oid);   // (the other picked meshes: pulled out too, then moved by the same gizmo)
+      preSelX = tselX_;                                        // (their meshes and picks before: put back when let go unmoved)
+      for (int oid : others) { tselActivate(oid); auto b = baseSp(*scene_->item(oid)); if (tExtrudeSel(oid)) preX.push_back({oid, b}); } if (!others.empty()) tselActivate(am); }
   }
   auto tg = gizmoTargets(); if (!tg) return false;
   gd_ = {}; gd_.list = tg->anchors; gd_.meshes = tg->meshes;
@@ -300,7 +329,7 @@ bool Viewport::gizmoPress(const QPointF& m, bool ctrl, const QString& forced) {
     const Item* it = scene_->item(tg->topo); tgz_ = {}; tgz_.on = true; tgz_.m = tg->topo; tgz_.verts = tg->verts;
     tgz_.base = (it->base ? it->base : it->poly)->pos; tgz_.uv0 = (it->base ? it->base : it->poly)->cornerUV; for (int v : tg->verts) tgz_.w0.push_back(it->poly->pos[size_t(v)]);
     if (tset.sym) tgz_.pairs = symFirstPairs(tgz_.m, tgz_.base);
-    tgz_.preExtrude = pre; tgz_.preSel = preSel; tgz_.q0 = gz_.quat; tgz_.p0 = gz_.pivot;
+    tgz_.preExtrude = pre; tgz_.preSel = preSel; tgz_.preExtrudeX = preX; tgz_.preSelX = preSelX; tgz_.q0 = gz_.quat; tgz_.p0 = gz_.pivot;
     auto T = topo::ttopo(baseSp(*it)); const auto& Wp = it->poly->pos;
     std::map<int, int> at; for (size_t i = 0; i < tgz_.verts.size(); i++) at[tgz_.verts[i]] = int(i);
     if (tset.gzWhat == "each" && tsel_.id == tg->topo) {      // (Components: each its own centre and — Normal — its own axes)
@@ -318,6 +347,12 @@ bool Viewport::gizmoPress(const QPointF& m, bool ctrl, const QString& forced) {
       for (int v : tgz_.verts) { std::vector<int> nb; for (int j = T->voff[size_t(v)]; j < T->voff[size_t(v) + 1]; j++) { const int w = T->other(T->vE[size_t(j)], v); if (!at.count(w)) nb.push_back(w); } tgz_.nbs.push_back(nb); }
     }
   }
+  tgzX_.clear();
+  if (tg->topo >= 0) for (const auto& [xid, xv] : tg->extra) {   // (the other meshes: from where they are, as shown)
+    const Item* xi = scene_->item(xid); TgzX x; x.m = xid; x.verts = xv; x.base = (xi->base ? xi->base : xi->poly)->pos; x.uv0 = (xi->base ? xi->base : xi->poly)->cornerUV;
+    for (int v : xv) x.w0.push_back(xi->poly->pos[size_t(v)]);
+    if (tset.sym) x.pairs = symFirstPairs(xid, x.base);
+    tgzX_.push_back(std::move(x)); }
   if (tg->refPlane >= 0) { RefPlane* rp = refPlane(tg->refPlane); refs::apply(*rp, cam_); rpd_ = {}; rpd_.id = rp->id; rpd_.m0 = rp->matrix(); rpd_.piv0 = refs::pivotWorld(*rp); }
   if (!gd_.list.empty()) { auto rel = releaseFrozenAround(*scene_, gd_.list); if (!rel.empty()) { std::vector<int> r; for (auto& x : rel) r.push_back(x.anchor); markCurves(curvesTouching(*scene_, r)); } }   // (as for a drag)
   for (int a : gd_.list) gd_.starts.push_back(scene_->anchor(a)->pos);
@@ -335,7 +370,10 @@ void Viewport::gizmoMove(const QPointF& m, Qt::KeyboardModifiers mods) {
   // (Shift: Move in steps of the set length — but one anchor in the Hair room slides along the nearest curve instead)
   gz_.moveStep = room() != "topo" && gz_.mode == Gizmo::Mode::Move && gd_.list.size() == 1 && sel_.anchors.size() == 1 && gd_.meshes.empty() ? 0 : tset.gzStep;
   Affine M = gz_.drag(cam_, paneW(), paneH(), m.x(), m.y(), shift, ctrl);
-  if (gdCustom_) { requestUpdate(); return; }                 // (only the gizmo moves)
+  if (gdCustom_) {                                            // (only the gizmo moves — onto a vertex / the grid with V / X held: its pivot taken there)
+    if (gz_.mode == Gizmo::Mode::Move && esnapOn()) { const Vec3 p0 = gz_.pivot - M.t; esnapHit_ = elemSnap(m, -1, {}, p0); if (esnapHit_) gz_.pivot = *esnapHit_; overlayRev_++; }
+    else if (esnapHit_) { esnapHit_.reset(); overlayRev_++; }
+    requestUpdate(); return; }
   if (gz_.mode == Gizmo::Mode::Scale) {                      // (Scale: the change in percent — each axis that changes; all alike — one number)
     const double* s = gz_.scaleNow; auto pc = [](double v) { return QString::number(v * 100, 'f', std::abs(v * 100 - std::round(v * 100)) < 0.05 ? 0 : 1) + "%"; };
     QStringList parts; for (int k = 0; k < 3; k++) if (std::abs(s[k] - 1) > 1e-9) parts << QString("XYZ")[k] + QString(" ") + pc(s[k]);
@@ -350,16 +388,32 @@ void Viewport::gizmoMove(const QPointF& m, Qt::KeyboardModifiers mods) {
     }
     return;
   }
+  // (the element snap, V / X held or Snap on: the picked vertices' centre goes onto the vertex / edge / polygon / grid node under the
+  // pointer, kept on the handle's axis or plane — as a drag of the vertices themselves does)
+  if (tgz_.on && gz_.mode == Gizmo::Mode::Move && esnapOn() && gz_.active.valid()) {
+    const std::set<int> mv(tgz_.verts.begin(), tgz_.verts.end()); const Vec3 p0 = tgz_.p0;
+    if (auto hit = elemSnap(m, tgz_.m, mv, p0)) {
+      Vec3 d = *hit - p0; QString ax = gz_.active.axis; if (ax.startsWith('D')) ax = ax.mid(1);
+      const bool has[3] = {ax.contains('X'), ax.contains('Y'), ax.contains('Z')}; const int n = int(has[0]) + int(has[1]) + int(has[2]);
+      if (n == 1 || n == 2) { const Vec3 e[3] = {gz_.quat.rotate({1, 0, 0}), gz_.quat.rotate({0, 1, 0}), gz_.quat.rotate({0, 0, 1})};
+        if (n == 1) { for (int k = 0; k < 3; k++) if (has[k]) { d = e[k] * d.dot(e[k]); break; } }
+        else for (int k = 0; k < 3; k++) if (!has[k]) d = d - e[k] * d.dot(e[k]); }
+      M = Affine(); M.t = d; esnapHit_ = p0 + d;
+    } else esnapHit_.reset();
+    overlayRev_++;
+  } else if (tgz_.on && esnapHit_) { esnapHit_.reset(); overlayRev_++; }
   if (tgz_.on) { topoGizmoApply(M); gd_.moved = true; requestUpdate(); return; }
   for (size_t i = 0; i < gd_.list.size(); i++) scene_->anchor(gd_.list[i])->pos = M.apply(gd_.starts[i]);
   if (!hsym_.start.empty()) hairSymApply(hsym_);
   // frozen handles turn / stretch with the anchors
-  if (std::abs(gd_.lastM.det()) > 1e-12) {
+  // (a flat M is skipped and not kept: the handles stay at the last M that can be undone, and catch up from it once the
+  // scale comes back)
+  if (std::abs(gd_.lastM.det()) > 1e-12 && std::abs(M.det()) > 1e-12) {
     Affine inc = Affine::mul(M, gd_.lastM.inverse());
     std::set<int> ids(gd_.list.begin(), gd_.list.end());
     for (auto& [cid, c] : scene_->items) if (c.type == ItemType::Curve) for (auto& [aid, o] : c.ovr) if (ids.count(aid)) { if (o.in) o.in = inc.lin(*o.in); if (o.out) o.out = inc.lin(*o.out); }
+    gd_.lastM = M;
   }
-  gd_.lastM = M;
   for (size_t i = 0; i < gd_.meshes.size(); i++) { auto& P = scene_->item(gd_.meshes[i])->poly->pos; for (size_t k = 0; k < P.size(); k++) P[k] = M.apply(gd_.meshStarts[i][k]); }
   if (!gd_.meshes.empty()) staticRev_++;
   for (size_t i = 0; i < gd_.imeshes.size(); i++) meshmods::setMeshMatrix(*scene_, gd_.imeshes[i], Affine::mul(M, gd_.imStarts[i]));   // (the Transform modifier: remade in the next frame)
@@ -390,22 +444,26 @@ void Viewport::gizmoMove(const QPointF& m, Qt::KeyboardModifiers mods) {
 }
 
 void Viewport::gizmoRelease(const QPointF& m) {
-  drag_ = Drag::None; gz_.active = {};
+  drag_ = Drag::None; gz_.active = {}; if (esnapHit_) { esnapHit_.reset(); overlayRev_++; }   // (the snap's ring gone with the drag)
   if (gz_.mode == Gizmo::Mode::Scale) ui::hud({});           // (the percent shown while scaling: gone)
   if (gdCustom_) {                                             // (the gizmo's new place and axes kept: Custom)
+    if (esnapHit_) { esnapHit_.reset(); overlayRev_++; }
     if (room() == "topo" && topoMode == "object" && topoMesh() >= 0) {   // (Object mode: the mesh's own gizmo — into its Transform)
       gdCustom_ = false; ui::hud({}); tset.gzOrient = "local"; storeMeshGizmo(topoMesh(), gz_.pivot, gz_.quat); return; }
-    gdCustom_ = false; gzCustom_.q = gz_.quat; gzCustom_.pivot = gz_.pivot; gzCustom_.hasPivot = true; gzCustom_.key = gzKey(); ui::hud({});
-    tset.gzOrient = "custom"; saveTopoPrefs(); emit topoState(); updateGizmo(); return;
+    gdCustom_ = false; gzCustom_.q = gz_.quat; gzCustom_.pivot = gz_.pivot; gzCustom_.hasPivot = true; gzCustom_.key = gzKey(); symCache_ = {}; ui::hud({});   /* (symCache_: the Workplane symmetry's plane is the gizmo's — moved with it) */
+    tset.gzOrient = "custom"; saveTopoPrefs(); stepLabel_ = tr("Gizmo moved"); commit(false); emit topoState(); updateGizmo(); return;   // (an undo step of its own: Ctrl+Z puts the gizmo back)
   }
   if (gd_.snap >= 0) { ui::hud({}); ad_.snap = -1; gd_.snap = -1; overlayRev_++; }
   { const QString what = gz_.mode == Gizmo::Mode::Rotate ? tr("Rotate") : gz_.mode == Gizmo::Mode::Scale ? tr("Scale") : tr("Move");   // (the history's name for the step)
     QStringList names; for (int id : sel_.items) if (const Item* it = scene_->item(id)) names << it->name;
     stepLabel_ = rpd_.id >= 0 ? tr("%1: reference plane").arg(what) : tgz_.on ? tr("%1: %2 vertices").arg(what).arg(tgz_.verts.size()) : !sel_.anchors.empty() ? tr("%1: %2 anchor(s)").arg(what).arg(sel_.anchors.size())
                : names.size() == 1 ? tr("%1: %2").arg(what, names[0]) : names.isEmpty() ? what : tr("%1: %2 items").arg(what).arg(names.size()); }
-  if (!gd_.moved) { stepLabel_.clear(); if (tgz_.on && tgz_.preExtrude) { topoWrite(tgz_.m, tgz_.preExtrude); tsel_ = tgz_.preSel; tsel_.ver++; topoRev_++; emit topoState(); ui::hud({}); }   // (an extrude let go unmoved: none)
-    rpd_ = {}; tgz_ = {}; updateGizmo(); return; }
-  if (tgz_.on) { int m = tgz_.m; tgz_ = {}; gd_ = {}; if (Item* it = scene_->item(m)) topoWrite(m, it->base ? it->base : it->poly); commit(false); emit topoState(); updateGizmo(); return; }
+  if (!gd_.moved) { stepLabel_.clear(); if (tgz_.on && tgz_.preExtrude) { topoWrite(tgz_.m, tgz_.preExtrude); for (const auto& [xm, xb] : tgz_.preExtrudeX) topoWrite(xm, xb);   // (the other meshes' extrudes undone too)
+      if (!tgz_.preExtrudeX.empty()) tselX_ = tgz_.preSelX; tsel_ = tgz_.preSel; tsel_.ver++; topoRev_++; emit topoState(); ui::hud({}); }   // (an extrude let go unmoved: none)
+    rpd_ = {}; tgz_ = {}; tgzX_.clear(); updateGizmo(); return; }
+  if (tgz_.on) { int m = tgz_.m; auto more = std::move(tgzX_); tgzX_.clear(); tgz_ = {}; gd_ = {}; if (Item* it = scene_->item(m)) topoWrite(m, it->base ? it->base : it->poly);
+    for (const TgzX& x : more) if (Item* xi = scene_->item(x.m)) topoWrite(x.m, xi->base ? xi->base : xi->poly);
+    commit(false); emit topoState(); updateGizmo(); return; }
   if (rpd_.id >= 0) { rpd_ = {}; gd_ = {}; commit(false); updateGizmo(); return; }
   beforeFrame();
   HairChanges ch = hair_.finishDraft(*scene_);

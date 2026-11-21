@@ -1,6 +1,13 @@
+﻿#include "ui/Keymap.h"
 #include "app/TopoPanels.h"
 #include "app/SymPanel.h"
+#include "app/Outliner.h"
 #include "scene/Primitives.h"
+#include "app/ImportWindow.h"
+#include <QPainter>
+#include <QScrollArea>
+#include <QToolButton>
+#include <QWidgetAction>
 #include <QCursor>
 #include <QListWidget>
 #include "app/TexWindow.h"
@@ -21,6 +28,9 @@
 #include <QPointer>
 #include <QDateTime>
 #include <QColorDialog>
+#include <QMessageBox>
+#include <QFileDialog>
+#include <QFileInfo>
 #include <QComboBox>
 #include <QDropEvent>
 #include <QGraphicsOpacityEffect>
@@ -52,6 +62,9 @@
 #include <QTreeWidget>
 #include <QVBoxLayout>
 #include <cmath>
+#ifdef Q_OS_WIN
+extern "C" __declspec(dllimport) short __stdcall GetAsyncKeyState(int vKey);   // (user32: the brush's held keys — windows.h's macros clash with this file's names)
+#endif
 
 namespace hm {
 
@@ -140,24 +153,29 @@ protected:
 };
 // a selection set's button: the pointer on it — its elements lit in the viewport; a click — picked (Shift adds, Ctrl
 // takes off); RMB — deleted
+static qint64 g_setPress = 0;   // (the last left press on a set's button: the input's own time — the work a click does doesn't count against the double click)
 class SetBtn : public QPushButton {
 public:
   std::function<void(bool)> hover; std::function<void()> del;
 protected:
   void enterEvent(QEnterEvent* e) override { if (hover) hover(true); QPushButton::enterEvent(e); }
   void leaveEvent(QEvent* e) override { if (hover) hover(false); QPushButton::leaveEvent(e); }
-  void mousePressEvent(QMouseEvent* e) override { if (e->button() == Qt::RightButton && del) { e->accept(); QTimer::singleShot(0, del); return; } QPushButton::mousePressEvent(e); }
+  void mousePressEvent(QMouseEvent* e) override { if (e->button() == Qt::RightButton && del) { e->accept(); QTimer::singleShot(0, del); return; } if (e->button() == Qt::LeftButton) g_setPress = qint64(e->timestamp()); QPushButton::mousePressEvent(e); }
 };
 // ---- the UV Sets and UV Mats as buttons, as the selection sets: a picture, the name under it; the one worked in —
 // blue, those the selected polygons lie in — pale lit; a click: its polygons selected (Shift adds, Ctrl takes off) and it
 // worked in; a double click: renamed; RMB: its menu ----
 namespace {
 // (a double click told by the time, not by the button: the panel is made again between the two clicks)
+qint64 g_clickEnd = 0;   // (a click with no press of its own — a script's: told from the end of the one before)
 bool secondClick(int id, int key) {
-  static int lastId = -1, lastKey = 0; static qint64 lastT = 0; const qint64 now = QDateTime::currentMSecsSinceEpoch();
-  const bool dbl = lastId == id && lastKey == key && now - lastT <= QApplication::doubleClickInterval();
-  lastId = id; lastKey = key; lastT = dbl ? 0 : now; return dbl;
+  static int lastId = -1, lastKey = 0; static qint64 lastT = 0; static bool lastStamp = false;
+  const bool stamp = g_setPress > 0; const qint64 now = stamp ? g_setPress : QDateTime::currentMSecsSinceEpoch(); g_setPress = 0;
+  const qint64 ref = !stamp && g_clickEnd > lastT ? g_clickEnd : lastT;
+  const bool dbl = lastId == id && lastKey == key && stamp == lastStamp && lastT > 0 && now - ref <= QApplication::doubleClickInterval();
+  lastId = id; lastKey = key; lastT = dbl ? 0 : now; lastStamp = stamp; g_clickEnd = 0; return dbl;
 }
+void clickDone() { g_clickEnd = QDateTime::currentMSecsSinceEpoch(); }
 const PolyMesh* uvBase(Viewport* vp, int id) { const Item* mm = vp->scene()->item(id); return mm ? (mm->base ? mm->base.get() : mm->poly.get()) : nullptr; }
 std::vector<int> uvSetFaces(Viewport* vp, int id, int i) {
   const PolyMesh* B = uvBase(vp, id); std::vector<int> fs; if (!B) return fs;
@@ -174,7 +192,8 @@ QString askName(const QString& title, const QString& was) { bool ok = false; con
 QWidget* uvSetCell(Viewport* vp, const QString& icon, const QString& name, const QString& tip, std::function<int()> k, std::function<void()> click, std::function<void()> menu) {
   auto* cell = new QWidget; auto* cv = new QVBoxLayout(cell); cv->setContentsMargins(0, 0, 0, 0); cv->setSpacing(1);
   auto* b = new SetBtn; b->setProperty("tool", true); b->setFixedSize(40, 40); b->setIcon(ui::icon(icon)); b->setIconSize(QSize(34, 34)); b->setFocusPolicy(Qt::NoFocus); b->setToolTip(tip);
-  auto* l = new QLabel; l->setFixedWidth(44); l->setAlignment(Qt::AlignHCenter); l->setText(QFontMetrics(l->font()).elidedText(name, Qt::ElideRight, 44)); l->setToolTip(name);
+  auto* l = new QLabel; l->setFixedWidth(44); l->setAlignment(Qt::AlignHCenter | Qt::AlignTop); l->setWordWrap(true);   // (the whole name, over as many lines as it takes: a break after "_" and every few letters)
+  { QString t; int run = 0; for (const QChar ch : name) { t += ch; run++; if (ch == '_' || ch == ' ' || run >= 7) { t += QChar(0x200B); run = 0; } } l->setText(t); l->setToolTip(name); }
   auto look = [b, l, k] { const int s = k(); if (b->property("look").toInt() == s && b->property("lookSet").toBool()) return;
     b->setProperty("look", s); b->setProperty("lookSet", true); l->setStyleSheet(QString("font-size:9px;color:%1").arg(s == 2 ? "#cfe0ff" : "#9a9a9a"));
     b->setStyleSheet(s == 2 ? "QPushButton{background:#3d5f94;border:1px solid #8ab0f0}" : s == 1 ? "QPushButton{background:#34405a;border:1px solid #5d7bb0}" : QString()); };
@@ -192,7 +211,9 @@ void uvSetMenu(Viewport* vp, int id, int i) {
   const bool cur = vp->uvPicked.id == id && vp->uvPicked.set == i && vp->uvPicked.mat == -2;
   QMenu menu; auto act = [&](QMenu* mm, const QString& l, std::function<void()> fn) { QObject::connect(mm->addAction(l), &QAction::triggered, vp, [fn, later] { later(fn); }); };
   act(&menu, cur ? QObject::tr("⊘ Out of it (every polygon shown)") : QObject::tr("▣ Work in it (only it in the UV Editor)"), [vp, id, i] { vp->uvPickSet(id, i); });
-  act(&menu, QObject::tr("⇲ Apply to the selected polygons"), [vp, id, i] { vp->uvSetApply(id, i); });
+  { const QString nm = SS[size_t(i)].name;                          // (the selection may lie on other meshes than the one this button was listed under — a set is the project's: then it goes in by the name)
+    act(&menu, QObject::tr("⇲ Apply to the selected polygons"), [vp, id, i, nm] { if (vp->topoMode == "poly" && vp->topoMesh() == id && !vp->tSelFaces(id).empty()) vp->uvSetApply(id, i); else vp->uvSetPutPicked(nm, false); });
+    act(&menu, QObject::tr("⇲ Move the selected polygons (objects) here — out of their other sets"), [vp, nm] { vp->uvSetPutPicked(nm, true); }); }
   act(&menu, QObject::tr("⇱ Take the selected polygons out"), [vp, id, i] { vp->uvSetTakeOut(id, i); });
   act(&menu, QObject::tr("◉ Select its polygons"), [vp, id, i] { if (vp->topoMode != "poly") vp->setTopoMode("poly"); vp->tSelectFaces(id, uvSetFaces(vp, id, i)); });
   menu.addSeparator();
@@ -203,23 +224,66 @@ void uvSetMenu(Viewport* vp, int id, int i) {
   mg->setEnabled(SS.size() > 1);
   if (i > 0) act(&menu, QObject::tr("◂ Move before (wins a merge)"), [vp, id, i] { vp->uvSetMove(id, i, i - 1); });
   if (size_t(i) + 1 < SS.size()) act(&menu, QObject::tr("▸ Move after"), [vp, id, i] { vp->uvSetMove(id, i, i + 1); });
-  act(&menu, QObject::tr("✎ Rename (double click)"), [vp, id, i, n = SS[size_t(i)].name] { const QString t = askName(QObject::tr("Rename the UV Set"), n); if (!t.isEmpty()) vp->uvSetRename(id, i, t); });
+  act(&menu, QObject::tr("✎ Rename"), [vp, id, i, n = SS[size_t(i)].name] { const QString t = askName(QObject::tr("Rename the UV Set"), n); if (!t.isEmpty()) vp->uvSetRename(id, i, t); });
   menu.addSeparator(); if (SS.size() > 1) act(&menu, QObject::tr("✕ Delete (its mats use another set)"), [vp, id, i] { vp->uvSetDelete(id, i); });
   menu.exec(QCursor::pos());
 }
-QWidget* uvSetGrid(Viewport* vp, int id, int cols) {
-  auto* w = new QWidget; auto* g = new QGridLayout(w); g->setContentsMargins(0, 0, 0, 4); g->setSpacing(4);
-  const auto S = vp->uvSets(id);
+// the cells of a mesh's UV Sets (owner: whose they are, put first in each one's tip — the cells of several meshes share one grid)
+std::vector<QWidget*> uvSetCells(Viewport* vp, int id, const std::vector<int>& also = {}, std::set<QString>* seen = nullptr) {   // (also: other meshes that have exactly these sets — shown once, a click picks the set on all of them)
+  std::vector<QWidget*> out;
+  const auto S = vp->uvNone(id) ? std::vector<Viewport::UvSetL>{} : vp->uvSets(id);   // (no UV yet: no default set listed)
   for (size_t i = 0; i < S.size(); i++) {
     const int si = int(i); const QString name = S[i].name;
-    const QString tip = QObject::tr("%1: %2 polygons, %3 mat%4 — click: its polygons selected (Shift adds, Ctrl takes off), it worked in (only it in the UV Editor); double click: rename; RMB: more")
+    if (seen) { if (seen->count(name)) continue; seen->insert(name); }   // (one cell a set: a set of one name is the project's, whichever meshes hold it)
+    QStringList holders; for (const auto& [x, it] : vp->scene()->items) if (it.type == ItemType::IMesh && (it.base || it.poly) && !vp->uvNone(x)) for (const auto& s2 : vp->uvSets(x)) if (s2.name == name) { holders << it.name; break; }
+    const QString owner = holders.size() <= 4 ? QObject::tr("Mesh: %1").arg(holders.join(", ")) : QObject::tr("Meshes: %1 and %2 more").arg(QStringList(holders.mid(0, 4)).join(", ")).arg(holders.size() - 4);
+    const QString tip = owner + "\n" + QObject::tr("%1: %2 polygons, %3 mat%4 — click: its contents shown (only it in the UV Editor; again — out of it); double click: all its polygons selected (Shift adds, Ctrl takes off); RMB: rename and more")
                           .arg(name).arg(S[i].faces).arg(S[i].mats.size()).arg(S[i].mats.size() == 1 ? "" : "s");
     auto k = [vp, id, si] { return vp->uvPicked.id == id && vp->uvPicked.set == si ? 2 : vp->uvSetsOfSel(id).count(si) ? 1 : 0; };
-    auto click = [vp, id, si, name] {
-      if (secondClick(id, si + 1)) { const QString t = askName(QObject::tr("Rename the UV Set"), name); if (!t.isEmpty()) vp->uvSetRename(id, si, t); return; }
-      uvSelectFaces(vp, id, uvSetFaces(vp, id, si));
-      if (!(vp->uvPicked.id == id && vp->uvPicked.set == si && vp->uvPicked.mat == -2)) vp->uvPickSet(id, si); };
-    g->addWidget(uvSetCell(vp, "uv_set", name, tip, k, click, [vp, id, si] { uvSetMenu(vp, id, si); }), si / cols, si % cols);
+    auto click = [vp, id, si, name, also] {
+      const bool dblC = secondClick(id, si + 1);
+      // (every mesh the set holds — a set is the project's: each mesh that has one of this name, the listed one first)
+      std::vector<int> all{id}; for (const auto& [x, it] : vp->scene()->items) { if (x == id || it.type != ItemType::IMesh || !(it.base || it.poly) || vp->uvNone(x)) continue;
+        for (const auto& s : vp->uvSets(x)) if (s.name == name) { all.push_back(x); break; } }
+      for (int x : also) if (std::find(all.begin(), all.end(), x) == all.end()) all.push_back(x);
+      if (!dblC) {                       // (one click: only its contents shown — its meshes picked, it worked in; no polygon selected)
+        vp->setSelectedItems(all); vp->uvPickSet(id, si); clickDone(); return; }
+      // (a double click: all its polygons selected — the set stays shown: the first click of the two went into it)
+      if (all.size() > 1) {                                 // (one set in several meshes: its polygons picked on all of them)
+        vp->setSelectedItems(all); if (vp->topoMode != "poly") vp->setTopoMode("poly");
+        for (int x : all) { const auto Sx = vp->uvSets(x); for (size_t k = 0; k < Sx.size(); k++) if (Sx[k].name == name) { vp->tselApply(x, uvSetFaces(vp, x, int(k)), "set", 'f', false); break; } }
+        if (!(vp->uvPicked.id == id && vp->uvPicked.set == si && vp->uvPicked.mat == -2)) vp->uvPickSet(id, si); return; }
+      if (vp->topoMesh() != id) vp->setSelectedItems({id});
+      if (!(vp->uvPicked.id == id && vp->uvPicked.set == si && vp->uvPicked.mat == -2)) vp->uvPickSet(id, si);   // (into it first: going in shows its layout anew, and the selection after it stays)
+      uvSelectFaces(vp, id, uvSetFaces(vp, id, si)); };
+    out.push_back(uvSetCell(vp, "uv_set", name, tip, k, click, [vp, id, si] { uvSetMenu(vp, id, si); }));
+  }
+  return out;
+}
+QWidget* cellGrid(const std::vector<QWidget*>& cells, int cols) {
+  auto* w = new QWidget; auto* g = new QGridLayout(w); g->setContentsMargins(0, 0, 0, 0); g->setSpacing(4);
+  for (size_t i = 0; i < cells.size(); i++) g->addWidget(cells[i], int(i) / cols, int(i) % cols);
+  g->setColumnStretch(cols, 1); return w;
+}
+QWidget* uvSetGrid(Viewport* vp, int id, int cols, const std::vector<int>& also = {}) { return cellGrid(uvSetCells(vp, id, also), cols); }
+// the empty UV Sets that belong to no mesh yet: a cell each — RMB: the picked shells (objects) put in / moved in, rename, delete
+QWidget* uvFreeGrid(Viewport* vp, int cols) {
+  auto* w = new QWidget; auto* g = new QGridLayout(w); g->setContentsMargins(0, 0, 0, 4); g->setSpacing(4);
+  const auto F = vp->uvFreeSets();
+  for (size_t i = 0; i < F.size(); i++) {
+    const QString name = F[i];
+    const QString tip = QObject::tr("%1: empty, it belongs to no mesh — RMB: put the picked shells (objects) into it, move them in from their other sets, rename, delete").arg(name);
+    auto menu = [vp, name] {
+      QMenu m;
+      m.addAction(QObject::tr("⇲ Put the picked shells (objects) here"), vp, [vp, name] { vp->uvSetPutPicked(name, false); });
+      m.addAction(QObject::tr("⇲ Move them here — out of their other sets"), vp, [vp, name] { vp->uvSetPutPicked(name, true); });
+      m.addSeparator();
+      m.addAction(QObject::tr("✎ Rename"), vp, [vp, name] { const QString t = askName(QObject::tr("Rename the UV Set"), name); if (!t.isEmpty()) vp->uvSetFreeRename(name, t); });
+      m.addAction(QObject::tr("✕ Delete"), vp, [vp, name] { vp->uvSetFreeDelete(name); });
+      m.exec(QCursor::pos()); };
+    auto k = [vp, name] { return vp->uvFreePicked == name ? 2 : 0; };   // (lit while it is the one ⇲ Add puts things into)
+    auto click = [vp, name] { vp->uvFreePicked = vp->uvFreePicked == name ? QString() : name; if (!vp->uvFreePicked.isEmpty()) ui::toast(QObject::tr("%1 lit — select shells (or objects) and press ⇲ Add: they go into it").arg(name)); emit vp->topoState(); };
+    g->addWidget(uvSetCell(vp, "uv_set", name, tip, k, click, menu), int(i) / cols, int(i) % cols);
   }
   g->setColumnStretch(cols, 1); return w;
 }
@@ -249,7 +313,6 @@ QPushButton* toolBtn(const QString& icon, const QString& tip) {
 }
 QColor tgColor(int gi) { return QColor::fromHslF(std::fmod(gi * 137.5, 360.0) / 360.0, 0.55, 0.58); }
 const PolyMesh* baseOf(const Item& m) { return m.base ? m.base.get() : m.poly.get(); }
-const char* HEAVY = "A high-poly mesh (over 300 000 triangles) is not edited — Object mode only";
 QString fmt3(double v) { double r = std::round(v * 1000) / 1000; if (r == 0) r = 0; return QString::number(r, 'g', 10); }
 double unitK(const QString& u) { return u == "mm" ? 0.1 : u == "m" ? 100 : u == "in" ? 2.54 : 1; }
 struct MatP { const char* name; const char* color; double rough, metal, spec; };
@@ -258,9 +321,96 @@ const MatP MATS[] = {{"Sculpt clay", "#a99a86", 0.55, 0, 0.35}, {"Clay", "#b9a99
 QJsonObject matOf(const MatP& m) { return {{"color", m.color}, {"roughness", m.rough}, {"metalness", m.metal}, {"specular", m.spec}}; }
 // an edit of the mesh's record (no geometry): one undo step, the look drawn anew
 void rawEdit(Viewport* vp, int id, const std::function<void(QJsonObject&)>& fn) {
-  vp->runEdit([id, fn](Scene& s, Selection&, const CurveCache&) { if (Item* it = s.item(id)) { fn(it->raw); it->headTag = it->raw.value("headTag").toBool(); } return QString(); }, false);
+  vp->runEdit([id, fn](Scene& s, Selection&, const CurveCache&) { if (Item* it = s.item(id)) fn(it->raw); return QString(); }, false);
   vp->topoDisplayChanged();
 }
+void rawEditAll(Viewport* vp, const std::vector<int>& ids, const std::function<void(QJsonObject&)>& fn) {
+  vp->runEdit([ids, fn](Scene& s, Selection&, const CurveCache&) { for (int id : ids) if (Item* it = s.item(id)) fn(it->raw); return QString(); }, false);
+  vp->topoDisplayChanged();
+}
+// (the meshes a setting of this one goes to: every selected mesh when it is among them — 20.11: the Display tiles changed one
+// of the eleven selected)
+std::vector<int> meshTargets(Viewport* vp, int id) {
+  std::vector<int> o; bool in = false;
+  for (int x : vp->selection().items) if (const Item* it = vp->scene()->item(x); it && (it->type == ItemType::IMesh || it->type == ItemType::Mesh) && it->poly) { o.push_back(x); in = in || x == id; }
+  if (!in) o = {id};
+  return o;
+}
+
+// ---- the materials library (the strip's UV Mats): every material of the project in a window; a row is dragged by the mouse
+// itself (the viewport is a window of its own — it takes no Qt drops) onto an outliner row, an object in the 3D view, or
+// the shells picked in the UV Editor
+class MatRow : public QFrame {
+public:
+  Viewport::MatDef def; std::function<void(const QPoint&)> dropped;
+  explicit MatRow(const Viewport::MatDef& d) : def(d) {
+    setFixedHeight(26); setCursor(Qt::OpenHandCursor);
+    setToolTip(QObject::tr("%1 — %2 polygons in the project. Drag it onto an object (outliner or view) or onto the shells picked in the UV Editor").arg(d.name).arg(d.faces));
+  }
+protected:
+  void paintEvent(QPaintEvent*) override {
+    QPainter p(this); p.setRenderHint(QPainter::Antialiasing);
+    p.fillRect(rect(), underMouse() ? QColor(0x3a, 0x3f, 0x4a) : QColor(0x2e, 0x2e, 0x2e));
+    const QColor c = def.color.isEmpty() ? QColor(0x80, 0x80, 0x88) : QColor(def.color);
+    p.setPen(QColor(0x55, 0x55, 0x55)); p.setBrush(c.isValid() ? c : QColor(0x80, 0x80, 0x88)); p.drawRoundedRect(QRect(6, 5, 16, 16), 3, 3);
+    p.setPen(QColor(0xcc, 0xcc, 0xcc)); const QString n = QString::number(def.faces);
+    const int nw = p.fontMetrics().horizontalAdvance(n);
+    p.drawText(QRect(28, 0, width() - 28 - nw - 12, height()), Qt::AlignVCenter | Qt::AlignLeft, p.fontMetrics().elidedText(def.name, Qt::ElideRight, width() - 28 - nw - 12));
+    p.setPen(QColor(0x80, 0x80, 0x80)); p.drawText(QRect(width() - nw - 8, 0, nw, height()), Qt::AlignVCenter | Qt::AlignRight, n);
+  }
+  void enterEvent(QEnterEvent*) override { update(); }
+  void leaveEvent(QEvent*) override { update(); }
+  void mousePressEvent(QMouseEvent* e) override { if (e->button() == Qt::LeftButton) at_ = e->position().toPoint(); }
+  void mouseMoveEvent(QMouseEvent* e) override {
+    if (!(e->buttons() & Qt::LeftButton)) return;
+    if (!ghost_ && (e->position().toPoint() - at_).manhattanLength() < 6) return;
+    if (!ghost_) { ghost_ = new QLabel(def.name, nullptr, Qt::ToolTip | Qt::FramelessWindowHint | Qt::WindowTransparentForInput);
+      ghost_->setAttribute(Qt::WA_ShowWithoutActivating); ghost_->setStyleSheet("background:#34507a;color:#fff;border:1px solid #6f9fe8;border-radius:4px;padding:3px 8px"); ghost_->adjustSize(); ghost_->show(); setCursor(Qt::ClosedHandCursor); }
+    ghost_->move(e->globalPosition().toPoint() + QPoint(14, 10));
+  }
+  void mouseReleaseEvent(QMouseEvent* e) override {
+    if (!ghost_) return;
+    delete ghost_; ghost_ = nullptr; setCursor(Qt::OpenHandCursor);
+    const QPoint g = e->globalPosition().toPoint(); if (dropped) { auto f = dropped; const auto d = def; QTimer::singleShot(0, this, [f, g] { f(g); }); }
+  }
+private:
+  QPoint at_; QLabel* ghost_ = nullptr;
+};
+
+class MatLibWin : public QFrame {
+public:
+  MatLibWin(Viewport* vp, QWidget* owner) : QFrame(owner, Qt::Tool | Qt::FramelessWindowHint | Qt::NoDropShadowWindowHint), vp_(vp) {
+    setObjectName("matLib"); setStyleSheet("#matLib{background:#262626;border:1px solid #555;border-radius:6px} QLabel#mlh{color:#8a8f96;font-size:10px;padding:4px 6px}"
+                                           " QScrollArea{background:transparent;border:none} QScrollArea > QWidget > QWidget{background:transparent}");
+    auto* o = new QVBoxLayout(this); o->setContentsMargins(4, 4, 4, 4); o->setSpacing(2);
+    auto* h = new QLabel(tr("UV Mats — drag onto an object or the picked shells")); h->setObjectName("mlh"); h->setWordWrap(true); o->addWidget(h);
+    auto* sc = new QScrollArea; sc->setWidgetResizable(true); sc->setFrameShape(QFrame::NoFrame); body_ = new QWidget; list_ = new QVBoxLayout(body_); list_->setContentsMargins(0, 0, 0, 0); list_->setSpacing(2); list_->addStretch(1);
+    sc->setWidget(body_); o->addWidget(sc, 1); setFixedSize(230, 300);
+    connect(vp, &Viewport::topoState, this, [this] { if (isVisible()) refresh(); });
+  }
+  void refresh() {
+    const auto lib = vp_->matLibrary(); QString sig; for (auto& d : lib) sig += d.name + "|" + QString::number(d.faces) + "|" + d.color + ";";
+    if (sig == sig_) return; sig_ = sig;
+    while (list_->count() > 1) { QLayoutItem* it = list_->takeAt(0); if (QWidget* w = it->widget()) { w->hide(); w->setParent(nullptr); w->deleteLater(); } delete it; }
+    if (lib.empty()) { auto* e = new QLabel(tr("No materials in the project yet")); e->setObjectName("mlh"); list_->insertWidget(0, e); return; }
+    int i = 0; for (const auto& d : lib) { auto* r = new MatRow(d); r->dropped = [this, d](const QPoint& g) { drop(g, d); }; list_->insertWidget(i++, r); }
+  }
+private:
+  void drop(const QPoint& g, const Viewport::MatDef& d) {
+    if (geometry().contains(g)) return;                               // (let go over the window itself: cancelled)
+    for (QWidget* p = QApplication::widgetAt(g); p; p = p->parentWidget()) if (auto* ov = qobject_cast<OutlinerView*>(p)) {
+      const int id = ov->itemAt(ov->mapFromGlobal(g)); const Item* it = id >= 0 ? vp_->scene()->item(id) : nullptr;
+      if (!it) { ui::toast(tr("Drop the material onto an object's row")); return; }
+      std::vector<int> ms; std::function<void(const Item&)> walk = [&](const Item& x) { if (x.type == ItemType::IMesh) ms.push_back(x.id); else if (x.type == ItemType::Group) for (int c : x.children) if (const Item* ci = vp_->scene()->item(c)) walk(*ci); };
+      walk(*it); if (ms.empty()) { ui::toast(tr("Drop the material onto a mesh or a group of meshes")); return; }
+      for (int m : ms) vp_->matAssign(m, {}, d);
+      return;
+    }
+    if (QRect(vp_->mapToGlobal(QPoint(0, 0)), vp_->size()).contains(g)) { vp_->matDrop(g, d); return; }
+    ui::toast(tr("Drop the material onto an object, an outliner row or the UV Editor"));
+  }
+  Viewport* vp_; QWidget* body_ = nullptr; QVBoxLayout* list_ = nullptr; QString sig_ = "-";   // (not a signature any library gives: the first refresh fills the list, an empty one too)
+};
 }  // namespace
 
 // ---------- the mode strip ----------
@@ -312,30 +462,77 @@ TopoModes::TopoModes(Viewport* vp, QWidget* parent) : QFrame(parent), vp_(vp) {
   auto* syt = toolBtn("topo_snapsettings", tr("Symmetry settings: planar / topology / radial, the axes X Y Z, the space, where the plane lies, Restrict, the tolerance, the planes shown; the UV part — symmetric unfold, the −X tint, the UV axis, Symmetrize")); syt->setObjectName("tt_symset"); syt->setCheckable(false);
   connect(syt, &QPushButton::clicked, this, [this, syt] { openSymPanel(vp_, syt, true); });   // (the panel: Symmetry's settings, the UV part under them)
   v->addWidget(sn); v->addWidget(es); v->addWidget(est); v->addWidget(mkGap(), 0, Qt::AlignHCenter); v->addWidget(sy); v->addWidget(syt);
+  // (UV Mats under Symmetry: the window with every material of the project — a row dragged onto an object or the picked shells)
+  auto* mt = toolBtn("uv_mats", tr("UV Mats: every material of the project in a window — drag one onto an object (in the view or the outliner) or onto the shells picked in the UV Editor: they get it"));
+  mt->setObjectName("tt_mats"); mt->setCheckable(true);
+  connect(mt, &QPushButton::clicked, this, [this, mt] {
+    if (!matWin_) matWin_ = new MatLibWin(vp_, window());
+    auto* w = static_cast<MatLibWin*>(matWin_);
+    if (w->isVisible()) { w->hide(); mt->setChecked(false); return; }
+    w->refresh(); w->move(mt->mapToGlobal(QPoint(mt->width() + 8, 0))); w->show(); mt->setChecked(true); });
+  v->addWidget(mkGap(), 0, Qt::AlignHCenter); v->addWidget(mt);
   connect(vp, &Viewport::topoState, this, &TopoModes::sync);
   connect(vp, &Viewport::toolChanged, this, &TopoModes::sync);
   connect(vp, &Viewport::selectionChanged, this, &TopoModes::sync);
+  connect(vp, &Viewport::snapHoldChanged, this, &TopoModes::sync);
   sync();
 }
 void TopoModes::sync() {
   ProfScope prof_("TopoModes");
-  const bool heavy = vp_->topoHeavy(vp_->topoMesh());
   for (const char* k : {"object", "poly", "edge", "vert"}) if (auto* b = findChild<QPushButton*>(QString("tm_") + k)) {
     b->setChecked(vp_->topoMode == k);
-    if (QString(k) != "object") { if (heavy) { auto* e = new QGraphicsOpacityEffect(b); e->setOpacity(0.3); b->setGraphicsEffect(e); } else b->setGraphicsEffect(nullptr); if (heavy) b->setToolTip(tr(HEAVY)); }
   }
   if (auto* b = findChild<QPushButton*>("tt_snap")) b->setChecked(vp_->tset.snap);
-  if (auto* b = findChild<QPushButton*>("tt_esnap")) b->setChecked(vp_->tset.esnap);
+  if (auto* b = findChild<QPushButton*>("tt_esnap")) b->setChecked(vp_->esnapOn());   // (lit while the snap key — V / X — is held too)
   if (auto* b = findChild<QPushButton*>("tt_sym")) b->setChecked(vp_->tset.sym);
   if (auto* b = findChild<QPushButton*>("tt_uv")) b->setChecked(vp_->tset.uv);
   if (auto* b = findChild<QPushButton*>("tt_keepuv")) b->setChecked(vp_->tset.keepUv);
-  if (auto* b = findChild<QPushButton*>("tt_brush")) b->setChecked(vp_->tool() == "tmask");
 }
 
 // ---------- the UV mode's window ----------
 namespace {
 // a picture from a glyph (a function with no icon of its own yet)
+// The pictures of the UV tools that had no icon: the same look as the others — a dark rounded square, light round-capped lines, dashed grey frames, the orange shell
+QIcon drawnToolIcon(const QString& key) {
+  static const QStringList known{"＋", "⇲", "⊘", "◐", "✕", "✂", "~", "Rizom", "Overlap", "⤢", "⇹", "⇳", "▦", "⟋", "∟", "⇡", "⧉", "⧈", "⇆", "≈", "📍", "✋", "∠", "🖼"};
+  if (!known.contains(key)) return {};
+  const int S = 128; QPixmap pm(S, S); pm.fill(Qt::transparent); QPainter p(&pm); p.setRenderHint(QPainter::Antialiasing);
+  const QColor bg(0x21, 0x21, 0x21), lt(0xd0, 0xd0, 0xd0), dm(0x78, 0x78, 0x78), og(0xf0, 0x70, 0x1c);
+  p.setPen(Qt::NoPen); p.setBrush(bg); p.drawRoundedRect(QRectF(0, 0, S, S), 26, 26);
+  auto L = [&](double a, double b, double c, double d, QColor col = QColor(0xd0, 0xd0, 0xd0), double w = 7) { QPen pen(col, w); pen.setCapStyle(Qt::RoundCap); p.setPen(pen); p.drawLine(QPointF(a, b), QPointF(c, d)); };
+  auto arrow = [&](double a, double b, double c, double d) { L(a, b, c, d); const double dx = c - a, dy = d - b, n = std::hypot(dx, dy); if (n < 1e-6) return; const double ux = dx / n, uy = dy / n;
+    L(c, d, c - ux * 12 - uy * 8, d - uy * 12 + ux * 8); L(c, d, c - ux * 12 + uy * 8, d - uy * 12 - ux * 8); };
+  auto sq = [&](double x, double y, double w, double h, QColor f = QColor(0xf0, 0x70, 0x1c)) { p.setPen(Qt::NoPen); p.setBrush(f); p.drawRoundedRect(QRectF(x, y, w, h), 4, 4); };
+  auto frame = [&](double x, double y, double w, double h, QColor c, bool dash = false) { QPen pen(c, 5); pen.setCapStyle(Qt::RoundCap); if (dash) pen.setStyle(Qt::DashLine); p.setPen(pen); p.setBrush(Qt::NoBrush); p.drawRoundedRect(QRectF(x, y, w, h), 4, 4); };
+  auto circ = [&](double x, double y, double r, QColor c, double w = 6, bool fill = false) { p.setPen(QPen(c, w)); p.setBrush(fill ? c : Qt::NoBrush); p.drawEllipse(QPointF(x, y), r, r); };
+  if (key == "＋") { frame(26, 26, 76, 76, dm, true); sq(50, 50, 28, 28); L(64, 36, 64, 92, lt, 6); L(36, 64, 92, 64, lt, 6); sq(54, 54, 20, 20); }
+  else if (key == "⇲") { frame(54, 54, 52, 52, dm, true); sq(24, 24, 28, 28); arrow(56, 56, 84, 84); }
+  else if (key == "⊘") { circ(64, 64, 34, lt); L(40, 88, 88, 40, lt, 7); sq(56, 56, 16, 16); }
+  else if (key == "◐") { circ(64, 64, 36, lt); p.setPen(Qt::NoPen); p.setBrush(og); p.drawPie(QRectF(28, 28, 72, 72), 90 * 16, 180 * 16); }
+  else if (key == "✕") { sq(30, 30, 68, 68); L(38, 38, 90, 90, lt, 9); L(90, 38, 38, 90, lt, 9); }
+  else if (key == "✂") { circ(40, 92, 14, lt, 6); circ(88, 92, 14, lt, 6); L(46, 80, 92, 30, lt, 6); L(82, 80, 36, 30, lt, 6); sq(54, 18, 20, 12); }
+  else if (key == "~") { QPainterPath w; w.moveTo(22, 64); for (int i = 0; i <= 84; i++) w.lineTo(22 + i, 64 - 18 * std::sin(i / 84.0 * 6.2832)); p.setPen(QPen(lt, 7, Qt::SolidLine, Qt::RoundCap)); p.setBrush(Qt::NoBrush); p.drawPath(w); circ(22, 64, 7, og, 2, true); circ(106, 64, 7, og, 2, true); }
+  else if (key == "Rizom") { sq(24, 24, 80, 80); QFont f("Segoe UI"); f.setPixelSize(64); f.setBold(true); p.setFont(f); p.setPen(bg); p.drawText(QRect(0, 0, S, S), Qt::AlignCenter, "R"); }
+  else if (key == "Overlap") { frame(22, 22, 58, 58, lt); sq(48, 48, 58, 58, QColor(0xf0, 0x70, 0x1c, 200)); }
+  else if (key == "⤢") { frame(18, 18, 92, 92, dm, true); sq(46, 46, 36, 36); arrow(40, 64, 22, 64); arrow(88, 64, 106, 64); arrow(64, 40, 64, 22); arrow(64, 88, 64, 106); }
+  else if (key == "⇹") { sq(14, 46, 22, 36); sq(53, 46, 22, 36); sq(92, 46, 22, 36); arrow(40, 30, 50, 30); L(40, 30, 50, 30); arrow(80, 30, 90, 30); L(40, 100, 90, 100, dm, 5); }
+  else if (key == "⇳") { sq(46, 14, 36, 22); sq(46, 53, 36, 22); sq(46, 92, 36, 22); L(100, 40, 100, 90, dm, 5); arrow(100, 40, 100, 30); arrow(100, 90, 100, 100); }
+  else if (key == "▦") { for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) sq(22 + i * 30, 22 + j * 30, 24, 24, ((i + j) % 2) ? dm : og); }
+  else if (key == "⟋") { L(26, 100, 102, 28, lt, 7); circ(26, 100, 8, og, 2, true); circ(102, 28, 8, og, 2, true); circ(64, 64, 6, og, 2, true); }
+  else if (key == "∟") { L(30, 24, 30, 100, dm, 7); L(30, 100, 104, 100, lt, 7); sq(40, 88, 40, 12); }
+  else if (key == "⇡") { sq(48, 40, 32, 70); arrow(64, 34, 64, 14); L(30, 112, 98, 112, dm, 5); }
+  else if (key == "⧉") { frame(24, 24, 56, 56, dm); sq(46, 46, 56, 56); }
+  else if (key == "⧈") { sq(14, 22, 44, 44); frame(70, 62, 44, 44, dm); arrow(48, 74, 66, 92); }
+  else if (key == "⇆") { sq(14, 50, 30, 30); sq(84, 50, 30, 30); arrow(46, 56, 66, 56); arrow(82, 74, 62, 74); }
+  else if (key == "≈") { circ(64, 64, 40, lt); for (int k = -1; k <= 1; k++) { QPainterPath w; w.moveTo(36, 64 + k * 16); for (int i = 0; i <= 56; i++) w.lineTo(36 + i, 64 + k * 16 + 5 * std::sin(i / 56.0 * 6.2832)); p.setPen(QPen(og, 5, Qt::SolidLine, Qt::RoundCap)); p.setBrush(Qt::NoBrush); p.drawPath(w); } }
+  else if (key == "📍") { circ(64, 46, 22, lt, 6); L(64, 68, 64, 106, lt, 7); circ(64, 46, 8, og, 2, true); }
+  else if (key == "✋") { circ(64, 64, 42, dm, 4); arrow(64, 64, 64, 28); arrow(64, 64, 64, 100); arrow(64, 64, 28, 64); arrow(64, 64, 100, 64); sq(54, 54, 20, 20); }
+  else if (key == "∠") { L(26, 100, 100, 100, lt, 7); L(26, 100, 82, 36, lt, 7); p.setPen(QPen(og, 6)); p.setBrush(Qt::NoBrush); p.drawArc(QRectF(-8, 66, 70, 70), 0, 48 * 16); }
+  else if (key == "🖼") { frame(18, 18, 92, 92, lt); for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) if ((i + j) % 2 == 0) sq(24 + i * 20, 24 + j * 20, 20, 20, og); }
+  p.end(); return QIcon(pm);
+}
 QIcon glyphIcon(const QString& g) {
+  if (const QIcon d = drawnToolIcon(g); !d.isNull()) return d;
   QPixmap p(64, 64); p.fill(Qt::transparent); QPainter q(&p); q.setRenderHint(QPainter::TextAntialiasing);
   QFont f("Segoe UI Symbol"); f.setPixelSize(40); q.setFont(f); q.setPen(QColor(0xd0, 0xd0, 0xd8)); q.drawText(QRect(0, 0, 64, 64), Qt::AlignCenter, g); q.end();
   return QIcon(p);
@@ -360,12 +557,35 @@ protected:
   }
 };
 QIcon textIcon(const QString& t) {                  // (a picture of a short word — a switch with no icon of its own)
+  if (const QIcon d = drawnToolIcon(t); !d.isNull()) return d;
   QPixmap p(96, 96); p.fill(Qt::transparent); QPainter q(&p); q.setRenderHint(QPainter::Antialiasing); q.setRenderHint(QPainter::TextAntialiasing);
   q.setPen(QPen(QColor(0xc8, 0xc8, 0xd0), 4)); q.setBrush(Qt::NoBrush); q.drawRoundedRect(QRectF(10, 22, 76, 52), 10, 10);
   QFont f("Segoe UI"); f.setPixelSize(28); f.setBold(true); q.setFont(f); q.drawText(QRect(0, 0, 96, 96), Qt::AlignCenter, t); q.end(); return QIcon(p);
 }
 }  // namespace
 
+// A button of the UV panel drawn entirely here: the picture at one fixed size and place whatever the state (hover, pressed, checked) — no Qt icon states, no style sheet box;
+// only the background and the border change. (The hovered icon of a QToolButton moved / grew and lay over the others.)
+class UvBtn : public QToolButton {
+public:
+  explicit UvBtn(int sz) : sz_(sz) { setAttribute(Qt::WA_Hover, false); setMouseTracking(false); setFixedSize(sz, sz); }
+  void setPicture(const QIcon& ic) { src_ = ic.pixmap(QSize(256, 256)).toImage(); cacheD_ = 0; update(); }
+protected:
+  void enterEvent(QEnterEvent* e) override { hov_ = true; update(); QToolButton::enterEvent(e); }
+  void leaveEvent(QEvent* e) override { hov_ = false; update(); QToolButton::leaveEvent(e); }
+  void paintEvent(QPaintEvent*) override {
+    QPainter p(this); p.setRenderHint(QPainter::Antialiasing); p.setRenderHint(QPainter::SmoothPixmapTransform);
+    const bool on = isChecked() || isDown(); QColor bg(0x2e, 0x2e, 0x2e), bd(0x3c, 0x3c, 0x3c);
+    if (on) { bg = QColor(0x34, 0x50, 0x7a); bd = QColor(0x6f, 0x9f, 0xe8); } else if (hov_ && isEnabled()) { bg = QColor(0x3a, 0x3f, 0x4a); bd = QColor(0x5b, 0x6b, 0x88); }
+    p.setPen(QPen(bd, 1)); p.setBrush(bg); p.drawRoundedRect(QRectF(0.5, 0.5, width() - 1, height() - 1), 4, 4);
+    if (!src_.isNull()) { const qreal d = devicePixelRatioF(); const int s = sz_ - 6;
+      if (cacheD_ != d) { pm_ = QPixmap::fromImage(src_.scaled(int(s * d), int(s * d), Qt::KeepAspectRatio, Qt::SmoothTransformation)); pm_.setDevicePixelRatio(d); cacheD_ = d; }
+      if (!isEnabled()) p.setOpacity(0.4);
+      p.drawPixmap(QPointF((width() - pm_.width() / d) / 2, (height() - pm_.height() / d) / 2), pm_); }
+  }
+private:
+  int sz_; bool hov_ = false; QImage src_; QPixmap pm_; qreal cacheD_ = 0;
+};
 UvTools::UvTools(QWidget* window, Viewport* vp) : QFrame(window, Qt::Tool | Qt::FramelessWindowHint | Qt::NoDropShadowWindowHint), vp_(vp) {
   setObjectName("uvWin"); setStyleSheet("#uvWin{background:#262626;border:1px solid #555;border-radius:6px} #uvbar{background:#2b2b2b;border-bottom:1px solid #3a3a3a}"
                                          " QPushButton{padding:2px 6px} QLabel[h5=\"true\"]{color:#9a9a9a;font-size:11px;margin-top:4px}"
@@ -378,52 +598,93 @@ UvTools::UvTools(QWidget* window, Viewport* vp) : QFrame(window, Qt::Tool | Qt::
     // (the hotkeys switch: on — the keys work on the UV)
     auto* kb = new QToolButton; kb->setText(tr("⌨ UV keys")); kb->setCheckable(true); kb->setChecked(vp->uvKeys); kb->setCursor(Qt::ArrowCursor);
     kb->setStyleSheet("QToolButton{background:transparent;border:1px solid #444;border-radius:3px;color:#aaa;font-size:10px;padding:0 5px} QToolButton:checked{background:#34507a;border-color:#6f9fe8;color:#fff}");
-    kb->setToolTip(tr("<b>The hotkeys switched to the UV</b> (the Topology room's selection, view and gizmo keys stay: Ctrl+A / D / I, F, H, B, E / R / T, Shift+X)<br>"
+    kb->setToolTip(tr("<b>The hotkeys switched to the UV</b> (the Topology room's selection, view and gizmo keys stay: Ctrl+A / D / I, F, H, B, E / R / T, Shift+S)<br>"
                       "<b>Seams</b> — C seam (polygons: cut off into a shell of their own) · Shift+C off · Alt+C Auto (the closed shells) · W sew · Shift+W snap together<br>"
                       "<b>Unfold</b> — U the selected · Shift+U all · Alt+U symmetric (mirror pairs too) · O Optimize<br>"
                       "<b>Face</b> — L lips / lids open · Shift+L shut · Alt+L off<br>"
                       "<b>Shape</b> — J grid · N line · I by edge · Shift+I upright · M / Shift+M mirror in U / V · [ / ] turn ±90° · K / Shift+K stack / unstack<br>"
                       "<b>Move</b> — arrows a texel (Shift: 10) · Alt+arrows align · Alt+Shift+arrows space out<br>"
-                      "<b>Symmetry</b> — Shift+X on / off · Shift+Y Symmetrize · Alt+Y the axis from the selection<br>"
+                      "<b>Symmetry</b> — Shift+S on / off · Shift+Y Symmetrize · Alt+Y the axis from the selection<br>"
                       "<b>Density</b> — Alt+D take · Shift+D give to the selected<br>"
                       "<b>Pack</b> — Shift+B all · Alt+B the selected · Alt+H lock · G / Shift+G group / ungroup<br>"
-                      "<b>Pins</b> — Alt+V / Alt+T the edges straightened up / across and pinned · Alt+Shift+C the pins off<br>"
+                      "<b>Pins</b> — Alt+V / Alt+T the edges straightened up / across (kept straight, not held) · Alt+Shift+C the pins off<br>"
                       "<b>Brushes</b> — Alt+R Relax (Shift: the border too) · Alt+P Pin (Ctrl: unpin) · [ ] size · Shift+[ ] strength · Esc off<br>"
                       "<b>View</b> — V in turn: plain → stretch by area → by angles → the problems<br>"
                       "With the UV Editor open, the shell under the pointer in 3D shows unfolded in it"));
     connect(kb, &QToolButton::toggled, this, [this](bool on) { vp_->setUvKeys(on); });
     h->addWidget(kb); }
   v->addWidget(bar_);
-  auto* body = new QWidget; auto* b = new QVBoxLayout(body); b->setContentsMargins(8, 2, 8, 0); b->setSpacing(3);
+  auto* body = new QWidget; QVBoxLayout* b = new QVBoxLayout(body); b->setContentsMargins(8, 2, 8, 0); b->setSpacing(3);
   // (the body scrolls when the window would be taller than the program's — the rows never squeezed into one another)
   scroll_ = new QScrollArea; scroll_->setWidget(body); scroll_->setWidgetResizable(true); scroll_->setFrameShape(QFrame::NoFrame); scroll_->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
-  scroll_->setStyleSheet("QScrollArea{background:transparent} QScrollArea > QWidget > QWidget{background:transparent}"); body_ = body; v->addWidget(scroll_);
-  auto h5 = [&](const QString& s) { auto* l = new QLabel(s); l->setProperty("h5", true); b->addWidget(l); };
+  body->setObjectName("uvBody"); body->setAttribute(Qt::WA_StyledBackground);   // (opaque, and repainted whole when its rows move: on a see-through body the old pixels stayed, and a hovered button came up over a stale copy of the panel shifted by a line)
+  scroll_->setStyleSheet("QScrollArea{background:#262626;border:none} QScrollArea > QWidget{background:#262626} #uvBody{background:#262626}"); body_ = body; v->addWidget(scroll_); body->installEventFilter(this);
+  // (every block folds: its header a button — the state kept; a block's widgets go into its own folded part)
+  QVBoxLayout* rootB = b;
+  auto h5 = [&](const QString& s) {
+    const QString key = s.section(QRegularExpression("\\s+[—–]\\s+"), 0, 0).trimmed();
+    auto* hdr = new QPushButton; hdr->setFlat(true); hdr->setCursor(Qt::PointingHandCursor); hdr->setFocusPolicy(Qt::NoFocus); hdr->setToolTip(tr("Click — fold / unfold this block"));
+    hdr->setStyleSheet("QPushButton{text-align:left;color:#9a9a9a;font-size:11px;border:none;background:transparent;padding:4px 0 1px 0} QPushButton:hover{color:#e0e0e0}");
+    auto* sec = new QWidget; auto* sl = new QVBoxLayout(sec); sl->setContentsMargins(0, 0, 0, 0); sl->setSpacing(3);
+    auto folded = std::make_shared<bool>(QSettings().value("uvwin/folded/" + key).toBool());
+    auto upd = [hdr, folded, s] { hdr->setText(QString(*folded ? "▸ " : "▾ ") + s); };
+    sec->setVisible(!*folded); upd();
+    connect(hdr, &QPushButton::clicked, this, [this, sec, folded, key, upd] { *folded = !*folded; sec->setVisible(!*folded); QSettings().setValue("uvwin/folded/" + key, *folded); upd(); QTimer::singleShot(0, this, [this] { sync(); }); });
+    rootB->addWidget(hdr); rootB->addWidget(sec); b = sl; };
   // a big button: its picture over its name
-  auto big = [this](const QIcon& icon, const QString& label, const QString& tip, std::function<void()> fn) {
-    auto* x = new QToolButton; x->setObjectName("uvb"); x->setIcon(icon); x->setIconSize(QSize(38, 38)); x->setText(label); x->setToolTip("<b>" + label.toHtmlEscaped() + "</b> — " + tip.toHtmlEscaped());   // (compact, as RizomUV's bars: the icon only, its name first in the tip)
-    x->setToolButtonStyle(Qt::ToolButtonIconOnly); x->setFixedSize(44, 44);   // (the size of the Topology tools window's) x->setFocusPolicy(Qt::NoFocus);
+  auto big = [this](const QIcon& icon, const QString& label, const QString& tip, std::function<void()> fn, int sz = 44) {
+    auto* x = new UvBtn(sz); x->setObjectName("uvb"); x->setPicture(icon); x->setText(label); x->setToolTip("<b>" + label.toHtmlEscaped() + "</b> — " + tip.toHtmlEscaped());   // (compact, as RizomUV's bars: the icon only, its name first in the tip)
+    x->setToolButtonStyle(Qt::ToolButtonIconOnly); x->setFixedSize(sz, sz);   /* (the size of the Topology tools window's) */ x->setFocusPolicy(Qt::NoFocus);
     connect(x, &QToolButton::clicked, this, [fn] { fn(); }); return x; };
   auto pic = [](const QString& name) { return ui::icon(name); };
   auto grid = [&](std::initializer_list<QWidget*> ws) { auto* w = new QWidget; auto* g = new QGridLayout(w); g->setContentsMargins(0, 2, 0, 2); g->setSpacing(3); int i = 0;
     for (QWidget* x : ws) { g->addWidget(x, i / 6, i % 6); i++; } g->setColumnStretch(6, 1); b->addWidget(w); };
-  status_ = new QLabel; status_->setWordWrap(true); status_->setProperty("mut", true); status_->setMaximumWidth(292); b->addWidget(status_);
+  status_ = new QLabel; status_->setWordWrap(true); status_->setProperty("mut", true); status_->setMaximumWidth(292); status_->setAlignment(Qt::AlignLeft | Qt::AlignTop); status_->setFixedHeight(status_->fontMetrics().lineSpacing() * 2 + 2); b->addWidget(status_);   // (always two lines tall: its text wrapping moved the whole panel by a line)
   // ---- UV Sets: the selected shells into a new set or an existing one; the list — a click enters a set (again — out),
   // its polygons a shade of blue; Isolate — only its shells shown ----
   h5(tr("UV Sets — the selected shells laid out apart"));
-  { auto* nw = big(glyphIcon("＋"), tr("New set"), tr("A new UV Set for the selected shells (whole — a polygon of each is enough) or the selected objects (Object mode: all of them): a layout of their own, worked in at once"), [this] { vp_->uvSetFromShells(-1); });
-    setAdd_ = big(glyphIcon("⇲"), tr("Add to ▾"), tr("The selected shells into an existing UV Set"), [this] {
-      const int m = vp_->topoMesh(); if (m < 0) return; auto S = vp_->uvSets(m); QMenu menu;
-      for (size_t i = 0; i < S.size(); i++) { const int si = int(i); menu.addAction(S[i].name, this, [this, si] { vp_->uvSetFromShells(si); }); }
-      menu.exec(QCursor::pos()); });
-    setExit_ = big(glyphIcon("⊘"), tr("Exit set"), tr("Out of the UV Set worked in — every polygon shown again"), [this] { const auto P = vp_->uvPicked; if (P.id >= 0 && P.set >= 0) vp_->uvPickSet(P.id, P.set); });
-    setIso_ = big(glyphIcon("◐"), tr("Isolate"), tr("Only the shells of the UV Set worked in shown in the UV Editor (off — the rest shown darkened)"), [] {});
+  { auto* nw = big(glyphIcon("＋"), tr("New set"), tr("A new UV Set. Polygons selected: exactly those go into it (the Shells button widens a selection to whole shells first). Nothing selected (or Object mode): an empty set that belongs to nothing — put polygons, shells or objects into it later with Add to, or move shells into it from other sets (Add to → Move to)"), [this] { vp_->uvSetFromShells(-1); }, 30);
+    // the selection into a set; polygons that lie in another set already: a report asks what to do with them
+    auto putSel = [this](const QString& n, bool mv0) {
+      const bool mv = mv0 || (vp_->uvObjScope() && !(QApplication::keyboardModifiers() & Qt::ControlModifier));   // (whole objects: taken out of their other sets — an object has one layout; Ctrl — kept in them too)
+      const auto c = mv ? Viewport::SetClashInfo{} : vp_->uvSetClash(n);
+      Viewport::SetClash mode = Viewport::SetClash::CopySame;
+      if (c.n > 0) {
+        QMessageBox box(this); box.setIcon(QMessageBox::Question); box.setWindowTitle(tr("Polygons already in another set"));
+        box.setText(tr("%1 of the selected polygon%2 already belong%3 to: %4.").arg(c.n).arg(c.n == 1 ? "" : "s").arg(c.n == 1 ? "s" : "").arg(c.sets.join(", ")));
+        box.setInformativeText(tr("What to do with them in %1?").arg(n));
+        auto* ex = box.addButton(tr("Leave them out"), QMessageBox::ActionRole);
+        auto* mvb = box.addButton(tr("Add, take out of the other sets"), QMessageBox::ActionRole);
+        auto* same = box.addButton(tr("Add, keep their unwrap (a copy)"), QMessageBox::ActionRole);
+        auto* nw = box.addButton(tr("Add for a new unwrap"), QMessageBox::ActionRole);
+        box.addButton(QMessageBox::Cancel); box.exec();
+        auto* got = box.clickedButton();
+        if (got == ex) mode = Viewport::SetClash::Exclude; else if (got == mvb) mode = Viewport::SetClash::MoveNew;
+        else if (got == same) mode = Viewport::SetClash::CopySame; else if (got == nw) mode = Viewport::SetClash::CopyNew; else return; }
+      vp_->uvSetPutPicked(n, mv, mode); };
+    setAdd_ = big(glyphIcon("⇲"), tr("Add to ▾"), tr("The selected polygons (Object mode: the picked objects) into the lit UV Set (polygons: Shift — and taken out of their other sets; objects: always taken out of their other sets, Ctrl keeps them there); none lit — into one chosen from the menu"), [this, putSel] {
+      const bool mv1 = QApplication::keyboardModifiers() & Qt::ShiftModifier;
+      if (!vp_->uvFreePicked.isEmpty()) { putSel(vp_->uvFreePicked, mv1); return; }   // (an empty set lit: the selection goes into it)
+      { const auto P0 = vp_->uvPicked; const int m0 = P0.id; if (m0 >= 0 && P0.set >= 0 && P0.mat == -2) { const auto S0 = vp_->uvSets(m0); if (size_t(P0.set) < S0.size()) { putSel(S0[size_t(P0.set)].name, mv1); return; } } }   // (a set lit: likewise)
+      const auto names = vp_->uvSetNamesAll(); if (names.empty()) { ui::toast(tr("No UV Sets yet — ＋ makes an empty one")); return; }
+      QMenu menu; QMenu* mv = menu.addMenu(tr("Move to ▸"));
+      for (const QString& n : names) { menu.addAction(n, this, [putSel, n] { putSel(n, false); }); mv->addAction(n, this, [putSel, n] { putSel(n, true); }); }
+      menu.exec(QCursor::pos()); }, 30);
+    setExit_ =big(glyphIcon("⊘"), tr("Exit set"), tr("Out of the UV Set worked in — every polygon shown again"), [this] { const auto P = vp_->uvPicked; if (P.id >= 0 && P.set >= 0) vp_->uvPickSet(P.id, P.set); }, 30);
+    setIso_ = big(glyphIcon("◐"), tr("Solo set"), tr("Solo set (on by default): only the polygons of the UV Set worked in shown in the UV Editor. Off — the rest shown darkened. Pack and the checks work on the set's polygons either way"), [] {}, 30);
     setIso_->setCheckable(true); setIso_->setChecked(vp_->uvSetIso);
-    connect(setIso_, &QToolButton::toggled, this, [this](bool on) { vp_->uvSetIso = on; vp_->uvChanged(); emit vp_->topoState(); });
-    setDel_ = big(glyphIcon("✕"), tr("Delete set"), tr("Delete the UV Set worked in — its polygons (its mats) go to the first other set; Ctrl+Z brings it back"), [this] { const auto P = vp_->uvPicked; if (P.id >= 0 && P.set >= 0) vp_->uvSetDelete(P.id, P.set); });
-    grid({nw, setAdd_, setExit_, setIso_, setDel_});
-    sets_ = new QWidget; sets_->setMaximumWidth(300); auto* sl = new QVBoxLayout(sets_); sl->setContentsMargins(0, 0, 0, 0);   // (the sets as buttons — made again in syncSets)
-    b->addWidget(sets_);
+    connect(setIso_, &QToolButton::toggled, this, [this](bool on) { vp_->uvSetIso = on; vp_->saveUvPrefs(); vp_->uvChanged(); emit vp_->topoState(); });
+    setDel_ = big(glyphIcon("✕"), tr("Delete set"), tr("Delete the UV Set worked in — its polygons (its mats) go to the first other set; Ctrl+Z brings it back"), [this] { const auto P = vp_->uvPicked; if (P.id >= 0 && P.set >= 0) vp_->uvSetDelete(P.id, P.set); }, 30);
+    setTiles_ = big(glyphIcon("▦"), tr("All sets as tiles"), tr("Every UV Set of the project at once, each in a tile of its own — up to 4 in a row (4 sets: 2 × 2, 5: 3 over 2, 6: 3 × 2, 9: 3 × 3). To look at only: a click on a tile works in that set (the tiles closed)"), [] {}, 30);
+    setTiles_->setCheckable(true); setTiles_->setChecked(vp_->uvTiles);
+    connect(setTiles_, &QToolButton::toggled, this, [this](bool on) { vp_->setUvTiles(on); emit vp_->topoState(); });
+    grid({nw, setAdd_, setExit_, setIso_, setDel_, setTiles_});
+    // (the window with all the mesh's UV Sets: a frame of its own, there even while empty — made again in syncSets)
+    auto* box = new QFrame; box->setObjectName("uvSetsBox"); box->setMaximumWidth(300);
+    box->setStyleSheet("#uvSetsBox{background:#1f1f1f;border:1px solid #3c3c3c;border-radius:4px}");
+    auto* bl = new QVBoxLayout(box); bl->setContentsMargins(4, 4, 4, 4);
+    sets_ = new QWidget; auto* sl = new QVBoxLayout(sets_); sl->setContentsMargins(0, 0, 0, 0); bl->addWidget(sets_); bl->addStretch(1);
+    b->addWidget(box);
     // the texture the set worked in (else the mesh) is laid out for: its size (a rectangle too) and the padding in pixels
     auto size = [this](const QString& tip) { auto* c = new QComboBox; c->setEditable(true); c->setFocusPolicy(Qt::ClickFocus); c->setToolTip(tip); c->setMinimumWidth(66);
       for (int s : {256, 512, 1024, 2048, 4096, 8192}) c->addItem(QString::number(s)); return c; };
@@ -432,15 +693,27 @@ UvTools::UvTools(QWidget* window, Viewport* vp) : QFrame(window, Qt::Tool | Qt::
     texPad_->setToolTip(tr("Padding: the gap between the shells in the texture's pixels (half of it off the tile's edges) — Pack keeps it; the bleed a baker / a mip map needs"));
     padShow_ = new QPushButton(tr("▣")); padShow_->setCheckable(true); padShow_->setFixedWidth(28); padShow_->setFocusPolicy(Qt::NoFocus); padShow_->setChecked(vp_->uvShowPad);
     padShow_->setToolTip(tr("Show the padding: round each shell a band of half of it — bands overlapping (darker) or past the tile's edge: the shells closer than the padding"));
-    auto apply = [this] { const int m = vp_->topoMesh(); if (m < 0) return; Viewport::UvTex t = vp_->uvTex(m);
+    auto apply = [this] { const int m = vp_->topoMesh(); if (m < 0 && vp_->uvFreePicked.isEmpty()) return; Viewport::UvTex t = vp_->uvTex(m);
       t.w = std::clamp(texW_->currentText().toInt(), 16, 16384); t.h = std::clamp(texH_->currentText().toInt(), 16, 16384); t.pad = texPad_->value();
       const auto o = vp_->uvTex(m); if (o.w != t.w || o.h != t.h || o.pad != t.pad) vp_->uvSetTex(m, t); };
+    // the set's label colour and the texture shown on the model while the UV Editor is up
+    setColor_ = new QPushButton(tr("Colour")); setColor_->setFocusPolicy(Qt::NoFocus); setColor_->setToolTip(tr("The set's label colour: its button, its shells' outline, its mark in the outliner. Empty — picked for it"));
+    connect(setColor_, &QPushButton::clicked, this, [this] { const int m = vp_->topoMesh(); if (m < 0 && vp_->uvFreePicked.isEmpty()) return; Viewport::UvTex t = vp_->uvTex(m);
+      const QColor c = QColorDialog::getColor(QColor(t.color.isEmpty() ? "#4a8fe0" : t.color), this, tr("The set's label colour")); if (!c.isValid()) return; t.color = c.name(); vp_->uvSetTex(m, t); });
+    setTex_ = new QComboBox; setTex_->setFocusPolicy(Qt::ClickFocus); setTex_->addItem(tr("Checker"), ""); setTex_->addItem(tr("Colour checker"), "color"); setTex_->addItem(tr("Image…"), "image");
+    setTex_->setToolTip(tr("The texture shown on the model, in every mode, while the UV Editor is open: a colourless checker (by default), a coloured one, or an image — to see the stretch of the polygons"));
+    connect(setTex_, &QComboBox::activated, this, [this](int i) { const int m = vp_->topoMesh(); if (m < 0 && vp_->uvFreePicked.isEmpty()) return; Viewport::UvTex t = vp_->uvTex(m);
+      const QString k = setTex_->itemData(i).toString();
+      if (k == "image") { const QString f = QFileDialog::getOpenFileName(this, tr("Texture for the set"), QString(), tr("Images (*.png *.jpg *.jpeg *.tga *.bmp *.webp)")); if (f.isEmpty()) { emit vp_->topoState(); return; } t.tex = f; }
+      else t.tex = k;
+      vp_->uvSetTex(m, t); });
     for (QComboBox* c : {texW_, texH_}) { connect(c, &QComboBox::activated, this, apply); connect(c->lineEdit(), &QLineEdit::editingFinished, this, apply); }   // (a pick, or typed and Enter — not every key)
     connect(texPad_, &QDoubleSpinBox::valueChanged, this, apply);
     connect(padShow_, &QPushButton::toggled, this, [this](bool on) { vp_->uvShowPad = on; vp_->uvChanged(); });
     auto* tr0 = new QWidget; auto* tl = new QHBoxLayout(tr0); tl->setContentsMargins(0, 2, 0, 2); tl->setSpacing(4);
     tl->addWidget(new QLabel(tr("Texture"))); tl->addWidget(texW_); tl->addWidget(new QLabel("×")); tl->addWidget(texH_);
     tl->addWidget(new QLabel(tr("Padding"))); tl->addWidget(texPad_); tl->addWidget(padShow_); tl->addStretch(1); b->addWidget(tr0);
+    { auto* r1 = new QWidget; auto* l1 = new QHBoxLayout(r1); l1->setContentsMargins(0, 2, 0, 2); l1->setSpacing(4); l1->addWidget(setColor_); l1->addWidget(new QLabel(tr("Texture"))); l1->addWidget(setTex_); l1->addStretch(1); b->addWidget(r1); }
     // the texel density: the one the set wants (texture pixels per the Transform table's unit) and the selected shells'
     tdWant_ = new QDoubleSpinBox; tdWant_->setRange(0, 1e6); tdWant_->setDecimals(2); tdWant_->setKeyboardTracking(false); tdWant_->setFocusPolicy(Qt::ClickFocus); tdWant_->setSpecialValueText(tr("—"));
     tdWant_->setToolTip(tr("Texel density wanted: texture pixels per unit of the model (the unit of the Transform table: mm, cm, m, in) — for this UV Set's texture. Get — from the selected shells; Set — the selected shells scaled to it, each in its place"));
@@ -460,16 +733,35 @@ UvTools::UvTools(QWidget* window, Viewport* vp) : QFrame(window, Qt::Tool | Qt::
   connect(ang, &QSpinBox::valueChanged, this, [this](int x) { vp_->uvo.angle = x; vp_->saveUvPrefs(); });
   grid({big(pic("uv_seambyangle"), tr("By angle"), tr("Seams where the polygons meet at more than the angle (added to those there are)"), [this] { vp_->uvSeamsByAngle(vp_->uvo.angle); }),
         big(pic("uv_seamfromuv"), tr("From UV"), tr("The seams = where the mesh's UV breaks now (the shells' borders)"), [this] { vp_->uvSeamsFromBorders(); }),
-        big(glyphIcon("✂"), tr("Auto"), tr("Alt+C — the closed shells of the selection (none selected — all shown) given seams that open each into one piece: its handles cut, a path at the back, below, along sharp edges between its far ends, branches while the stretch drops. Unfold does it by itself to a closed shell"), [this] { vp_->uvAutoSeams(); }), ang});
+        big(glyphIcon("✂"), tr("Auto"), tr("The closed shells of the selection (none selected — all shown) given seams that open each into one piece: its handles cut, a path at the back, below, along sharp edges between its far ends, branches while the stretch drops. Unfold does it by itself to a closed shell"), [this] { vp_->uvAutoSeams(); }), ang});
+  // ---- the constraints: pins and lines held by Unfold and Pack (the article's block 3) ----
+  h5(tr("Pins and constraints — held by Unfold and Pack"));
+  grid({big(pic("uv_pin"), tr("Pin"), tr("The selected elements (shell, polygons, edges, points) pinned where they lie in UV: Pack does not move them, Unfold lays the rest round them"), [this] { vp_->uvPinKind("pin"); }),
+        big(pic("uv_pinoff"), tr("Unpin"), tr("Alt+Shift+C — the pins of the selected elements off"), [this] { vp_->uvUnpin(); }),
+        big(pic("uv_pinh"), tr("Horizontal"), tr("Alt+T — the selected chain of edges straightened into a horizontal line (one V) and kept so: Unfold and Optimize keep it straight, its points not held — the shell unfolds and moves freely. A shell turned by 90° — the constraint becomes vertical"), [this] { vp_->uvPinStraight(false); }),
+        big(pic("uv_unpinh"), tr("Free horizontal"), tr("The horizontal constraint of the selected edges off"), [this] { vp_->uvPinKind("unh"); }),
+        big(pic("uv_pinv"), tr("Vertical"), tr("Alt+V — the selected chain of edges straightened into a vertical line (one U) and kept so: Unfold and Optimize keep it straight, the shell unfolds and moves freely. A shell turned by 90° — the constraint becomes horizontal"), [this] { vp_->uvPinStraight(true); }),
+        big(pic("uv_unpinv"), tr("Free vertical"), tr("The vertical constraint of the selected edges off"), [this] { vp_->uvPinKind("unv"); })});
+  grid({big(pic("uv_pineye"), tr("Eye / lips"), tr("L — the selected edges of an eye or the lips (Edge mode: the loop round the hole), or the holes of the selected shells: the lids laid one on the other with a small slit, the corners level, as half shut; Unfold keeps them so. The upper rim is orange, the lower pink, a white dot at each corner. Symmetry on — the other eye too"), [this] { vp_->uvFeatureKey(3); }),
+        big(pic("uv_pinupper"), tr("Upper lid"), tr("The selected edges (Edge mode) are the upper lid — when the program took the lids the other way round"), [this] { vp_->uvFeatureLid(true); }),
+        big(pic("uv_pinlower"), tr("Lower lid"), tr("The selected edges are the lower lid"), [this] { vp_->uvFeatureLid(false); }),
+        big(pic("uv_unpineye"), tr("Free eye / lips"), tr("Alt+L — the lips / lids of the selection (none selected — all) laid free again by the next Unfold"), [this] { vp_->uvFeatureKey(2); }),
+        big(pic("uv_pinangled"), tr("Line as is"), tr("The selected edges held in the state they are in: their points stay where they are, at any angle"), [this] { vp_->uvPinKind("angled"); }),
+        big(pic("uv_pinlinesoff"), tr("Free all"), tr("Every line constraint of the selected edges off (none selected — of the whole mesh)"), [this] { vp_->uvPinKind("unall"); })});
+  { auto* sc = big(glyphIcon("~"), tr("Smooth chain"), tr("Smooth Edge Chain for the UV: the selected chain of edges (Edge mode; two ends, no branches) pulled into a smooth curve through its ends — its points spaced by their 3D lengths. The slider: how much of the bends goes"), [this] { vp_->uvSmoothChain(vp_->uvChainAmt); });
+    auto* s = new SliderRow(tr("Chain smoothing"), 0, 1, 0.05, vp_->uvChainAmt, [](double x) { return QString::number(int(std::lround(x * 100))) + "%"; });
+    connect(s, &SliderRow::changed, this, [this](double x) { vp_->uvChainAmt = x; });
+    grid({sc}); b->addWidget(s); }
   // ---- unfold, hair strands ----
   h5(tr("Unfold — along your seams; Optimize — the UV as it lies, less stretch"));
   grid({big(pic("uv_unfold"), tr("Unfold"), tr("U — the selection's shells unfolded along the seams you marked (least squares conformal, then SLIM: even stretch, no triangle turned over), each where its UV was, at the density of the rest; pinned edges kept"), [this] { vp_->uvUnfold(false); }),
         big(pic("uv_unfoldall"), tr("Unfold all"), tr("Shift+U — every shell unfolded along the seams (the locked left), then packed (each UV Mat into its own tile)"), [this] { vp_->uvUnfold(true); }),
         big(ui::image("uv_unwrapopt").isNull() ? pic("uv_unfoldall") : pic("uv_unwrapopt"), tr("Optimize"), tr("O — the selection's shells (none picked — all) relaxed as they lie (SLIM): the stretch evened out, no triangle turned over, no seams cut, not moved or packed; pinned edges held"), [this] { vp_->uvOptimize(); })});
+    auto* pp = big(ui::image("uv_puppet").isNull() ? glyphIcon("📌") : pic("uv_puppet"), tr("Puppet"), tr("Puppet Warp (as Photoshop's): click the selection's UV — pins; drag a pin — the UV follows, kept stiff round the pins (each polygon bent as little as it can be); Ctrl + click a pin — it goes. Again — off"), [this] { vp_->uvTfStart('p'); sync(); });
+  pp->setCheckable(true); ppBtn_ = pp;
   grid({big(pic("uv_straighten"), tr("Straighten"), tr("Hair strands: the selected shells unbent along their length — not into strips (they would stretch): their bends made smaller by Straighten, the width and shape kept; upright when asked"), [this] { vp_->uvStraightenStrands(false); }),
-        big(pic("uv_strandsall"), tr("Strands all"), tr("Every shown shell straightened as a hair strand"), [this] { vp_->uvStraightenStrands(true); }),
-        big(ui::image("uv_rectangle").isNull() ? glyphIcon("▯") : pic("uv_rectangle"), tr("Rectangle"), tr("Hair strands: the selected shells laid out as strips — along the middle line, the width made one all along (it stretches the UV; Straighten keeps the shape)"), [this] { vp_->uvRectangleStrands(false); }),
-        big(ui::image("uv_rectangleall").isNull() ? glyphIcon("▯▯") : pic("uv_rectangleall"), tr("Rect. all"), tr("Every shown shell laid out as a strip"), [this] { vp_->uvRectangleStrands(true); })});
+        big(ui::image("uv_rectangle").isNull() ? glyphIcon("▯") : pic("uv_rectangle"), tr("Rectangle"), tr("The selected shells laid out as true rectangles: the border laid on the rectangle (the two ends of the strand the middles of its short sides, the long sides by their length), the inside between them, the area kept — it stretches the UV; Straighten keeps the shape. A shell with a hole, or with several borders, is laid out as a strip as before"), [this] { vp_->uvRectangleStrands(false); }),
+        pp});
   { auto* s = new SliderRow(tr("Straighten"), 0, 1, 0.05, vp_->uvo.strAmt, [](double x) { return QString::number(int(std::lround(x * 100))) + "%"; });
     s->setTip(tr("How much of the strands' bends goes: 0 — none, 100% — straight (a strip — it stretches the UV)"));
     connect(s, &SliderRow::changed, this, [this](double x) { vp_->uvo.strAmt = x; }); connect(s, &SliderRow::released, this, [this](double) { vp_->saveUvPrefs(); });
@@ -477,42 +769,12 @@ UvTools::UvTools(QWidget* window, Viewport* vp) : QFrame(window, Qt::Tool | Qt::
     connect(up, &QCheckBox::toggled, this, [this](bool x) { vp_->uvo.strUp = x; vp_->saveUvPrefs(); });
     auto* sp = check(tr("Spread out"), vp_->uvo.strSpread, tr("The straightened shells laid apart in the tile as they stand (not turned), the margin between them — none over another"));
     connect(sp, &QCheckBox::toggled, this, [this](bool x) { vp_->uvo.strSpread = x; vp_->saveUvPrefs(); });
-    b->addWidget(s); b->addWidget(hrow({up, sp})); }
+    b->addWidget(s); b->addWidget(hrow({up, sp}));
+    auto* rm = new QComboBox; rm->addItem(tr("Grid")); rm->addItem(tr("Relax")); rm->setCurrentIndex(vp_->uvo.rectMode == 0 ? 0 : 1); rm->setFocusPolicy(Qt::NoFocus);
+    rm->setToolTip(tr("Rectangle's way. Grid — an even lattice, as a plane subdivided: every border point one step of its side, every row and column evenly apart (the polygons' own sizes not kept). Relax — the border straight on the rectangle by its lengths, the inside relaxed: the least stretch inside"));
+    connect(rm, &QComboBox::currentIndexChanged, this, [this](int i) { vp_->uvo.rectMode = i; vp_->saveUvPrefs(); });
+    b->addWidget(hrow({new QLabel(tr("Rectangle")), rm})); }
   // ---- pack, the tile's edges ----
-  // ---- the face: lips and lids whose points face each other (open), or are shut (one on another) ----
-  h5(tr("Face — lips and lids facing each other"));
-  grid({big(glyphIcon("⇕"), tr("Open"), tr("L — the lips' / the eye's rim selected (Edge mode: the loop round the hole), or the holes of the selected shells: the upper and the lower points on one vertical each, the corners level — the texture's strokes go straight up and down; the shell unfolded again. Symmetry on — the other eye too"), [this] { vp_->uvFeatureKey(0); }),
-        big(glyphIcon("⇊"), tr("Shut"), tr("Shift+L — as Open, but each upper point on its lower one: the hole zipped — the lids (the lips) laid as if closed, to paint them shut"), [this] { vp_->uvFeatureKey(1); }),
-        big(glyphIcon("⊘"), tr("Off"), tr("Alt+L — the lips / lids of the selection (none selected — all) laid free again by the next Unfold"), [this] { vp_->uvFeatureKey(2); })});
-  // ---- the selection ----
-  h5(tr("The selection — shells, turns, mirrors, lining up"));
-  grid({big(pic("uv_shells"), tr("Shells"), tr("The whole shells of what is selected (as polygons)"), [this] { vp_->uvSelectShells(); }),
-        big(pic("uv_rotate90"), tr("+90°"), tr("[ — turn the selection's UV anticlockwise about its box's middle"), [this] { vp_->uvTurn(1); }),
-        big(mirroredIcon("uv_rotate90"), tr("−90°"), tr("] — turn the selection's UV clockwise"), [this] { vp_->uvTurn(-1); }),
-        big(pic("uv_flipu"), tr("Flip U"), tr("M — mirror the selection's UV in U (left ↔ right)"), [this] { vp_->uvFlip(true); }),
-        big(pic("uv_flipv"), tr("Flip V"), tr("Shift+M — mirror the selection's UV in V (up ↔ down)"), [this] { vp_->uvFlip(false); }),
-        big(pic("uv_alignu"), tr("Align U"), tr("Line the selected UV points up along U (one V: a horizontal line)"), [this] { vp_->uvStraighten(true); }),
-        big(pic("uv_alignv"), tr("Align V"), tr("Line the selected UV points up along V (one U: a vertical line)"), [this] { vp_->uvStraighten(false); })});
-  { auto* pv = new QPushButton(tr("Gizmo pivot: each shell")); pv->setCheckable(true); pv->setChecked(vp_->uvo.pivShells); pv->setFocusPolicy(Qt::NoFocus);
-    pv->setToolTip(tr("The Move / Rotate / Scale gizmo in the UV Editor (the tools E / R / T): on — Rotate and Scale turn and size each selected shell about its own middle; off — the whole selection about its box's middle"));
-    connect(pv, &QPushButton::toggled, this, [this](bool on) { vp_->uvo.pivShells = on; vp_->saveUvPrefs(); }); b->addWidget(pv); }
-  // ---- lining up: to each other, spaced evenly; a grid, a loop straight, turned by an edge / to the up; stacks ----
-  h5(tr("Line up — the selection to itself (Polygon mode: whole shells)"));
-  grid({big(pic("uv_alignleft"), tr("Left"), tr("Alt+← — to the selection's left edge: UV points (Vertex / Edge mode), or each shell's left side (Polygon mode)"), [this] { vp_->uvAlign("left"); }),
-        big(pic("uv_alignright"), tr("Right"), tr("Alt+→ — to the selection's right edge"), [this] { vp_->uvAlign("right"); }),
-        big(pic("uv_aligntop"), tr("Top"), tr("Alt+↑ — to the selection's top edge"), [this] { vp_->uvAlign("top"); }),
-        big(pic("uv_alignbottom"), tr("Bottom"), tr("Alt+↓ — to the selection's bottom edge"), [this] { vp_->uvAlign("bottom"); }),
-        big(pic("uv_aligncentre"), tr("Mid U"), tr("To the selection's middle across U (one vertical line)"), [this] { vp_->uvAlign("hmid"); }),
-        big(mirroredIcon("uv_aligncentre"), tr("Mid V"), tr("To the selection's middle across V (one horizontal line)"), [this] { vp_->uvAlign("vmid"); }),
-        big(glyphIcon("⇹"), tr("Space U"), tr("Alt+Shift+← / → — the selected shells spaced evenly along U between the outer two"), [this] { vp_->uvDistribute(true); }),
-        big(glyphIcon("⇳"), tr("Space V"), tr("Alt+Shift+↑ / ↓ — the selected shells spaced evenly along V"), [this] { vp_->uvDistribute(false); }),
-        big(glyphIcon("▦"), tr("Grid"), tr("J — the selected shells' quads laid as a grid: each quad strip level across, upright along, the lengths even (Follow Quads); in its place, its size"), [this] { vp_->uvGrid(); }),
-        big(glyphIcon("⟋"), tr("Line"), tr("N — the selected chain of edges (Edge mode) on a line from its first end to its last, the points spaced as in 3D"), [this] { vp_->uvStraightenLoop(); }),
-        big(glyphIcon("∟"), tr("By edge"), tr("I — the selected edge's shell turned so the edge lies level or upright (the nearer)"), [this] { vp_->uvOrientEdge(); }),
-        big(glyphIcon("⇡"), tr("Upright"), tr("Shift+I — the selected shells turned so the model's up goes up their V"), [this] { vp_->uvOrientUpright(); }),
-        big(glyphIcon("⧉"), tr("Stack"), tr("K — the selected shells laid over the last picked one — sized to it, turned (mirrored) to fit best: one texture for alike parts"), [this] { vp_->uvStack(); }),
-        big(glyphIcon("⧈"), tr("Unstack"), tr("Shift+K — shells lying over each other set apart along U, the padding between"), [this] { vp_->uvUnstack(); }),
-        big(glyphIcon("⇆"), tr("Snap"), tr("Shift+W — along the selected seam (Edge mode): the smaller shell turned and moved onto the bigger, then sewn there"), [this] { vp_->uvSnapTogether(); })});
   // ---- the UV symmetry: what is done to the selected shells, done mirrored to their mirror shells ----
   h5(tr("Symmetry — the mirrored shells follow"));
   { auto* sb = symBtn_ = new QPushButton(tr("Symmetry")); sb->setCheckable(true); sb->setChecked(vp_->tset.sym); sb->setFocusPolicy(Qt::NoFocus);
@@ -534,19 +796,34 @@ UvTools::UvTools(QWidget* window, Viewport* vp) : QFrame(window, Qt::Tool | Qt::
   auto* pad = new QDoubleSpinBox; pad->setRange(0, 10); pad->setDecimals(1); pad->setSingleStep(0.5); pad->setSuffix(" %"); pad->setValue(vp_->uvo.pad * 100);
   pad->setToolTip(tr("Margin: off the tile's edges for the snaps (left / right / top / bottom / fit), in percent of the tile. Pack keeps the texture's padding in pixels (UV Sets)"));
   connect(pad, &QDoubleSpinBox::valueChanged, this, [this](double x) { vp_->uvo.pad = x / 100; vp_->saveUvPrefs(); });
-  auto* rot = check(tr("Turn"), vp_->uvo.rotate, tr("Pack: a shell taller than wide turned by 90° to lie flat"));
+  auto* rot = check(tr("Rotate shells"), vp_->uvo.rotate, tr("Pack may turn shells by 90° to fit them closer. Off — every shell keeps its orientation (a shell with its own mode below still follows that)"));
   connect(rot, &QCheckBox::toggled, this, [this](bool x) { vp_->uvo.rotate = x; vp_->saveUvPrefs(); });
-  grid({big(pic("uv_pack"), tr("Pack"), tr("Alt+B — the shells of the selection packed into the tile by their outlines (the others stay), at the texture's padding; Symmetry on (Shift+X) — symmetric: across the middle on the axis, pairs mirrored, the rest in the gaps"), [this] { vp_->uvPack(false); }),
-        big(pic("uv_packall"), tr("Pack all"), tr("Shift+B — every shell packed into the tile by their outlines (each UV Mat into its own), at the texture's padding; Symmetry on (Shift+X) — symmetric"), [this] { vp_->uvPack(true); }),
+  grid({big(pic("uv_pack"), tr("Pack"), tr("Alt+B — the shells of the selection packed into the tile by their outlines (the others stay), at the texture's padding; Symmetry on (Shift+S) — symmetric: across the middle on the axis, pairs mirrored, the rest in the gaps"), [this] { vp_->uvPack(false); }),
+        big(pic("uv_packall"), tr("Pack all"), tr("Shift+B — every shell packed into the tile by their outlines (each UV Mat into its own), at the texture's padding; Symmetry on (Shift+S) — symmetric"), [this] { vp_->uvPack(true); }),
         big(ui::image("uv_rizom").isNull() ? textIcon("Rizom") : pic("uv_rizom"), tr("RizomUV"), tr("Send the mesh to RizomUV (its UV kept; each UV Mat a tile of its own; shells stacked over each other — groups its Pack keeps stacked; the pins pinned; the texture's size and padding its Pack's): unwrap there and Save — the UV comes back here on every save. Shift + click — pick rizomuv.exe again"),
             [this] { vp_->uvToRizom(QApplication::keyboardModifiers() & Qt::ShiftModifier); })});
   b->addWidget(hrow({new QLabel(tr("Margin")), pad, rot}));
+  { auto* q = new QComboBox; q->addItem(tr("Quick")); q->addItem(tr("Final")); q->setCurrentIndex(vp_->uvo.packFinal ? 1 : 0); q->setFocusPolicy(Qt::NoFocus);
+    q->setToolTip(tr("Quick — one try, at once: to bring the shells to one texel density, to see the layout. Final — slower (seconds to a minute, a window says it is thinking): the orders of the shells, two ways of placing them, with and without slanted turns, the best one's scale then refined on a grid as fine as the texture — packed tighter. Neither turns a shell more than its settings allow (Rotate shells, its own mode); groups and symmetry are kept the same"));
+    connect(q, &QComboBox::currentIndexChanged, this, [this](int i) { vp_->uvo.packFinal = i == 1; vp_->saveUvPrefs(); });
+    b->addWidget(hrow({new QLabel(tr("Pack")), q})); }
+  { auto* sz = new QComboBox; sz->addItem(tr("Keep the shells' size ratio")); sz->addItem(tr("Equal texel density for all")); sz->setCurrentIndex(vp_->uvo.packEqual ? 1 : 0); sz->setFocusPolicy(Qt::NoFocus);
+    sz->setToolTip(tr("Pack's sizes. Keep the ratio — the shells stay as large as they are against each other (what you scaled by hand stays), all fitted to the tile together; a part packed among the rest keeps the size it has. Equal texel density — every shell sized by its 3D area so the whole set has one texel density (the shells' own 'Shell density ×' factors still apply, locked ones are left); then fitted to the tile"));
+    connect(sz, &QComboBox::currentIndexChanged, this, [this](int i) { vp_->uvo.packEqual = i == 1; vp_->saveUvPrefs(); });
+    auto* fr = check(tr("Free turn"), vp_->uvo.packFree, tr("Pack may turn the shells freely — in 45° steps, slanted too — to fit them closer. Off (by default): no slanted turns — only by 90°, when Rotate shells is on (a shell with its own mode still follows that)"));
+    connect(fr, &QCheckBox::toggled, this, [this](bool x) { vp_->uvo.packFree = x; vp_->saveUvPrefs(); });
+    b->addWidget(hrow({new QLabel(tr("Sizes")), sz, fr})); }
   // each shell's own settings for Pack: kept where it is, never turned, a texel density of its own, laid by its group's
-  grid({big(glyphIcon("🔒"), tr("Lock"), tr("Alt+H — the selected shells locked (again — unlocked): Pack and Unfold all leave them where they are, the rest packed round them. Slate in the editor"), [this] { vp_->uvShellSet("lock"); }),
-        big(glyphIcon("⤓"), tr("No turn"), tr("The selected shells never turned by Pack (again — may be turned): hair strips, text, a pattern that must run one way"), [this] { vp_->uvShellSet("noturn"); }),
-        big(glyphIcon("▦"), tr("Group"), tr("G — the selected shells one pack group: Pack lays them close together (the parts of one thing — a shoe, a glove). A colour of its own in the editor"), [this] { vp_->uvShellSet("group"); }),
-        big(glyphIcon("▢"), tr("Ungroup"), tr("Shift+G — the selected shells out of their pack groups"), [this] { vp_->uvShellSet("ungroup"); }),
-        big(glyphIcon("✕"), tr("Clear"), tr("The selected shells' own settings cleared: unlocked, may be turned, ×1, no group"), [this] { vp_->uvShellSet("clear"); })});
+  grid({big(pic("uv_shelllock"), tr("Lock"), tr("Alt+H — the selected shells locked (again — unlocked): Pack and Unfold all leave them where they are, the rest packed round them. Slate in the editor"), [this] { vp_->uvShellSet("lock"); }),
+        big(pic("uv_shellkeep"), tr("Keep orientation"), tr("The selected shells never turned by Pack (again — may be turned): hair strips, text, a pattern that must run one way"), [this] { vp_->uvShellSet("noturn"); }),
+        big(pic("uv_shell90"), tr("Turn by 90° only"), tr("The selected shells may be turned by Pack only by 90° (again — off)"), [this] { vp_->uvShellSet("rot90"); }),
+        big(pic("uv_shell180"), tr("Turn by 180° only"), tr("The selected shells may be turned by Pack only by 180° (again — off)"), [this] { vp_->uvShellSet("rot180"); }),
+        big(pic("uv_shellfree"), tr("Free turn"), tr("The selected shells may be turned by Pack freely (any 45° step) even where the Rotate shells is off or the shell keeps its orientation (again — as the rest)"), [this] { vp_->uvShellSet("free"); }),
+        big(pic("uv_shellsym"), tr("Pack symmetrically"), tr("The selected shells (and their mirror shells) packed symmetrically by Pack: a pair mirrored across the UV axis, a shell across the middle on it (again — packed as the rest). The shells without the tag are packed freely"), [this] { vp_->uvShellSet("sym"); }),
+        big(pic("uv_shellgroup"), tr("Group"), tr("G — the selected shells one pack group: Pack lays them close together (the parts of one thing — a shoe, a glove). A colour of its own in the editor"), [this] { vp_->uvShellSet("group"); }),
+        big(ui::image("uv_overlap").isNull() ? textIcon("Overlap") : pic("uv_overlap"), tr("Overlap"), tr("The selected shells laid on the last picked one (their middles one) and made an Overlap stack (O and its number): Pack keeps them lying so and moves them as one. A stack is apart from the pack groups — a group (G) may hold stacks and other shells. Ctrl+C on shells, pick another shell, Ctrl+V — the copied ones go on it"), [this] { vp_->uvOverlapSel(); }),
+        big(pic("uv_shellungroup"), tr("Ungroup"), tr("Shift+G — the selected shells out of their pack groups (their Overlap stacks kept); shells in no group — out of their Overlap stacks"), [this] { vp_->uvShellSet("ungroup"); }),
+        big(pic("uv_shellclear"), tr("Clear"), tr("The selected shells' own settings cleared: unlocked, may be turned, ×1, no group"), [this] { vp_->uvShellSet("clear"); })});
   { auto* sc = new QDoubleSpinBox; sc->setRange(0.05, 20); sc->setDecimals(2); sc->setSingleStep(0.25); sc->setPrefix("× "); sc->setValue(2); sc->setKeyboardTracking(false); sc->setFocusPolicy(Qt::ClickFocus);
     sc->setToolTip(tr("The texel density of the selected shells against the rest's: ×2 — the face twice as sharp, ×0.5 — the soles half. Pack and Texel density Set keep it"));
     auto* ap = new QPushButton(tr("Apply")); ap->setFocusPolicy(Qt::NoFocus); ap->setToolTip(tr("The selected shells get this density factor (×1 — as the rest)"));
@@ -557,23 +834,73 @@ UvTools::UvTools(QWidget* window, Viewport* vp) : QFrame(window, Qt::Tool | Qt::
         big(pic("uv_aligntop"), tr("Top"), tr("The selection against the tile's top edge (the margin off it)"), [this] { vp_->uvSnapEdge("top"); }),
         big(pic("uv_alignbottom"), tr("Bottom"), tr("The selection against the tile's bottom edge (the margin off it)"), [this] { vp_->uvSnapEdge("bottom"); }),
         big(pic("uv_aligncentre"), tr("Centre"), tr("The selection into the tile's middle"), [this] { vp_->uvSnapEdge("centre"); }),
-        big(pic("uv_fit"), tr("Fit"), tr("The selection scaled (evenly) to fill the tile inside the margin"), [this] { vp_->uvSnapEdge("fit"); })});
-  h5(tr("Warp, puppet, brushes — the UV reshaped by hand (move / turn / scale: the frame of E / R / T)"));
-  { auto* wp = big(ui::image("uv_warp").isNull() ? glyphIcon("▦") : pic("uv_warp"), tr("Warp"), tr("A warp mesh over the selection (as Photoshop's): drag its anchors — the UV bends smoothly with them. Again — off"), [this] { vp_->uvTfStart('w'); sync(); });
-    auto* pp = big(ui::image("uv_puppet").isNull() ? glyphIcon("📌") : pic("uv_puppet"), tr("Puppet"), tr("Puppet Warp (as Photoshop's): click the selection's UV — pins; drag a pin — the UV follows, kept stiff round the pins (each polygon bent as little as it can be); Ctrl + click a pin — it goes. Again — off"), [this] { vp_->uvTfStart('p'); sync(); });
-    pp->setCheckable(true); ppBtn_ = pp;
-    wp->setCheckable(true); wpBtn_ = wp;
-    auto* gn = new QSpinBox; gn->setRange(1, 12); gn->setValue(vp_->uvo.warpN); gn->setToolTip(tr("The warp mesh: cells along the selection's longer side")); gn->setPrefix(tr("Cells "));
-    connect(gn, &QSpinBox::valueChanged, this, [this](int x) { vp_->uvo.warpN = x; vp_->saveUvPrefs(); if (vp_->uvTfKind() == 'w') { vp_->uvTfStop(); vp_->uvTfStart('w'); } });
-    grid({wp, pp, gn}); }
+        big(pic("uv_fit"), tr("Fit"), tr("The selection scaled (evenly) to fill the tile inside the margin"), [this] { vp_->uvSnapEdge("fit"); }),
+        big(glyphIcon("⤢"), tr("Stretch"), tr("The UV stretched — across and up each by itself, the proportions change — to fill the whole tile inside the margin. Several meshes in the editor: all of them as one set; one mesh: its selection (none — all of it)"), [this] { vp_->uvStretchFill(); })});
+  // ---- the selection ----
+  h5(tr("The selection — shells, turns, mirrors, lining up"));
+  grid({big(pic("uv_shells"), tr("Shells"), tr("The whole shells of what is selected (as polygons)"), [this] { vp_->uvSelectShells(); }),
+        big(mirroredIcon("uv_rotate90"), tr("+90°"), tr("[ — turn the selection's UV anticlockwise about its box's middle"), [this] { vp_->uvTurn(1); }),
+        big(pic("uv_rotate90"), tr("−90°"), tr("] — turn the selection's UV clockwise"), [this] { vp_->uvTurn(-1); }),
+        big(pic("uv_flipu"), tr("Flip U"), tr("M — mirror the selection's UV in U (left ↔ right)"), [this] { vp_->uvFlip(true); }),
+        big(pic("uv_flipv"), tr("Flip V"), tr("Shift+M — mirror the selection's UV in V (up ↔ down)"), [this] { vp_->uvFlip(false); }),
+        big(pic("uv_alignu"), tr("Align U"), tr("Line the selected UV points up along U (one V: a horizontal line)"), [this] { vp_->uvStraighten(true); }),
+        big(pic("uv_alignv"), tr("Align V"), tr("Line the selected UV points up along V (one U: a vertical line)"), [this] { vp_->uvStraighten(false); })});
+  { auto* pv = new QPushButton(tr("Gizmo pivot: each shell")); pv->setCheckable(true); pv->setChecked(vp_->uvo.pivShells); pv->setFocusPolicy(Qt::NoFocus);
+    pv->setToolTip(tr("The Move / Rotate / Scale gizmo in the UV Editor (the tools E / R / T): on — Rotate and Scale turn and size each selected shell about its own middle; off — the whole selection about its box's middle"));
+    connect(pv, &QPushButton::toggled, this, [this](bool on) { vp_->uvo.pivShells = on; vp_->saveUvPrefs(); }); b->addWidget(pv); }
+  // ---- the transform: the selection's box typed in ----
+  { auto* tl = new QLabel(tr("Its box in UV — position (by the anchor), size")); tl->setProperty("h5", true); b->addWidget(tl); }
+  { auto* w = new QWidget; auto* g = new QGridLayout(w); g->setContentsMargins(0, 0, 0, 0); g->setHorizontalSpacing(4); g->setVerticalSpacing(3);
+    const char* names[4] = {"U", "V", "W", "H"};
+    const char* tips[4] = {"Its place in U (the anchor point of its box — below)", "Its place in V (the anchor point of its box — below)", "Its width in U", "Its height in V"};
+    for (int i = 0; i < 4; i++) {
+      auto* s = new QDoubleSpinBox; s->setRange(i < 2 ? -16 : 0, 16); s->setDecimals(4); s->setSingleStep(0.01); s->setKeyboardTracking(false); s->setToolTip(tr(tips[i])); s->setEnabled(false); box_[i] = s;
+      auto* l = new QLabel(names[i]); l->setStyleSheet("color:#9a9a9a"); g->addWidget(l, i / 2, (i % 2) * 2); g->addWidget(s, i / 2, (i % 2) * 2 + 1);
+      connect(s, &QDoubleSpinBox::editingFinished, this, [this] { if (!box_[0]->isEnabled()) return; vp_->uvSetBox(box_[0]->value(), box_[1]->value(), box_[2]->value(), box_[3]->value()); });
+    }
+    { auto* l = new QLabel(tr("Scale")); l->setStyleSheet("color:#9a9a9a"); g->addWidget(l, 2, 0);
+      auto* s = new QDoubleSpinBox; s->setRange(0.001, 1000); s->setDecimals(3); s->setSingleStep(0.1); s->setValue(1); s->setKeyboardTracking(false); s->setEnabled(false); s->setPrefix("× "); s->setToolTip(tr("Scale the selection by this number about its anchor point (below): 2 — twice as big, 0.5 — half. Enter or Apply")); scale_ = s; g->addWidget(s, 2, 1);
+      auto* go = new QPushButton(tr("Apply")); go->setEnabled(false); go->setFocusPolicy(Qt::NoFocus); go->setToolTip(s->toolTip()); scaleGo_ = go; g->addWidget(go, 2, 2, 1, 2);
+      auto apply = [this] { if (!scale_->isEnabled()) return; scale_->interpretText(); const double k = scale_->value(); if (std::abs(k - 1) > 1e-9) vp_->uvScaleBy(k); { QSignalBlocker bl(scale_); scale_->setValue(1); } };
+      connect(go, &QPushButton::clicked, this, apply);
+      if (auto* le = s->findChild<QLineEdit*>()) connect(le, &QLineEdit::returnPressed, this, apply); }
+    b->addWidget(w);
+    { auto* row = new QWidget; auto* rl = new QHBoxLayout(row); rl->setContentsMargins(0, 0, 0, 0); rl->setSpacing(8);   // (the anchor of U, V — as RizomUV's: the box's corner / side / middle the position is of)
+      auto* lab = new QLabel(tr("Anchor")); lab->setStyleSheet("color:#9a9a9a"); rl->addWidget(lab);
+      auto* gw = new QWidget; auto* gl = new QGridLayout(gw); gl->setContentsMargins(0, 0, 0, 0); gl->setSpacing(2); anch_.clear();
+      for (int r = 0; r < 3; r++) for (int c = 0; c < 3; c++) { const int idx = (2 - r) * 3 + c;                                       // (top row first)
+        auto* bt = new QPushButton; bt->setCheckable(true); bt->setFixedSize(18, 18); bt->setFocusPolicy(Qt::NoFocus); bt->setChecked(idx == vp_->uvo.anch);
+        bt->setToolTip(tr("U and V are the position of this point of the selection's box (the middle — the box's centre: U = 0.5 puts it in the tile's middle)"));
+        bt->setStyleSheet("QPushButton{background:#3a3a40;border:1px solid #55555c;border-radius:3px} QPushButton:checked{background:#f0701c;border-color:#ffb070}");
+        connect(bt, &QPushButton::clicked, this, [this, idx] { vp_->uvo.anch = idx; vp_->saveUvPrefs(); sync(); }); gl->addWidget(bt, r, c); anch_.push_back({idx, bt}); }
+      rl->addWidget(gw); rl->addStretch(1); b->addWidget(row); } }
+  // ---- lining up: to each other, spaced evenly; a grid, a loop straight, turned by an edge / to the up; stacks ----
+  h5(tr("Line up — the selection to itself (Polygon mode: whole shells)"));
+  grid({big(pic("uv_alignleft"), tr("Left"), tr("Alt+← — to the selection's left edge: UV points (Vertex / Edge mode), or each shell's left side (Polygon mode)"), [this] { vp_->uvAlign("left"); }),
+        big(pic("uv_alignright"), tr("Right"), tr("Alt+→ — to the selection's right edge"), [this] { vp_->uvAlign("right"); }),
+        big(pic("uv_aligntop"), tr("Top"), tr("Alt+↑ — to the selection's top edge"), [this] { vp_->uvAlign("top"); }),
+        big(pic("uv_alignbottom"), tr("Bottom"), tr("Alt+↓ — to the selection's bottom edge"), [this] { vp_->uvAlign("bottom"); }),
+        big(pic("uv_aligncentre"), tr("Mid U"), tr("To the selection's middle across U (one vertical line)"), [this] { vp_->uvAlign("hmid"); }),
+        big(mirroredIcon("uv_aligncentre"), tr("Mid V"), tr("To the selection's middle across V (one horizontal line)"), [this] { vp_->uvAlign("vmid"); }),
+        big(glyphIcon("⇹"), tr("Space U"), tr("Alt+Shift+← / → — the selected shells spaced evenly along U between the outer two"), [this] { vp_->uvDistribute(true); }),
+        big(glyphIcon("⇳"), tr("Space V"), tr("Alt+Shift+↑ / ↓ — the selected shells spaced evenly along V"), [this] { vp_->uvDistribute(false); }),
+        big(glyphIcon("▦"), tr("Grid"), tr("J — the selected shells' quads laid as a grid: each quad strip level across, upright along, the lengths even (Follow Quads); in its place, its size"), [this] { vp_->uvGrid(); }),
+        big(glyphIcon("⟋"), tr("Line"), tr("N — the selected chain of edges (Edge mode) on a line from its first end to its last, the points spaced as in 3D"), [this] { vp_->uvStraightenLoop(); }),
+        big(glyphIcon("∟"), tr("By edge"), tr("I — the selected edge's shell turned so the edge lies level or upright (the nearer)"), [this] { vp_->uvOrientEdge(); }),
+        big(glyphIcon("⇡"), tr("Upright"), tr("Shift+I — the selected shells turned so the model's up goes up their V"), [this] { vp_->uvOrientUpright(); }),
+        big(glyphIcon("⧉"), tr("Stack"), tr("K — the selected shells laid over the last picked one — sized to it, turned (mirrored) to fit best: one texture for alike parts"), [this] { vp_->uvStack(); }),
+        big(glyphIcon("⧈"), tr("Unstack"), tr("Shift+K — shells lying over each other set apart along U, the padding between"), [this] { vp_->uvUnstack(); }),
+        big(glyphIcon("⇆"), tr("Snap"), tr("Shift+W — along the selected seam (Edge mode): the smaller shell turned and moved onto the bigger, then sewn there"), [this] { vp_->uvSnapTogether(); })});
+  h5(tr("Brushes — the UV reshaped by hand (move / turn / scale: the frame of E / R / T)"));
   { auto* rb = big(glyphIcon("≈"), tr("Relax brush"), tr("Alt+R — drag over the UV: the points under the circle relaxed (SLIM — the stretch evened out, nothing turned over, the rest held); Shift — the shell's border too (never into an overlap). [ ] the size, Shift+[ ] the strength, Esc off"), [this] { vp_->setUvBrush('r'); sync(); });
     auto* pb = big(glyphIcon("📍"), tr("Pin brush"), tr("Alt+P — drag over the UV points: pinned (yellow dots) — Unfold lays the shell round them, Optimize and the Relax brush hold them; Ctrl — unpinned. Alt+Shift+C — the selection's pins off"), [this] { vp_->setUvBrush('p'); sync(); });
-    rb->setCheckable(true); pb->setCheckable(true); rbBtn_ = rb; pbBtn_ = pb;
+    auto* gb = big(glyphIcon("✋"), tr("Grab brush"), tr("Alt+G — drag over the UV: the points under the circle pulled with the pointer, softly (the further from the middle of the circle, the less); the shell is deformed, not moved. Pinned points stay. [ ] the size"), [this] { vp_->setUvBrush('g'); sync(); });
+    rb->setCheckable(true); pb->setCheckable(true); gb->setCheckable(true); rbBtn_ = rb; pbBtn_ = pb; gbBtn_ = gb;
     auto* bs = brR_ = new QSpinBox; bs->setRange(6, 600); bs->setValue(int(vp_->uvBrushR)); bs->setSuffix(" px"); bs->setToolTip(tr("The brush's radius on the screen ( [ ] )"));
     connect(bs, &QSpinBox::valueChanged, this, [this](int x) { vp_->uvBrushR = x; });
     auto* bk = brK_ = new QDoubleSpinBox; bk->setRange(0.1, 1); bk->setSingleStep(0.1); bk->setDecimals(1); bk->setValue(vp_->uvBrushK); bk->setToolTip(tr("The Relax brush's strength ( Shift+[ ] )"));
     connect(bk, &QDoubleSpinBox::valueChanged, this, [this](double x) { vp_->uvBrushK = x; });
-    grid({rb, pb, bs, bk}); }
+    grid({rb, pb, gb, bs, bk}); }
   // ---- display (on the UV): the checker, the stretch, the texture under it; their opacity ----
   // ---- the checks: what is wrong for the set's texture — each kind counted, its polygons selected on a click ----
   h5(tr("Check — for the texture (each UV Mat's tile apart)"));
@@ -611,25 +938,22 @@ UvTools::UvTools(QWidget* window, Viewport* vp) : QFrame(window, Qt::Tool | Qt::
   dispOp_->setTip(tr("How strongly the checker / the texture / the stretch show under the UV (and the stretch on the object)"));
   connect(dispOp_, &SliderRow::changed, this, [this](double x) { vp_->uvo.dispOp = x; vp_->uvChanged(); }); connect(dispOp_, &SliderRow::released, this, [this](double) { vp_->saveUvPrefs(); });
   b->addWidget(dispOp_);
-  // ---- the transform: the selection's box typed in ----
-  h5(tr("Transform — the selection's box in UV"));
-  { auto* w = new QWidget; auto* g = new QGridLayout(w); g->setContentsMargins(0, 0, 0, 0); g->setHorizontalSpacing(4); g->setVerticalSpacing(3);
-    const char* names[4] = {"U", "V", "W", "H"};
-    const char* tips[4] = {"Its place in U (its left side, or its middle)", "Its place in V (its bottom, or its middle)", "Its width in U", "Its height in V"};
-    for (int i = 0; i < 4; i++) {
-      auto* s = new QDoubleSpinBox; s->setRange(i < 2 ? -16 : 0, 16); s->setDecimals(4); s->setSingleStep(0.01); s->setKeyboardTracking(false); s->setToolTip(tr(tips[i])); s->setEnabled(false); box_[i] = s;
-      auto* l = new QLabel(names[i]); l->setStyleSheet("color:#9a9a9a"); g->addWidget(l, i / 2, (i % 2) * 2); g->addWidget(s, i / 2, (i % 2) * 2 + 1);
-      connect(s, &QDoubleSpinBox::editingFinished, this, [this] { if (!box_[0]->isEnabled()) return; vp_->uvSetBox(box_[0]->value(), box_[1]->value(), box_[2]->value(), box_[3]->value()); });
-    }
-    b->addWidget(w);
-    auto* mid = check(tr("By its middle"), vp_->uvo.boxMid, tr("U, V — the box's middle (off — its bottom left corner)"));
-    connect(mid, &QCheckBox::toggled, this, [this](bool x) { vp_->uvo.boxMid = x; vp_->saveUvPrefs(); sync(); });
-    b->addWidget(mid); }
-  auto* keys = muted(tr("In the UV Editor: LMB pick (Shift add, Ctrl take off), a drag on empty space — a box, double click — the shell / the edge loop; drag the selection — move (Shift: one axis); the frame (E / R / T) — its sides and corners scale, its knob turns; Alt+LMB / MMB — pan, Alt+RMB / wheel — zoom, F — frame"));
+  h5(tr("Colours — of the UV Editor"));
+  vp_->loadUvColors();
+  { auto* cw = new QWidget; auto* cg = new QGridLayout(cw); cg->setContentsMargins(0, 2, 0, 2); cg->setHorizontalSpacing(8); cg->setVerticalSpacing(3);
+    struct CE { QString name; QColor* c; QColor def; }; const std::vector<CE> ce = {{tr("Selection"), &vp_->uvo.cSel, QColor(0xff, 0x9a, 0x2e)}, {tr("Seams"), &vp_->uvo.cSeam, QColor(0xff, 0x5a, 0x4f)}, {tr("Shell border"), &vp_->uvo.cBorder, QColor(0x5f, 0xd3, 0xc4)},
+                                                         {tr("Edges"), &vp_->uvo.cWire, QColor(0xa8, 0xa8, 0xb4)}, {tr("Padding kept"), &vp_->uvo.cPadOk, QColor(0x5a, 0xb4, 0xe8)}, {tr("Too close"), &vp_->uvo.cPadBad, QColor(0xff, 0x30, 0x30)}};
+    auto paint = [](QPushButton* b, const QColor& c) { b->setStyleSheet(QString("QPushButton{background:%1;border:1px solid #555;border-radius:2px}").arg(c.name())); };
+    auto btns = std::make_shared<std::vector<QPushButton*>>(); int i = 0;
+    for (const CE& e : ce) { auto* l = new QLabel(e.name); auto* sw = new QPushButton; sw->setFixedSize(34, 16); sw->setFocusPolicy(Qt::NoFocus); paint(sw, *e.c); btns->push_back(sw); const int r = i / 2, c = (i % 2) * 2; cg->addWidget(l, r, c); cg->addWidget(sw, r, c + 1); i++;
+      QColor* field = e.c; connect(sw, &QPushButton::clicked, this, [this, sw, field, paint] { const QColor x = QColorDialog::getColor(*field, this); if (!x.isValid()) return; *field = x; paint(sw, x); vp_->saveUvColors(); vp_->uvChanged(); }); }
+    auto* rs = new QPushButton(tr("Reset colours")); rs->setFocusPolicy(Qt::NoFocus); cg->addWidget(rs, (i + 1) / 2, 0, 1, 4);
+    connect(rs, &QPushButton::clicked, this, [this, ce, btns, paint] { for (size_t n = 0; n < ce.size(); n++) { *ce[n].c = ce[n].def; paint((*btns)[n], ce[n].def); } vp_->saveUvColors(); vp_->uvChanged(); });
+    b->addWidget(cw); }
+  auto* keys = muted(tr("In the UV Editor: LMB pick (Shift add, Ctrl take off), a drag on empty space — a box, double click — the shell / the edge loop (with the gizmo too), Ctrl+Shift — the shortest path from the last picked; drag the selection — move (Shift: one axis); the frame (E / R / T) — its sides and corners scale, its knob turns; Alt+LMB / MMB — pan, Alt+RMB / wheel — zoom, F — frame"));
   keys->setMaximumWidth(292); b->addWidget(keys);
   connect(vp, &Viewport::topoState, this, &UvTools::sync);
   connect(vp, &Viewport::selectionChanged, this, &UvTools::sync);   // (the selection's texel density, its box)
-  connect(vp, &Viewport::selectionChanged, this, &UvTools::sync);
   setFixedWidth(326); sync();
 }
 void UvTools::sync() {
@@ -638,13 +962,14 @@ void UvTools::sync() {
   if (scroll_ && body_) { const int maxH = parentWidget() ? std::max(240, parentWidget()->height() - 90) : 900; scroll_->setFixedHeight(std::min(body_->sizeHint().height() + 2, maxH)); }
   if (status_) status_->setText(vp_->uvStatus());
   if (dispOp_) dispOp_->setVisible(vp_->uvo.checker || vp_->uvo.stretch || vp_->uvo.tex || vp_->uvo.s3d); if (stretchScale_) stretchScale_->setVisible(vp_->uvo.stretch || vp_->uvo.s3d);   // (the opacity: while one of them shows)
-  if (ppBtn_) ppBtn_->setChecked(vp_->uvTfKind() == 'p'); if (wpBtn_) wpBtn_->setChecked(vp_->uvTfKind() == 'w');
-  if (rbBtn_) { QSignalBlocker b1(rbBtn_); rbBtn_->setChecked(vp_->uvBrush == 'r'); } if (pbBtn_) { QSignalBlocker b2(pbBtn_); pbBtn_->setChecked(vp_->uvBrush == 'p'); }
+  if (ppBtn_) ppBtn_->setChecked(vp_->uvTfKind() == 'p');
+  if (rbBtn_) { QSignalBlocker b1(rbBtn_); rbBtn_->setChecked(vp_->uvBrush == 'r'); } if (gbBtn_) { QSignalBlocker b3(gbBtn_); gbBtn_->setChecked(vp_->uvBrush == 'g'); } if (pbBtn_) { QSignalBlocker b2(pbBtn_); pbBtn_->setChecked(vp_->uvBrush == 'p'); }
   if (brR_ && !brR_->hasFocus()) { QSignalBlocker b3(brR_); brR_->setValue(int(vp_->uvBrushR)); } if (brK_ && !brK_->hasFocus()) { QSignalBlocker b4(brK_); brK_->setValue(vp_->uvBrushK); }
-  auto bx = vp_->uvSelBox(); const bool mid = vp_->uvo.boxMid;
+  auto bx = vp_->uvSelBox(); const double axf = (vp_->uvo.anch % 3) * 0.5, ayf = (vp_->uvo.anch / 3) * 0.5; for (auto& [i2, bt] : anch_) { QSignalBlocker bl(bt); bt->setChecked(i2 == vp_->uvo.anch); }
+  if (scale_) { scale_->setEnabled(bx.has_value()); scaleGo_->setEnabled(bx.has_value()); }
   for (int i = 0; i < 4; i++) if (box_[i] && !box_[i]->hasFocus()) { QSignalBlocker bl(box_[i]); box_[i]->setEnabled(bx.has_value());
     if (!bx) { box_[i]->setValue(0); continue; } const auto& B = *bx;
-    const double val = i == 0 ? (mid ? (B[0] + B[2]) / 2 : B[0]) : i == 1 ? (mid ? (B[1] + B[3]) / 2 : B[1]) : i == 2 ? B[2] - B[0] : B[3] - B[1]; box_[i]->setValue(val); }
+    const double val = i == 0 ? B[0] + axf * (B[2] - B[0]) : i == 1 ? B[1] + ayf * (B[3] - B[1]) : i == 2 ? B[2] - B[0] : B[3] - B[1]; box_[i]->setValue(val); }
   if (symBtn_) { QSignalBlocker bl(symBtn_); symBtn_->setChecked(vp_->tset.sym); }
   if (symAx_ && !symAx_->hasFocus()) { QSignalBlocker bl(symAx_); symAx_->setValue(vp_->uvo.symAxis); }
   syncSets();
@@ -656,13 +981,30 @@ void UvTools::syncSets() {
   const int m = vp_->topoMesh(); const auto S = m >= 0 ? vp_->uvSets(m) : std::vector<Viewport::UvSetL>{};
   const auto P = vp_->uvPicked; const int cur = P.id == m && P.mat == -2 ? P.set : -1;
   // (made again only when the sets changed — their look follows the selection by itself)
-  QString sig = QString::number(m); for (auto& s : S) sig += "|" + s.name + QString::number(s.faces) + "," + QString::number(s.mats.size());
+  // (the window lists every mesh's sets, each under its mesh's name — whatever is picked)
+  std::vector<int> withSets; for (const auto& [id, it] : vp_->scene()->items) if (it.type == ItemType::IMesh && baseOf(it) && !vp_->uvNone(id)) withSets.push_back(id);
+  const auto freeSets = vp_->uvFreeSets(); const QString lit = vp_->uvFreePicked;
+  QString sig = "^" + lit; for (const QString& n : freeSets) sig += "~" + n;
+  for (int id : withSets) { sig += "#" + QString::number(id); for (auto& s : vp_->uvSets(id)) sig += "|" + s.name + QString::number(s.faces) + "," + QString::number(s.mats.size()); }
   if (sig != sets_->property("sig").toString()) { sets_->setProperty("sig", sig);
     auto* L = sets_->layout(); while (QLayoutItem* it = L->takeAt(0)) { if (QWidget* x = it->widget()) { x->hide(); x->setParent(nullptr); x->deleteLater(); } delete it; }
-    if (m >= 0 && !S.empty()) L->addWidget(uvSetGrid(vp_, m, 6)); else L->addWidget(new QLabel(tr("No UV Sets"))); }
-  if (setExit_) setExit_->setEnabled(cur >= 0); if (setDel_) setDel_->setEnabled(cur >= 0); if (setAdd_) setAdd_->setEnabled(!S.empty());
+    if (!freeSets.empty()) { auto* h = new QLabel(tr("Empty — no polygons yet")); h->setProperty("mut", true); L->addWidget(h); L->addWidget(uvFreeGrid(vp_, 6)); }
+    if (withSets.empty() && freeSets.empty()) { auto* e = new QLabel(tr("No UV Sets in the project yet — ＋ makes an empty one")); e->setProperty("mut", true); e->setWordWrap(true); L->addWidget(e); }
+    // (meshes that have exactly the same sets — one project set over many objects — are one row, not a row each)
+    std::map<QString, std::vector<int>> groups; std::vector<QString> order;
+    for (int id : withSets) { QString k; for (auto& s : vp_->uvSets(id)) k += s.name + "|"; if (!groups.count(k)) order.push_back(k); groups[k].push_back(id); }
+    // (every mesh's sets in one grid, no row of its own each: whose a set is — in its tip)
+    std::vector<QWidget*> cells; std::set<QString> seenNames;
+    for (const QString& k : order) { const auto& ids = groups[k]; const int id = ids.front();
+      for (QWidget* c : uvSetCells(vp_, id, std::vector<int>(ids.begin() + 1, ids.end()), &seenNames)) cells.push_back(c); }
+    if (!cells.empty()) L->addWidget(cellGrid(cells, 6)); }
+  if (setExit_) setExit_->setEnabled(cur >= 0); if (setDel_) setDel_->setEnabled(cur >= 0); if (setAdd_) setAdd_->setEnabled(!vp_->uvSetNamesAll().empty());
   if (setIso_) { QSignalBlocker bl(setIso_); setIso_->setChecked(vp_->uvSetIso); }
-  if (texW_ && m >= 0) { const auto t = vp_->uvTex(m);                   // (the texture of the set worked in, else the mesh's)
+  if (setTiles_) { QSignalBlocker bl(setTiles_); setTiles_->setChecked(vp_->uvTiles); }
+  if (setColor_ && setTex_ && (m >= 0 || !lit.isEmpty())) { const auto t = vp_->uvTex(m);
+    setColor_->setStyleSheet(t.color.isEmpty() ? QString() : QString("border-left:10px solid %1").arg(t.color));
+    QSignalBlocker bl(setTex_); setTex_->setCurrentIndex(t.tex.isEmpty() ? 0 : t.tex == "color" ? 1 : 2); if (t.tex.size() > 5) setTex_->setItemText(2, QFileInfo(t.tex).fileName()); else setTex_->setItemText(2, tr("Image…")); }
+  if (texW_ && (m >= 0 || !lit.isEmpty())) { const auto t = vp_->uvTex(m);                   // (the texture of the set worked in, else the mesh's)
     if (!texW_->hasFocus()) { QSignalBlocker bl(texW_); texW_->setCurrentText(QString::number(t.w)); }
     if (!texH_->hasFocus()) { QSignalBlocker bl(texH_); texH_->setCurrentText(QString::number(t.h)); }
     if (!texPad_->hasFocus()) { QSignalBlocker bl(texPad_); texPad_->setValue(t.pad); } }
@@ -690,14 +1032,16 @@ void UvTools::place(QWidget* vpBox) {
   QJsonObject st = QJsonDocument::fromJson(QSettings().value("topo/uvWin").toByteArray()).object();
   QWidget* w = parentWidget(); QPoint o = w->mapToGlobal(QPoint(0, 0));
   QPoint p = st.contains("x") ? o + QPoint(st.value("x").toInt(), st.value("y").toInt()) : vpBox->mapToGlobal(QPoint(vpBox->width() - width() - 130, 34));
-  QRect g(o, w->size()); p.setX(std::clamp(p.x(), g.left(), g.right() - 60)); p.setY(std::clamp(p.y(), g.top(), g.bottom() - 40));
+  QRect g(o, w->size()); p.setX(std::clamp(p.x(), g.left(), std::max(g.left(), g.right() - width()))); p.setY(std::clamp(p.y(), g.top(), std::max(g.top(), g.bottom() - 60))); lastBox_ = vpBox;   // (wholly inside the program's window)
   move(p);
 }
 bool UvTools::eventFilter(QObject* o, QEvent* e) {
+  if (o == body_ && (e->type() == QEvent::LayoutRequest || e->type() == QEvent::Resize)) QTimer::singleShot(0, this, [this] { if (body_) body_->update(); if (scroll_) scroll_->viewport()->update(); });
   if (o != bar_) return QFrame::eventFilter(o, e);
   if (e->type() == QEvent::MouseButtonPress) { auto* m = static_cast<QMouseEvent*>(e); if (m->button() == Qt::LeftButton) { drag_ = true; grab_ = m->globalPosition().toPoint() - pos(); } return true; }
   if (e->type() == QEvent::MouseMove && drag_) { move(static_cast<QMouseEvent*>(e)->globalPosition().toPoint() - grab_); return true; }
-  if (e->type() == QEvent::MouseButtonRelease && drag_) { drag_ = false; save(); return true; }
+  if (e->type() == QEvent::MouseButtonRelease && drag_) { drag_ = false; save(); raise(); return true; }
+  if (e->type() == QEvent::MouseButtonDblClick) { QSettings().remove("topo/uvWin"); if (lastBox_) place(lastBox_); raise(); return true; }   // (double click on the title: back to its place)
   return QFrame::eventFilter(o, e);
 }
 
@@ -722,13 +1066,13 @@ TopoTools::TopoTools(QWidget* window, Viewport* vp, std::function<void(const QSt
   lv->addWidget(head(tr("TOOLS")));
   row_ = new QWidget; auto* g = new QGridLayout(row_); g->setContentsMargins(0, 0, 0, 0); g->setSpacing(4); lv->addWidget(row_); lv->addStretch(1);
   struct T { const char *id, *icon, *tip; int r, c; };
-  // (by what they do, a row each: moving, selecting, building, cutting, welding and cleaning, shaping, normals, symmetry)
+  // (by what they do, a row each: moving, selecting (two), building, cutting, operations on the mesh — Subdivide, Relax, Weld, Collapse, Optimize —, repair and shaping, normals, symmetry and modifier groups)
   const T ts[] = {
     {"move", "tool_move", "Move (E) — the gizmo; its axes and the soft selection in the options. Alt + a handle: the gizmo itself", 0, 0},
     {"rotate", "tool_rotate", "Rotate (R) — Shift: 45° steps. Alt + a ring: the gizmo's axes turned", 0, 1},
     {"gizmo", "tool_scale", "Scale (T) — Shift: 0.1 steps down to 0 (flatten), Ctrl: uniform; Ctrl + drag with polygons selected — inset (new polygons round them), then scaled", 0, 2},
     {"tbrush", "tool_brush", "Brush — LMB: as its mode (RMB — the modes); Shift: smooth; Shift+Ctrl: relax; Ctrl: along the normals; Ctrl+RMB drag: size ←→, hardness ↑↓. With a selection — only it", 0, 3},
-    {"tslide", "tt_slide", "Slide — selects as the Select Cursor; a drag in empty space slides the selected vertices along their edges: LMB proportionally, RMB in parallel", 0, 4},
+    {"tslide", "tt_slide", "Slide — take hold of an edge / vertex and drag: it is picked and slides along its edges (LMB proportionally, RMB in parallel); a drag in empty space slides what is already picked", 0, 4},
     {"sel:cursor", "tsel_cursor", "Select Cursor (Q) — a click picks, a held LMB paints the selection", 1, 0},
     {"sel:rect", "tsel_rect", "Rectangle — a held LMB draws a box to select in", 1, 1},
     {"sel:lasso", "tsel_lasso", "Lasso — a held LMB draws the outline to select inside", 1, 2},
@@ -748,21 +1092,22 @@ TopoTools::TopoTools(QWidget* window, Viewport* vp, std::function<void(const QSt
     {"tplane", "tt_planecut", "Plane Cut — drag a line: the mesh cut by the plane through it (cut, split, one side removed)", 4, 2},
     {"treveal", "topo_reveal", "Reveal Brush — paint over the Topology Ghost: its polygons under the stroke become real, welded onto what is built there (no mesh picked — a new one). Ctrl+wheel / [ ] — its size", 4, 3},
     {"tpatch", "tt_patch", "PatchTool — LMB clicks place anchors of a curve on the references (double click / Enter ends it); RMB — pick an anchor and drag it, on a curve — a new anchor, Ctrl+RMB — delete one. Shift + drag along the open edges — an edge curve on them (its divisions their vertices). Crossing curves (or the mesh's open rim) close contours shown filled; Enter makes the patch", 4, 4},
-    {"tlobe", "tool_braid", "Lobe Brush — paint the lobes of a braid on the high-poly mesh, each a layer: LMB paints the active lobe (white), Ctrl erases it, Shift fills up to the crevices, Ctrl+Shift picks the lobe under the pointer; Enter — a new lobe. Build makes a quad mesh of them, a grid per lobe", 5, 3},
-    {"tweld", "tt_weld", "Weld — select, then RMB: in a point (onto the vertex under the pointer, else their middle) or in pairs (two chains of edges)", 5, 0},
-    {"act:collapse", "tt_collapse", "Collapse Edge — the selected edges each into a vertex (edges joined to each other — one)", 5, 1},
-    {"tfixmesh", "tt_fixmesh", "FixMesh — the Fix button in its options: collapsed and doubled polygons taken out, parts welded where they only touch (teeth sewn along their bite) cut apart, each part's polygons turned one way, the separate parts made meshes of their own", 5, 4},
-    {"toptimize", "tt_optimize", "Optimize — selects as the Select Cursor; the Optimize button in its options: the clean-up — points in one place welded (the distance — the options, or picked by a drag), unused points and polygons of one or two points taken out, doubled polygons made one; the selection, else all", 5, 2},
-    {"tshaper", "tt_shaper", "Edge Shaper — selects as the Select Cursor; a drag → in empty space: LMB even spacing, RMB Edge Flow, Shift+LMB flat on a plane (three vertices — their plane), Shift+RMB straight", 6, 0},
-    {"tchain", "tt_edgechain", "Smooth EdgeChain — select edges, Shift+RMB → a curve they follow; drag its anchors, a click on it — a new anchor; smooth / even them in the options", 6, 1},
-    {"act:relax", "tt_relax", "Relax Mesh (Ctrl+R) — the selected vertices (none — all) evened out on the surface, the rim kept", 6, 2},
+    {"tlobe", "tool_braid", "Lobe Brush — paint the lobes of a braid on the high-poly mesh, each a layer: LMB paints the active lobe (white), Ctrl erases it, Shift fills up to the crevices, Ctrl+Shift picks the lobe under the pointer; Enter — a new lobe. Build makes a quad mesh of them, a grid per lobe", 6, 4},
+    {"tweld", "tt_weld", "Weld — select, then RMB: in a point (onto the vertex under the pointer, else their middle) or in pairs (two chains of edges)", 5, 2},
+    {"act:collapse", "tt_collapse", "Collapse Edge — the selected edges each into a vertex (edges joined to each other — one)", 5, 3},
+    {"tfixmesh", "tt_fixmesh", "FixMesh — the Fix button in its options: collapsed and doubled polygons taken out, parts welded where they only touch (teeth sewn along their bite) cut apart, each part's polygons turned one way, the separate parts made meshes of their own", 6, 0},
+    {"toptimize", "tt_optimize", "Optimize — selects as the Select Cursor; the Optimize button in its options: the clean-up — points in one place welded (the distance — the options, or picked by a drag), unused points and polygons of one or two points taken out, doubled polygons made one; the selection, else all", 5, 4},
+    {"tshaper", "tt_shaper", "Edge Shaper — selects as the Select Cursor; a drag → in empty space: LMB even spacing, RMB Edge Flow, Shift+LMB flat on a plane (three vertices — their plane), Shift+RMB straight", 6, 1},
+    {"tchain", "tt_edgechain", "Smooth EdgeChain — select edges, Shift+RMB → a curve they follow; drag its anchors, a click on it — a new anchor; smooth / even them in the options", 6, 2},
+    {"act:relax", "tt_relax", "Relax Mesh (Ctrl+R) — the selected vertices (none — all) evened out on the surface, the rim kept", 5, 1},
     {"act:snapgeom", "tt_snapgeom", "Snap to the references — the selected vertices (none — all) onto the reference meshes' surface", 6, 3},
     {"tnormals", "tt_normals", "Normals — selects as the Select Cursor, the normals shown; its options: Smooth (hard at the border), Turn (then a drag in the viewport), Copy from a mesh (then a click on it)", 7, 0},
     {"act:alignN", "tt_alignnormals", "Align Normals — the selected polygons (none — all) turned to face one way, each piece outward", 7, 1},
     {"act:reverseN", "tt_reversenormals", "Reverse Normals — the selected polygons (none — all) turned round", 7, 2},
     {"tmirror", "tt_mirror", "Mirror — the Mirror button in its options: a copy by the axis (the side found by itself, the seam welded), or round it — radial, kaleidoscope, half a flower; the axis and kind in the options", 8, 0},
-    {"act:vsym", "tt_vsymgroup", "Virtual symmetry group — the selected meshes into a group whose symmetry is only shown (in any place); on such a group: Apply makes it real", 8, 1},
-    {"act:identical", "tt_identical", "Apply To Identical — the selected retopology polygons (none — the whole mesh) of one part of a high-poly copied onto every topologically identical part of it (and onto copies of that mesh); UVs, seams, creases, hard edges carried", 8, 2}};
+    {"tmodgroups", "tt_modgroups", "Modifier groups — the options list every kind: Symmetry (copies shown by an axis / round it, in any place) and Subdivision (smoothed, more polygons); the selected meshes go into a new group of the kind picked, its settings are in the Properties, Apply makes it real", 8, 2},
+    {"tsubdiv", "tt_subdivide", "Subdivide — selects as the Select Cursor; the Subdivide button in its options: the selected polygons (none — the whole mesh) split into quads for good — simple (new points on the edges and in the polygons) or smooth (Catmull–Clark's places); how many times in the options", 5, 0},
+    {"act:identical", "tt_identical", "Apply To Identical — the selected retopology polygons (none — the whole mesh) of one part of a high-poly copied onto every topologically identical part of it (and onto copies of that mesh); UVs, seams, creases, hard edges carried", 8, 1}};
   for (const T& t : ts) {
     auto* b = toolBtn(t.icon, tr(t.tip)); b->setFixedSize(44, 44); b->setIconSize(QSize(38, 38)); QString id = t.id;
     b->setObjectName("tw_" + id.replace(':', '_')); id = t.id;
@@ -792,6 +1137,9 @@ TopoTools::TopoTools(QWidget* window, Viewport* vp, std::function<void(const QSt
   connect(split_, &QSplitter::splitterMoved, this, [this] { save(); });
   connect(vp, &Viewport::toolChanged, this, &TopoTools::sync);
   connect(vp, &Viewport::topoState, this, &TopoTools::sync);
+  // (Modifier groups: its tiles show the selection's groups — made again when the selection or the groups change)
+  connect(vp, &Viewport::selectionChanged, this, [this] { if (vp_->tool() == "tmodgroups") sync(); });
+  connect(vp, &Viewport::sceneEdited, this, [this] { if (vp_->tool() == "tmodgroups") sync(); });
   sync();
 }
 void TopoTools::resizeEvent(QResizeEvent* e) { QFrame::resizeEvent(e); if (isVisible()) save(); }   // (its size kept)
@@ -811,14 +1159,17 @@ void TopoTools::sync() {
 // the options of the tool in use (made again only when what they show changed)
 void TopoTools::buildOptions() {
   auto& S = vp_->tset; const QString tool = vp_->tool();
-  const QString sig = tool + "|" + S.selTool + "|" + S.gzOrient + "|" + QString::number(S.gzFree) + S.gzWhat + QString::number(S.gzSlide) + S.alAxis + S.alTo + "|" + S.brushMode + "|" + QString::number(S.soft) + S.softMode + QString::number(S.selThrough)
-                      + QString::number(S.loopStopSel) + QString::number(S.loopStopNgon) + QString::number(S.loopStopTri) + QString::number(S.relaxStars) + QString::number(vp_->topoMode == "object")
+  const QString sig = tool + "|" + S.selTool + "|" + S.fillMode + "|" + S.gzOrient + "|" + QString::number(S.gzFree) + S.gzWhat + QString::number(S.gzSlide) + S.alAxis + S.alTo + "|" + S.brushMode + "|" + QString::number(S.soft) + S.softMode + QString::number(S.selThrough)
+                      + QString::number(S.loopStopSel) + QString::number(S.loopStopNgon) + QString::number(S.loopStopTri) + QString::number(S.loopStopSeam) + QString::number(S.loopStopCrease) + QString::number(S.relaxStars) + QString::number(vp_->topoMode == "object")
                       + S.brushKind + vp_->ttools.weldMode + vp_->ttools.weldPos + vp_->ttools.planeMode + QString::number(vp_->penAnchorCount() > 0) + QString::number(vp_->chainActive()) + vp_->topoMode
                       + QString::number(vp_->ttools.loopCuts) + QString::number(vp_->ttools.loopParallel) + QString::number(vp_->ttools.chainEqual) + vp_->ttools.fillMode + vp_->ttools.mirType + QString::number(vp_->ttools.mirAxis) + QString::number(vp_->ttools.mirLocal) + vp_->ttools.penBrush + QString::number(int(vp_->ttools.penSmooth));
   QString psig; if (tool == "tpatch") { vp_->patchBuild(); const auto& P = vp_->pt_; psig = QString("|p%1,%2,%3,%4%5%6,%7,%8,%9").arg(P.selC).arg(P.selC >= 0 && size_t(P.selC) < P.c.size() ? P.c[size_t(P.selC)].div : 0)
       .arg(P.selC >= 0 && size_t(P.selC) < P.c.size() ? QChar(P.c[size_t(P.selC)].mode) : QChar(0x2d)).arg(P.c.size()).arg(P.toDense).arg(P.triFan).arg(P.zoneChoice).arg(P.F.size()).arg(P.note) + QChar(P.kind) + QString::number(P.stripAcross) + QString("|o%1,%2").arg(P.ordering).arg(P.order.size()); }
   if (tool == "tlobe") { const int m = vp_->lobeTarget(); psig = QString("|l%1,%2,%3").arg(m).arg(m >= 0 ? vp_->lobeActive(m) : 0).arg(m >= 0 ? vp_->scene()->item(m)->raw.value("lobeF").toString().size() : 0); if (m >= 0) for (const QString& n : vp_->lobeNames(m)) psig += "," + n; if (m >= 0) { psig += vp_->lobeGhostInfo() + QString("|%1").arg(int(vp_->lb_.gh.size())); for (const QJsonValue& x : vp_->scene()->item(m)->raw.value("lobeFlip").toArray()) psig += "f" + QString::number(x.toInt()); } psig += vp_->lb_.ghost ? "G" : "-"; }
   if (tool == "tnormals") psig += "|n" + vp_->ttools.normMode;      // (Face: the Nose slider in place of Smoothness)
+  if (tool == "tchain") psig += "|a" + vp_->ttools.chainAnchor;       // (the anchor-move choice lit)
+  if (tool == "tsubdiv") psig = QString("|s%1").arg(int(vp_->ttools.subdSmooth));   // (the Simple / Smooth switch lit)
+  if (tool == "tmodgroups") { psig = "|m"; for (int id : vp_->selection().items) { const int sg = vp_->vsymGroupOf(id); psig += QString("%1:%2%3%4,").arg(id).arg(vp_->subdivGroupOf(id)).arg(sg).arg(sg >= 0 ? vp_->scene()->item(sg)->raw.value("vsym").toObject().value("type").toString() : QString()); } }   // (the tile lit: the picked group's kind)
   if (sig + psig == optSig_) return;
   optSig_ = sig + psig;
   auto* L = static_cast<QVBoxLayout*>(opts_->layout());
@@ -850,6 +1201,12 @@ void TopoTools::buildOptions() {
             [vp](const QString& k) { vp->setGzOrient(k); }, tr("The gizmo's axes: the world's, the mesh's own, along the selection's normal, the view's, or where Alt + drag put them"));
     auto* fr = check(tr("Free gizmo"), S.gzFree, tr("A drag of a handle moves / turns the gizmo itself (as Alt + drag) — the model stays"));
     connect(fr, &QCheckBox::toggled, this, [vp, saved](bool x) { vp->tset.gzFree = x; saved(); }); L->addWidget(fr);
+    if (vp->topoMode == "object") {   // (the picked meshes' gizmo — their pivot — to the middle of their own geometry)
+      auto* pc = new QPushButton(tr("⊙ Gizmo to the object's centre")); pc->setToolTip(tr("The pivot of each picked mesh to the middle of its geometry (its box); the mesh stays where it is"));
+      connect(pc, &QPushButton::clicked, this, [vp] { int n = 0; for (int id : vp->selection().items) { const Item* it = vp->scene()->item(id); const PolyMesh* B = it ? (it->base ? it->base.get() : it->poly.get()) : nullptr;
+          if (it && it->type == ItemType::IMesh && B) { vp->setMeshPivot(id, B->bounds().center()); n++; } }
+        ui::toast(n ? tr("Gizmo to the middle of the geometry") : tr("Select a mesh first")); }); L->addWidget(pc);
+    }
     if (tool == "move") {   // (Shift while moving: in steps of this length along the gizmo's axes)
       auto* st = new SliderRow(tr("Shift step, cm"), 0.01, 100, 0.01, S.gzStep, [](double x) { return QString::number(x, 'g', 3); });
       st->setLog(true); st->setReset(1); st->setTip(tr("Hold Shift while moving with the gizmo: the move goes in steps of this length along its axes (Rotate: 45°, Scale: 0.1 steps). Double click — 1 cm"));
@@ -866,6 +1223,10 @@ void TopoTools::buildOptions() {
     }
     L->addWidget(muted(vp->topoMode == "object" ? tr("Alt + drag a handle: the gizmo itself moved / turned — kept in the mesh's Transform (Bake: they become its own axes).")
                                                 : tr("Alt + drag a handle: the gizmo itself moved / turned (Custom) — the model stays.")));
+    if (S.gzOrient == "custom") {   // (Custom → Local: kept in the picked group / mesh)
+      auto* bk = new QPushButton(tr("⤓ Bake Custom into Local")); bk->setToolTip(tr("The gizmo put by Alt + drag becomes the picked group's point and axes (a mesh: its pivot and axes) — Local shows it from now on"));
+      connect(bk, &QPushButton::clicked, this, [vp] { vp->gzBakeCustom(); }); L->addWidget(bk);
+    }
     head(tr("Align"));
     choices({{"x", "X"}, {"y", "Y"}, {"z", "Z"}, {"xy", tr("Plane XY")}, {"yz", tr("Plane YZ")}, {"xz", tr("Plane XZ")}}, S.alAxis, [vp, saved](const QString& k) { vp->tset.alAxis = k; saved(); },
             tr("The axis turned (or the plane — the axis square to it)"));
@@ -889,8 +1250,23 @@ void TopoTools::buildOptions() {
     connect(ba, &QCheckBox::toggled, this, [vp, saved](bool x) { vp->tset.brushAll = x; saved(); }); L->addWidget(ba);
     head(tr("LMB does"));
     choices({{"move", tr("Move")}, {"smooth", tr("Smooth")}, {"relax", tr("Relax")}, {"inflate", tr("Inflate")}, {"shrink", tr("Shrink")}}, S.brushKind, [vp, saved](const QString& k) { vp->tset.brushKind = k; saved(); },
-            tr("What LMB does — also RMB on the viewport"));
-    L->addWidget(muted(tr("RMB — the modes · Shift — smooth · Shift+Ctrl — relax · Ctrl — along the normals (drag) · Ctrl+RMB drag: ←→ size, ↑↓ hardness · Ctrl + wheel — size. With a selection only it is touched. Symmetry: the side the stroke is on.")));
+            tr("What LMB does; RMB — the same along the normals"));
+    // (the mode a held key gives lit while it is held — Shift: Smooth, Shift+Ctrl: Relax, Ctrl: Move (along the normals) —
+    //  one button, the picked one back when it is let go. The keys read from the system itself: Ctrl+Shift is Windows' layout
+    //  switch — Qt's own reading missed the Shift then, and Ctrl's two buttons were left lit)
+    if (QWidget* kw = L->itemAt(L->count() - 1)->widget()) {
+      const auto bs = kw->findChildren<QPushButton*>(QString(), Qt::FindDirectChildrenOnly); const QStringList keys{"move", "smooth", "relax", "inflate", "shrink"};
+      if (bs.size() == keys.size()) { auto* tm = new QTimer(kw); tm->setInterval(60);
+        connect(tm, &QTimer::timeout, kw, [bs, keys, vp] {
+#ifdef Q_OS_WIN
+          const bool sh = GetAsyncKeyState(0x10) & 0x8000, ct = GetAsyncKeyState(0x11) & 0x8000;   // (VK_SHIFT, VK_CONTROL)
+#else
+          const auto md = QGuiApplication::queryKeyboardModifiers(); const bool sh = md & Qt::ShiftModifier, ct = md & Qt::ControlModifier;
+#endif
+          QStringList on; if (sh && ct) on = {"relax"}; else if (sh) on = {"smooth"}; else if (ct) on = {"move"}; else on = {vp->tset.brushKind};
+          for (int i = 0; i < bs.size(); i++) { const bool c = on.contains(keys[i]); if (bs[i]->isChecked() != c) bs[i]->setChecked(c); } });
+        tm->start(); } }
+    L->addWidget(muted(tr("RMB — the same stroke along the normals (Move: each vertex along its own normal, not the screen's plane) · Shift — smooth · Shift+Ctrl — relax · Ctrl — move along the normals (drag) · Ctrl+RMB drag: ←→ size, ↑↓ hardness · Ctrl + wheel — size. With a selection only it is touched. Symmetry: the side the stroke is on.")));
   } else if (tool == "cursor") {
     const QString st = S.selTool;
     if (st == "cursor" || st == "rect" || st == "lasso") {
@@ -898,17 +1274,30 @@ void TopoTools::buildOptions() {
       choices({{"0", tr("Visible only")}, {"1", tr("Through")}}, S.selThrough ? "1" : "0", [vp, saved](const QString& k) { vp->tset.selThrough = k == "1"; saved(); },
               tr("Visible only — what the camera sees; Through — the hidden side too"));
     }
-    if (st == "loop" || st == "ring") {
-      head(tr("Stop"));
+    if (st == "loop" || st == "ring" || st == "cursor") {         // (Select Cursor: its double click's edge / vertex loop stops the same way — one set of options)
+      head(st == "cursor" ? tr("Double-click loop: stop") : tr("Stop"));
       auto add = [&](const QString& t, bool on, bool Viewport::TSet::*field) { auto* c = check(t, on); connect(c, &QCheckBox::toggled, this, [vp, saved, field](bool x) { vp->tset.*field = x; saved(); }); L->addWidget(c); };
       add(tr("Before selected"), S.loopStopSel, &Viewport::TSet::loopStopSel);
       add(tr("Before n-gon"), S.loopStopNgon, &Viewport::TSet::loopStopNgon);
       add(tr("Before tris"), S.loopStopTri, &Viewport::TSet::loopStopTri);
+      add(tr("Before seam"), S.loopStopSeam, &Viewport::TSet::loopStopSeam);
+      add(tr("Before crease"), S.loopStopCrease, &Viewport::TSet::loopStopCrease);
     }
-    if (st == "fill") L->addWidget(muted(tr("A click — the region up to a cut or the selection's frame. Shift adds, Ctrl takes the selected piece off.")));
+    if (st == "fill") {
+      head(tr("Fill up to"));
+      { const QString tip = tr("Normal — the region up to a cut or the selection's frame; UV shell — up to the UV seams (in the UV Editor — the whole shell); Hard edges / Creases — up to the line of them; Polygroup island — the connected polygons of the polygroup under the pointer. The modes mix: switch on several and the region stops at any of them");
+        auto* w = new QWidget; auto* gl = new QGridLayout(w); gl->setContentsMargins(0, 0, 0, 0); gl->setSpacing(3); int i = 0;
+        for (auto& [key, label] : std::vector<std::pair<QString, QString>>{{"normal", tr("Normal")}, {"shell", tr("UV shell")}, {"hard", tr("Hard edges")}, {"crease", tr("Creases")}, {"group", tr("Polygroup island")}}) {
+          auto* b = btn(label, tip); b->setCheckable(true); b->setChecked(key == "normal" ? S.fillMode == "normal" : vp->fillHas(key)); QString k = key;
+          connect(b, &QPushButton::clicked, this, [vp, k] { vp->setFillMode(k); }); gl->addWidget(b, i / 2, i % 2); i++; }
+        L->addWidget(w); }
+      L->addWidget(muted(tr("A click — the region. Shift adds, Ctrl takes the selected piece off.")));
+    }
     if (st == "outline") L->addWidget(muted(tr("A click on a mesh — every border of it (all its open holes and edges, however far), or the selected polygons' border.")));
-    L->addWidget(muted(tr("Shift+RMB — every selection kind and the edits.")));
-  } else if (vp->isModelTool()) buildModelOptions(L);
+    L->addWidget(muted(tr("RMB — every selection kind and the edits.")));
+  } else if (tool == "tmodgroups") buildModGroupOptions(L);
+  else if (tool == "tsubdiv") buildSubdivOptions(L);
+  else if (vp->isModelTool()) buildModelOptions(L);
   else L->addWidget(muted(tr("No options.")));
   L->addStretch(1);
   if (tool == "cursor") {                                         // (the bottom: the edits of the selection — as the Ctrl+RMB menu has them)
@@ -1089,8 +1478,12 @@ void TopoTools::buildModelOptions(QVBoxLayout* L) {
     head(tr("Smooth EdgeChain"));
     if (!vp->chainActive()) action(tr("Curve from the selected edges"), tr("The selected chain of edges follows a curve from now on (Shift+RMB too)"), [vp] { vp->chainCreate(); });
     else {
-      slider(tr("Smooth"), 0, 1, 0.01, T.chainSmooth, pct, [vp](double x) { vp->ttools.chainSmooth = x; vp->chainApply(false); }, false, tr("The curve smoothed — the edges with it"));
+      slider(tr("Smooth"), 0, 1, 0.01, vp->chainSimp(), pct, [vp](double x) { vp->chainSimplify(x); }, false, tr("The curve smoothed: its anchors get fewer and slide evenly along it, till only the two ends are left (0 — all of them back); the edges follow"));
       connect(findChildren<SliderRow*>().last(), &SliderRow::released, this, [vp](double) { vp->chainApply(true); });
+      head(tr("Move the anchors"));
+      choices({{"free", tr("In the view")}, {"surface", tr("On the mesh")}}, T.chainAnchor, [vp](const QString& k) { vp->ttools.chainAnchor = k; }, false,
+              tr("How a dragged anchor of the curve moves: In the view — in the plane facing the camera (as the curve is, off the mesh too); On the mesh — laid on the surface under the pointer"));
+      action(tr("Smooth the curve"), tr("The curve itself smoothed — each anchor a step towards the middle of its neighbours (the ends stay), the edges follow; press again for more. The Smooth slider above only shows the curve smoothed"), [vp] { vp->chainSmoothCurve(); });
       box(tr("Even the edges"), T.chainEqual, [vp](bool x) { vp->ttools.chainEqual = x; vp->chainApply(true); }, false, tr("The vertices spaced evenly along the curve"));
       action(tr("Delete the curve"), tr("The chain stays where it is"), [vp] { vp->topoToolKey(Qt::Key_Escape, {}); });
     }
@@ -1156,7 +1549,7 @@ void TopoTools::buildModelOptions(QVBoxLayout* L) {
     L->addWidget(muted(tr("Polygons selected (or edges / vertices covering them): their inside shaped, their rim kept as it is —\nLMB — a smooth surface spanned by the rim\nRMB — smooth lines: every line of edges across it a smooth curve\nShift — flat on the plane the rim lies nearest, the grid evened out")));
   } else if (tool == "tslide") {
     head(tr("Slide"));
-    L->addWidget(muted(tr("Select vertices / edges as with the Select Cursor, then drag in empty space or from the selection itself (RMB — anywhere): LMB — proportionally (the same share of each edge), RMB — in parallel (the same distance)")));
+    L->addWidget(muted(tr("Take hold of an edge / vertex and drag — it is picked and slides (Shift + click — adds to the selection, Ctrl — selects as the Cursor); or pick several, then drag in empty space or from the selection itself (RMB — anywhere): LMB — proportionally (the same share of each edge), RMB — in parallel (the same distance)")));
   } else if (tool == "tnormals") {
     head(tr("Normals"));
     box(tr("Show the normals"), T.normShow, [vp](bool x) { vp->ttools.normShow = x; vp->saveModelPrefs(); vp->topoChanged(); }, false, tr("The normals' lines in the viewport — off: none drawn (the tool works the same)"));
@@ -1173,25 +1566,26 @@ void TopoTools::buildModelOptions(QVBoxLayout* L) {
       slider(tr("Smoothness"), 0, 1, 0.01, T.normSmooth, pct, [vp](double x) { vp->ttools.normSmooth = x; }, true, tr("How far the shape is smoothed before its normals are taken"));
     box(tr("Hard border"), T.normHardBorder, [vp](bool x) { vp->ttools.normHardBorder = x; }, true, tr("The selection's border a hard edge — the shading breaks there"));
     action(tr("Average the normals"), tr("Only the shading: the selected polygons' normals averaged as those of a simpler shape — no soft / hard edges or smoothing groups are set, the geometry stays (the settings above change the last one while it is selected)"), [vp] { vp->tNormalsSmooth(); });
+    // (the two pressed again and again stay buttons; the other ways to set the normals — in the menu under them, with the captions and
+    // tips they had as buttons: a key given to one goes on working)
+    action(tr("Reset to standard smoothing"), tr("The selected vertices' normals (nothing selected — the whole mesh's) back to the standard smooth shading: set by hand, averaged, turned or copied — all undone; the hard edges stay"), [vp] { vp->tNormalsSet("reset"); });
+    { auto* mb = btn(tr("Set the normals another way") + QString::fromUtf8("  ▾"), tr("The ways used less often: the edges' normals from the back wall, toward the camera, one common normal, along a world axis, turned by a drag, copied from another mesh"));
+      QMenu* m = ui::moreMenu(mb); L->addWidget(mb);
+      ui::menuItem(m, tr("Edges → the back wall's normals"), tr("The selected edges (Edge mode): their vertices take the normal of the wall behind them — the polygons turned away from the camera (orange in two-tone); the edge's band then shades as that wall and the border can't be seen. Turn the view so that wall faces away first"), this, [vp] { vp->tNormalsFromBack(); });
+      m->addSeparator();
+      ui::menuItem(m, tr("Toward the camera"), tr("The selected vertices' normals pointed at the viewer — the direction you look from"), this, [vp] { vp->tNormalsSet("cam"); });
+      ui::menuItem(m, tr("One common normal"), tr("The selected vertices all take their average normal — the area shades as one flat plane"), this, [vp] { vp->tNormalsSet("one"); });
+      QMenu* ax = m->addMenu(tr("Along a world axis")); ax->setToolTipsVisible(true);
+      for (const char* d : {"+x", "-x", "+y", "-y", "+z", "-z"}) { const QString k = d; ui::menuItem(ax, k.toUpper(), tr("The selected vertices' normals along this world axis"), this, [vp, k] { vp->tNormalsSet(k); }); }
+      m->addSeparator();
+      ui::menuItem(m, tr("Turn the normals…"), tr("The selected vertices / polygons: the next drag in the viewport turns their normals (←→ round the view's up, ↑↓ round its right)"), this, [vp] { vp->armOnce("nturn"); });
+      ui::menuItem(m, tr("Copy from a mesh…"), tr("The selected polygons (none — all) take the normals of the mesh clicked next in the viewport"), this, [vp] { vp->armOnce("ncopy"); }); }
     head(tr("Normals brush"));
     box(tr("Paint the normals"), T.nBrush, [vp](bool x) { vp->ttools.nBrush = x; vp->topoChanged(); QTimer::singleShot(0, vp, [vp] { emit vp->topoState(); }); }, false,
         tr("A brush in the viewport: the normals under it given the averaging's share set below (the mode and Smoothness above; the selected polygons' shape, none selected — the whole mesh's)"));
     slider(tr("Averaged"), 0, 1, 0.01, T.nBrushVal, pct, [vp](double x) { vp->ttools.nBrushVal = x; vp->saveModelPrefs(); }, false,
            tr("The share the brush gives: 100% — fully averaged, 0% — the custom normals wiped, the standard shading back"));
     if (T.nBrush) L->addWidget(muted(tr("LMB — this share; Ctrl+LMB (or 0%) — the custom normals wiped, the standard shading; Shift+LMB — the change between normals smoothed. The wheel over the mesh or Ctrl+RMB drag — its size.")));
-    head(tr("Blend edges"));
-    action(tr("Edges → the back wall's normals"), tr("The selected edges (Edge mode): their vertices take the normal of the wall behind them — the polygons turned away from the camera (orange in two-tone); the edge's band then shades as that wall and the border can't be seen. Turn the view so that wall faces away first"), [vp] { vp->tNormalsFromBack(); });
-    head(tr("Turn / copy"));
-    head(tr("Set the direction"));
-    { auto* w = new QWidget; auto* gl = new QGridLayout(w); gl->setContentsMargins(0, 0, 0, 0); gl->setSpacing(3); int i = 0;
-      for (const char* d : {"+x", "-x", "+y", "-y", "+z", "-z"}) { const QString k = d; auto* b = btn(k.toUpper(), tr("The selected vertices' normals along this world axis"));
-        connect(b, &QPushButton::clicked, this, [vp, k] { vp->tNormalsSet(k); }); gl->addWidget(b, i / 3, i % 3); i++; }
-      L->addWidget(w); }
-    action(tr("Toward the camera"), tr("The selected vertices' normals pointed at the viewer — the direction you look from"), [vp] { vp->tNormalsSet("cam"); });
-    action(tr("One common normal"), tr("The selected vertices all take their average normal — the area shades as one flat plane"), [vp] { vp->tNormalsSet("one"); });
-    action(tr("Reset to standard smoothing"), tr("The selected vertices' normals (nothing selected — the whole mesh's) back to the standard smooth shading: set by hand, averaged, turned or copied — all undone; the hard edges stay"), [vp] { vp->tNormalsSet("reset"); });
-    action(tr("Turn the normals…"), tr("The selected vertices / polygons: the next drag in the viewport turns their normals (←→ round the view's up, ↑↓ round its right)"), [vp] { vp->armOnce("nturn"); });
-    action(tr("Copy from a mesh…"), tr("The selected polygons (none — all) take the normals of the mesh clicked next in the viewport"), [vp] { vp->armOnce("ncopy"); });
     L->addWidget(muted(tr("In the viewport the tool selects as the Select Cursor; its actions are these buttons.")));
   } else if (tool == "toptimize") {
     head(tr("Optimize"));
@@ -1213,8 +1607,9 @@ void TopoTools::buildModelOptions(QVBoxLayout* L) {
     box(tr("Separate parts as meshes"), T.fixSplit, [vp](bool x) { vp->ttools.fixSplit = x; }, false,
         tr("Each part of the mesh not joined to the rest by a shared side becomes a mesh of its own (the largest stays this one) — e.g. the upper and the lower teeth"));
     action(tr("Make manifold (selected meshes)"), tr("Every selected mesh made manifold, as the Hair room's conversion leaves it: an edge of three polygons or more split into pairs that carry on into each other, a vertex where parts only touch split, doubled polygons out — nothing else changes"), [vp] {
-      const std::vector<int> ms = vp->selection().items; vp->runEdit([ms](Scene& s, Selection&, const CurveCache&) { int fixed = 0;
+      const std::vector<int> ms = vp->selection().items; vp->runEdit([vp, ms](Scene& s, Selection&, const CurveCache&) { int fixed = 0;
         for (int m : ms) { Item* x = s.item(m); if (!x || !x->poly || (x->type != ItemType::IMesh && x->type != ItemType::Mesh)) continue; auto src = x->base ? x->base : x->poly; auto p = std::make_shared<PolyMesh>(*src); if (!tedit::makeManifold(*p)) continue;
+          if (x->type == ItemType::IMesh) { vp->topoWrite(m, p); fixed++; continue; }   // (as every geometry edit of the room: a live source saved with the project, the per-polygon data and the caches following)
           const bool sameShown = x->poly == src; if (x->base) x->base = p; if (sameShown || !x->base) x->poly = p; fixed++; }
         return fixed ? QObject::tr("%1 mesh%2 made manifold").arg(fixed).arg(fixed == 1 ? "" : "es") : QObject::tr("Already manifold — nothing to clean"); }); });
     action(tr("Fix mesh"), tr("The active mesh: collapsed polygons (no area, slivers) and doubled ones out, parts that only touch at a vertex or share a side with a third polygon cut apart, each part turned the way most of its polygons face"), [vp] { vp->tFixMesh(); });
@@ -1231,7 +1626,7 @@ void TopoTools::buildModelOptions(QVBoxLayout* L) {
     box(tr("Replace the other side"), T.mirReplace, [vp](bool x) { vp->ttools.mirReplace = x; }, false,
         tr("Mirror: the selected polygons take the place of the other side's matching region (found by the selection's border mirrored onto the mesh) — e.g. the left hand remodelled with claws, then the right one replaced by its copy; UVs, seams, creases, hard edges carried"));
     action(tr("Mirror"), tr("The selected polygons (none — the whole mesh) copied; the side found by itself, the seam welded"), [vp] { vp->tMirrorMesh(); });
-    action(tr("Virtual symmetry group…"), tr("The selected meshes into a group whose symmetry is only shown — in any place; Apply makes it real"), [this] { vsymMenu(); }, "tt_vsymgroup");
+    L->addWidget(muted(tr("A symmetry only shown (in any place): the Modifier groups tool — Symmetry group.")));
   } else if (tool == "tfill") {
     head(tr("Fill Hole"));
     choices({{"quads", tr("Quads")}, {"quadtri", tr("Quads + tris")}, {"fan", tr("Tris to a centre")}, {"tris", tr("Tris, no centre")}, {"ngon", tr("N-gon")}}, T.fillMode,
@@ -1255,27 +1650,54 @@ void TopoTools::runAct(const QString& a) {
   else if (a == "snapgeom") vp_->tSnapToGeom();
   else if (a == "alignN") vp_->tAlignNormals();
   else if (a == "reverseN") vp_->tReverseNormals();
-  else if (a == "vsym") vsymMenu();
   else if (a == "identical") vp_->tApplyIdentical();
 }
 
-void TopoTools::vsymMenu() {
-  Viewport* vp = vp_; int g = -1; for (int id : vp->selection().items) if (int x = vp->vsymGroupOf(id); x >= 0) g = x;
-  struct K { const char *k, *icon, *label, *tip; };
-  const K ks[] = {{"mirror", "sym_mirror", "Mirror", "By the axis: a mirrored copy"}, {"radial", "sym_radial", "Radial", "Round the axis: copies turned evenly (the count in the Mirror tool's options)"},
-                  {"radialMirror", "sym_radialmirror", "Radial mirror", "Round the axis, each copy and its mirror — a kaleidoscope"}, {"radialHalf", "sym_radialhalf", "Radial half", "Round half the axis — half a flower"}};
-  ui::PieSpec s; s.bare = true;
-  for (const K& k : ks) { ui::PieItem it; it.icon = k.icon; it.label = tr(k.label); it.tip = tr(k.tip); QString key = k.k;
-    if (g < 0) it.act = [vp, key] { vp->vsymCreate(key); };
-    else { it.cur = vp->scene()->item(g)->raw.value("vsym").toObject().value("type").toString() == key;
-      it.act = [vp, g, key] { vp->runEdit([g, key](Scene& sc, Selection&, const CurveCache&) { QJsonObject o = sc.item(g)->raw.value("vsym").toObject(); o.insert("type", key); sc.item(g)->raw.insert("vsym", o); return QObject::tr("Symmetry: %1").arg(key); }); }; }
-    s.ring.push_back(it); }
-  if (g >= 0) {
-    ui::PieItem ap; ap.label = tr("✔ Apply — make it real"); ap.tip = tr("The copies become the meshes' own geometry (the seams welded); the group stays, its symmetry gone"); ap.act = [vp, g] { vp->vsymApply(g); };
-    ui::PieItem rm; rm.label = tr("✕ Remove the symmetry"); rm.tip = tr("Only the original kept — the preview gone"); rm.act = [vp, g] { vp->runEdit([g](Scene& sc, Selection&, const CurveCache&) { sc.item(g)->raw.remove("vsym"); return QObject::tr("Virtual symmetry removed"); }); };
-    s.top = {ap}; s.bottom = {rm};
-  } else s.title = tr("A group with a virtual symmetry");
-  ui::Pie::open(parentWidget(), QCursor::pos(), s, false);
+// the Subdivide tool's options: simple / smooth, how many times, the button (the selected polygons, none — the whole mesh)
+void TopoTools::buildSubdivOptions(QVBoxLayout* L) {
+  Viewport* vp = vp_; auto& T = vp->ttools;
+  auto head = [&](const QString& t) { auto* l = new QLabel(t); l->setProperty("h4", true); l->setStyleSheet("margin-top:4px"); L->addWidget(l); };
+  head(tr("Subdivide"));
+  auto* w = new QWidget; auto* gl = new QGridLayout(w); gl->setContentsMargins(0, 0, 0, 0); gl->setSpacing(3); int i = 0;
+  for (auto [k, label, tip] : std::vector<std::tuple<bool, QString, QString>>{{false, tr("Simple"), tr("Every polygon split into quads by new points on its edges and in its middle — the shape is not changed")},
+                                                                               {true, tr("Smooth"), tr("Split and rounded as Catmull–Clark does (as the Subdivision modifier): the points inside the region move to where the smooth surface has them; the region's border stays where it is, the rest of the mesh is not touched")}}) {
+    auto* b = btn(label, tip); b->setCheckable(true); b->setChecked(T.subdSmooth == k); connect(b, &QPushButton::clicked, this, [vp, k] { vp->ttools.subdSmooth = k; vp->saveModelPrefs(); emit vp->topoState(); }); gl->addWidget(b, 0, i++); }
+  L->addWidget(w);
+  auto* lv = new SliderRow(tr("Levels"), 1, 4, 1, T.subdLevels, [](double x) { return QString::number(int(std::lround(x))); });
+  lv->setTip(tr("How many times the polygons are split: each level — four times the quads"));
+  connect(lv, &SliderRow::changed, this, [vp](double x) { vp->ttools.subdLevels = int(std::lround(x)); }); connect(lv, &SliderRow::released, this, [vp](double) { vp->saveModelPrefs(); }); L->addWidget(lv);
+  auto* go = btn(tr("Subdivide"), tr("The selected polygons (none selected, or Object mode — the whole mesh) subdivided")); go->setProperty("primary", true);
+  connect(go, &QPushButton::clicked, this, [vp] { vp->tSubdivide(); }); L->addWidget(go);
+  L->addWidget(muted(tr("Only the selected polygons: the polygons next to them get the new points of the shared edges (they become n-gons there) — no crack, nothing else moves. The new polygons stay selected.")));
+}
+
+// the Modifier groups tool's options: tiles, as the Tools panel has them — the symmetry types (a new group of that type, or the
+// picked symmetry group changed to it) and Subdivision (a new group); the group's own settings, Apply and Remove are in its Properties
+void TopoTools::buildModGroupOptions(QVBoxLayout* L) {
+  Viewport* vp = vp_;
+  auto head = [&](const QString& t) { auto* l = new QLabel(t); l->setProperty("h4", true); l->setStyleSheet("margin-top:4px"); L->addWidget(l); };
+  int sd = -1, sy = -1; for (int id : vp->selection().items) { if (int x = vp->subdivGroupOf(id); x >= 0) sd = x; if (int x = vp->vsymGroupOf(id); x >= 0) sy = x; }
+  const QString curType = sy >= 0 ? vp->scene()->item(sy)->raw.value("vsym").toObject().value("type").toString("mirror") : QString();
+  auto tiles = [&](std::vector<std::tuple<QString, QString, QString, bool, std::function<void()>>> items) {
+    auto* w = new QWidget; auto* gl = new QGridLayout(w); gl->setContentsMargins(0, 0, 0, 0); gl->setSpacing(4); int i = 0;
+    for (auto& [icon, tip, id, lit, fn] : items) { auto* b = toolBtn(icon, tip); b->setFixedSize(44, 44); b->setIconSize(QSize(38, 38)); b->setCheckable(true); b->setChecked(lit); b->setObjectName("mg_" + id);
+      auto f = fn; connect(b, &QPushButton::clicked, this, [f] { f(); }); gl->addWidget(b, i / 3, i % 3); i++; }
+    gl->setColumnStretch(3, 1); L->addWidget(w); };
+  head(tr("Symmetry"));
+  struct K { const char *k, *icon, *tip; };
+  const K ks[] = {{"mirror", "sym_mirror", "Mirror — a mirrored copy by the axes picked (X, Y, Z, each with its kept side), only shown, in any place"},
+                  {"radial", "sym_radial", "Radial — copies turned evenly round an axis"},
+                  {"radialMirror", "sym_radialmirror", "Radial mirror — round an axis, each copy and its mirror: a kaleidoscope"},
+                  {"radialHalf", "sym_radialhalf", "Radial half — copies round half the axis: half a flower"}};
+  std::vector<std::tuple<QString, QString, QString, bool, std::function<void()>>> sym;
+  for (const K& k : ks) { const QString key = k.k; const QString extra = sy >= 0 ? tr(". The picked symmetry group changes to this type") : tr(". A new symmetry group is made (the selected meshes go into it, none selected — an empty group)");
+    sym.push_back({k.icon, tr(k.tip) + extra, "sym_" + key, sy >= 0 && curType == key, [vp, key] {
+      int sy = -1; for (int id : vp->selection().items) if (int x = vp->vsymGroupOf(id); x >= 0) sy = x;   // (the selection's group at the click: not the one of the panel's making)
+      if (sy < 0 || !vp->scene()->item(sy)) vp->vsymCreate(key);
+      else vp->runEdit([sy, key](Scene& sc, Selection&, const CurveCache&) { QJsonObject o = sc.item(sy)->raw.value("vsym").toObject(); o.insert("type", key); sc.item(sy)->raw.insert("vsym", o); return QObject::tr("Symmetry: %1").arg(key); }); }}); }
+  tiles(sym);
+  head(tr("Subdivision"));
+  tiles({{"tt_subdiv", tr("Subdivision — a group that subdivides and smooths its meshes (Catmull–Clark), the cage stays what you edit; a new group (the selected meshes go into it, none selected — an empty group)"), "subdiv", sd >= 0, [vp] { vp->subdivCreate(); }}});
 }
 
 void TopoTools::save() const {
@@ -1287,15 +1709,17 @@ void TopoTools::place(QWidget* vpBox) {
   QJsonObject st = QJsonDocument::fromJson(QSettings().value("topo/tools").toByteArray()).object();
   QWidget* w = parentWidget(); QPoint o = w->mapToGlobal(QPoint(0, 0));
   QPoint p = st.contains("x") ? o + QPoint(st.value("x").toInt(), st.value("y").toInt()) : vpBox->mapToGlobal(QPoint(10, 34));
-  QRect g(o, w->size()); p.setX(std::clamp(p.x(), g.left(), g.right() - 60)); p.setY(std::clamp(p.y(), g.top(), g.bottom() - 40));
+  QRect g(o, w->size()); p.setX(std::clamp(p.x(), g.left(), std::max(g.left(), g.right() - width()))); p.setY(std::clamp(p.y(), g.top(), std::max(g.top(), g.bottom() - 60))); lastBox_ = vpBox;   // (wholly inside the program's window)
   move(p);
 }
 bool TopoTools::eventFilter(QObject* o, QEvent* e) {
-  if (o != bar_ && o != bar2_) return QFrame::eventFilter(o, e);
+  if (o != bar_) return QFrame::eventFilter(o, e);
   if (e->type() == QEvent::MouseButtonPress) { auto* m = static_cast<QMouseEvent*>(e); if (m->button() == Qt::LeftButton) { drag_ = true; grab_ = m->globalPosition().toPoint() - pos(); } return true; }
   if (e->type() == QEvent::MouseMove && drag_) { move(static_cast<QMouseEvent*>(e)->globalPosition().toPoint() - grab_); return true; }
-  if (e->type() == QEvent::MouseButtonRelease && drag_) { drag_ = false; save(); return true; }
-  if (e->type() == QEvent::MouseButtonDblClick) { vert_ = !vert_; if (auto* l = qobject_cast<QBoxLayout*>(row_->layout())) l->setDirection(vert_ ? QBoxLayout::TopToBottom : QBoxLayout::LeftToRight); adjustSize(); save(); return true; }
+  if (e->type() == QEvent::MouseButtonRelease && drag_) { drag_ = false; save(); raise(); return true; }
+  if (e->type() == QEvent::MouseButtonDblClick) {   // (double click on the title: back to its place — its own record's x / y dropped, the size and the split kept; it was the UV window's record that went)
+    QJsonObject st = QJsonDocument::fromJson(QSettings().value("topo/tools").toByteArray()).object(); st.remove("x"); st.remove("y");
+    QSettings().setValue("topo/tools", QJsonDocument(st).toJson(QJsonDocument::Compact)); drag_ = false; if (lastBox_) place(lastBox_); raise(); return true; }
   return QFrame::eventFilter(o, e);
 }
 
@@ -1332,8 +1756,8 @@ QFrame* makeTopoDisplay(QWidget* window, Viewport* vp, Scene* sc, std::function<
   slider("pdo", QObject::tr("PDO"), QObject::tr("Polygon draw offset: the active geometry is drawn nearer the camera than it is, so it covers the meshes it lies on (it stays where it is on the screen and in the scene)"), &vp->tdisp.pdo, [](double x) { return QString::number(int(std::lround(x * 100))); });
   f->setProperty("vp", QVariant::fromValue<void*>(vp)); f->setProperty("sc", QVariant::fromValue<void*>(sc));
   auto* holder = new QObject(f); holder->setObjectName("viewFn");
-  f->setProperty("viewWire", view().value("showMeshWire").toBool(true));
-  QObject::connect(vp, &Viewport::changed, f, [f, view] { f->setProperty("viewWire", view().value("showMeshWire").toBool(true)); });
+  f->setProperty("viewWire", view().value("showMeshWire").toBool(false));
+  QObject::connect(vp, &Viewport::changed, f, [f, view] { f->setProperty("viewWire", view().value("showMeshWire").toBool(false)); });
   f->hide();
   return f;
 }
@@ -1342,7 +1766,7 @@ void syncTopoDisplay(QFrame* f) {
   bool sm = true, fl = true, any = false; for (auto& [id, it] : sc->items) if (it.type == ItemType::IMesh) { any = true; if (it.raw.value("smoothN").toBool()) fl = false; else sm = false; }
   QJsonObject vw = sc->fileRaw.value("settings").toObject().value("view").toObject();
   auto set = [f](const char* n, bool on) { if (auto* b = f->findChild<QPushButton*>(n)) { QSignalBlocker k(b); b->setChecked(on); } };
-  set("wire", vw.value("showMeshWire").toBool(true)); set("smooth", !vp->tdisp.unlit && any && sm); set("flat", !vp->tdisp.unlit && any && fl);
+  set("wire", vw.value("showMeshWire").toBool(false)); set("smooth", !vp->tdisp.unlit && any && sm); set("flat", !vp->tdisp.unlit && any && fl);
   set("unlit", vp->tdisp.unlit); set("notex", vp->tdisp.noTex); set("selThrough", vp->tset.selThrough);
   for (auto [n, v] : {std::pair<const char*, double>{"op", vp->tdisp.op}, {"pdo", vp->tdisp.pdo}}) if (auto* s = f->findChild<QSlider*>(n)) { QSignalBlocker k(s); s->setValue(int(std::lround(v * 100)));
     if (auto* l = f->findChild<QLabel*>(QString(n) + "v")) l->setText(QString(n) == "op" ? QString::number(int(std::lround(v * 100))) + "%" : QString::number(int(std::lround(v * 100)))); }
@@ -1478,7 +1902,7 @@ protected:
   void mouseDoubleClickEvent(QMouseEvent* e) override { if (onButton(e)) { e->accept(); return; } QTreeWidget::mouseDoubleClickEvent(e); }
   void keyPressEvent(QKeyEvent* e) override {
     if (e->key() == Qt::Key_F2 && currentItem()) { editItem(currentItem(), 0); return; }
-    if (e->key() == Qt::Key_G && (e->modifiers() & Qt::ControlModifier) && groupPicked) { groupPicked(); return; }
+    if (ui::Keymap::latinKey(e) == Qt::Key_G && (e->modifiers() & Qt::ControlModifier) && groupPicked) { groupPicked(); return; }
     QTreeWidget::keyPressEvent(e);
   }
 public:
@@ -1612,13 +2036,17 @@ void uvMatMenu(Viewport* vp, Scene* sc, int id, int k) {
   QMenu* mg = menu.addMenu(QObject::tr("⊕ Merge into it"));
   for (auto& x : MM) if (x.idx != k) { const int o = x.idx; act(mg, x.name, [vp, id, k, o] { vp->uvMatMerge(id, k, o); }); }
   mg->setEnabled(MM.size() > 1);
-  act(&menu, QObject::tr("✎ Rename (double click)"), [vp, id, k, name] { const QString t = askName(QObject::tr("Rename the UV Mat"), name); if (!t.isEmpty()) vp->uvMatRename(id, k, t); });
+  act(&menu, QObject::tr("✎ Rename"), [vp, id, k, name] { const QString t = askName(QObject::tr("Rename the UV Mat"), name); if (!t.isEmpty()) vp->uvMatRename(id, k, t); });
   menu.addSeparator(); if (k >= 0) act(&menu, QObject::tr("✕ Delete (its polygons to Default)"), [vp, id, k] { vp->uvMatDelete(id, k); });
   menu.exec(QCursor::pos());
 }
+// the mesh's UV Mats as the panel lists them: Default (the polygons with no material) is not shown while it is all there is
+std::vector<Viewport::UvMat> shownMats(Viewport* vp, int id) {
+  auto M = vp->uvMats(id); if (M.size() == 1 && M[0].idx < 0) M.clear(); return M;
+}
 QWidget* uvMatGrid(Viewport* vp, Scene* sc, int id, int cols) {
   auto* w = new QWidget; auto* g = new QGridLayout(w); g->setContentsMargins(0, 0, 0, 4); g->setSpacing(4);
-  const auto M = vp->uvMats(id); const auto S = vp->uvSets(id); int n = 0;
+  const auto M = shownMats(vp, id); const auto S = vp->uvSets(id); int n = 0;
   for (auto& x : M) {
     const int mk = x.idx; const QString name = x.name; const int si = vp->uvSetOfMat(id, mk);
     const QString tip = QObject::tr("%1: %2 polygons, UV Set: %3 — click: its polygons selected (Shift adds, Ctrl takes off), it worked in (only it in the UV Editor); double click: rename; RMB: more (textures…)")
@@ -1639,7 +2067,7 @@ void topoUvBlocks(QVBoxLayout* v, Viewport* vp, Scene* sc, int id) {
   ProfScope prof_("topoUvBlocks");
   const Item* m = sc->item(id); if (!m) return;
   auto mainWin = [] { for (QWidget* w : QApplication::topLevelWidgets()) if (qobject_cast<QMainWindow*>(w)) return w; return static_cast<QWidget*>(nullptr); };
-  const auto S = vp->uvSets(id); const auto M = vp->uvMats(id); const auto& P = vp->uvPicked; const bool mine = P.id == id;
+  const auto S = vp->uvNone(id) ? std::vector<Viewport::UvSetL>{} : vp->uvSets(id); const auto M = shownMats(vp, id); const auto& P = vp->uvPicked; const bool mine = P.id == id;
   const QColor ON(0x35, 0x50, 0x78), SOFT(0x2c, 0x3c, 0x55);
   const Qt::ItemFlags rowFlags = Qt::ItemIsEnabled | Qt::ItemIsSelectable | Qt::ItemIsEditable | Qt::ItemIsDragEnabled | Qt::ItemIsDropEnabled;
   auto glyph = [](const QString& g, const QString& tip) { auto* b = new QPushButton(g); b->setFixedSize(34, 26); b->setToolTip(tip); b->setFocusPolicy(Qt::NoFocus); b->setStyleSheet("font-size:14px;padding:0"); return b; };
@@ -1655,7 +2083,7 @@ void topoUvBlocks(QVBoxLayout* v, Viewport* vp, Scene* sc, int id) {
     auto* se = glyph("◉", QObject::tr("Select the picked set's polygons"));
     auto* rm = glyph("✕", QObject::tr("Delete the picked UV Set (its polygons show their other set; its mats use another set)"));
     ap->setEnabled(cur >= 0); du->setEnabled(cur >= 0); se->setEnabled(cur >= 0); rm->setEnabled(cur >= 0 && S.size() > 1);
-    QObject::connect(nw, &QPushButton::clicked, vp, [vp, id, later] { later([vp, id] { vp->uvSetNew(id); }); });
+    QObject::connect(nw, &QPushButton::clicked, vp, [vp, id, later] { later([vp, id] { vp->uvSetFromShells(-1); }); });   // (polygons selected: a set of them; none: an empty one of the project)
     QObject::connect(ap, &QPushButton::clicked, vp, [vp, id, cur, later] { later([vp, id, cur] { vp->uvSetApply(id, cur); }); });
     QObject::connect(du, &QPushButton::clicked, vp, [vp, id, cur, later] { later([vp, id, cur] { vp->uvSetDuplicate(id, cur); }); });
     QObject::connect(se, &QPushButton::clicked, vp, [vp, id, cur, later] { later([vp, id, cur] { const Item* mm = vp->scene()->item(id); const PolyMesh* B = mm ? (mm->base ? mm->base.get() : mm->poly.get()) : nullptr; if (!B) return;
@@ -1687,7 +2115,6 @@ void topoUvBlocks(QVBoxLayout* v, Viewport* vp, Scene* sc, int id) {
 void topoMeshProps(QVBoxLayout* v, Viewport* vp, Scene* sc, int id) {
   ProfScope prof_("topoMeshProps");
   const Item* m = sc->item(id); const PolyMesh* B = baseOf(*m); if (!B) { v->addWidget(muted(QObject::tr("Loading…"))); return; }
-  const bool heavy = meshmods::heavy(*m);
   // ---- a primitive: Convert to object on top, then its settings (the mesh made again as they change) ----
   if (m->raw.value("prim").isObject()) {
     const QJsonObject pr = m->raw.value("prim").toObject(); const QString type = pr.value("type").toString(); const QJsonObject pp = pr.value("p").toObject();
@@ -1805,15 +2232,16 @@ void topoMeshProps(QVBoxLayout* v, Viewport* vp, Scene* sc, int id) {
     if (ids.empty()) { ui::toast(QObject::tr("Pick polygroups in the list first (Ctrl / Shift — several)")); return; }
     QTimer::singleShot(0, vp, [vp, id, ids] { vp->tgTreeEdit(id, [ids](std::vector<topo::TgNode>& t) {
       int k = 1; topo::tgWalk(t, [&](const topo::TgNode& n, int) { if (n.isFolder && n.f.startsWith("Group ")) k = std::max(k, n.f.mid(6).toInt() + 1); });
-      std::vector<topo::TgNode> picked; std::vector<topo::TgNode>* firstArr = nullptr; long firstAt = -1;
+      // (the new folder takes the first picked node's place at once, the others are erased after; it is found again by its id —
+      // no pointer into an array kept while other arrays shrink)
+      std::vector<topo::TgNode> picked; topo::TgNode f; f.id = topo::tgNid(); f.isFolder = true; f.f = QString("Group %1").arg(k); bool placed = false;
       for (qint64 nid : ids) { std::vector<topo::TgNode>* arr = nullptr; topo::TgNode* n = topo::tgFind(t, nid, &arr); if (!n) continue;
         bool inside = false; for (qint64 o : ids) if (o != nid) { std::vector<topo::TgNode>* a2 = nullptr; if (topo::TgNode* p = topo::tgFind(t, o, &a2)) if (topo::tgFind(p->kids, nid)) inside = true; }
         if (inside) continue;
-        if (!firstArr) { firstArr = arr; firstAt = long(n - arr->data()); }
-        picked.push_back(*n); arr->erase(arr->begin() + (n - arr->data())); if (arr == firstArr && firstAt > long(arr->size())) firstAt = long(arr->size()); }
-      if (!firstArr) return;
-      topo::TgNode f; f.id = topo::tgNid(); f.isFolder = true; f.f = QString("Group %1").arg(k); f.kids = picked;
-      firstArr->insert(firstArr->begin() + std::min<long>(firstAt, long(firstArr->size())), f);
+        picked.push_back(*n);
+        if (!placed) { *n = f; placed = true; } else arr->erase(arr->begin() + (n - arr->data())); }
+      if (!placed) return;
+      if (topo::TgNode* g = topo::tgFind(t, f.id)) g->kids = picked;
     }); ui::toast(QObject::tr("Grouped — F2 to name it")); });
   };
   tw->groupPicked = groupPicked;
@@ -1834,6 +2262,8 @@ void topoMeshProps(QVBoxLayout* v, Viewport* vp, Scene* sc, int id) {
       act(QObject::tr("Show all in it"), [vp, id, gs] { vp->tgSetVisible(id, gs, true); vp->runEdit([](Scene&, Selection&, const CurveCache&) { return QString(); }, false); }, gs.empty());
       act(QObject::tr("— Hide all in it"), [vp, id, gs] { vp->tgSetVisible(id, gs, false); vp->runEdit([](Scene&, Selection&, const CurveCache&) { return QString(); }, false); }, gs.empty());
     } else {
+      act(QObject::tr("◉ Select its polygons (double click)"), [vp, id, g, BB] { const int k = vp->tSelectFaces(id, topo::groupFaces(*BB, g)); ui::hud(QObject::tr("%1 polygons selected").arg(k), 1000); }, false, QObject::tr("Every polygon of this polygroup selected (Polygon mode)"));
+      menu.addSeparator();
       act(QObject::tr("⤴ Detach as a separate mesh"), [vp, id, g] { vp->tgDetach(id, g); }, GG < 2, QObject::tr("This polygroup becomes a mesh of its own (placed where it is)"));
       QMenu* mg = menu.addMenu(QObject::tr("⊕ Merge with")); mg->setEnabled(GG >= 2);
       auto order = topo::tgTree(vp->scene()->item(id)->raw.value("gTree"), GG, vp->scene()->item(id)->raw.value("gOrder")); std::vector<int> gl; topo::tgWalk(order, [&](const topo::TgNode& n, int) { if (!n.isFolder) gl.push_back(n.g); });
@@ -1846,8 +2276,10 @@ void topoMeshProps(QVBoxLayout* v, Viewport* vp, Scene* sc, int id) {
       act(QObject::tr("≡ Select all topologically identical parts"), [vp, id, g] { vp->tSelectIdentical(id, g); }, false, QObject::tr("Every part of the mesh with the same topology as this group's part(s)"));
       act(QObject::tr("⇋ Select the symmetric ones"), [vp, id, g] { vp->tSelectSymmetric(id, g); }, false, QObject::tr("The mirrored copy of this group's part — or, on one symmetric part, the polygons mirrored across X"));
       menu.addSeparator();
-      { auto a = vp->smArr(id); auto gs = vp->smPickedGroups(id); gs.insert(g); int n = 0; for (size_t f = 0; f < a.size(); f++) if (a[f] && gs.count(BB->faceGroup[f])) n++;
-        int out = 0; for (int f = 0; f < BB->faceCount(); f++) if (gs.count(BB->faceGroup[size_t(f)]) && (size_t(f) >= a.size() || !a[size_t(f)])) out++;
+      { auto a = vp->smArr(id); auto gs = vp->smPickedGroups(id); gs.insert(g); int n = 0;
+        const bool fg = BB->faceGroup.size() == size_t(BB->faceCount());   // (no group per polygon: nothing counted)
+        if (fg) for (size_t f = 0; f < a.size() && f < BB->faceGroup.size(); f++) if (a[f] && gs.count(BB->faceGroup[f])) n++;
+        int out = 0; if (fg) for (int f = 0; f < BB->faceCount(); f++) if (gs.count(BB->faceGroup[size_t(f)]) && (size_t(f) >= a.size() || !a[size_t(f)])) out++;
         act(gs.size() > 1 ? QObject::tr("▣ Mask — add to the snap mask (%1 polygroups)").arg(gs.size()) : QObject::tr("▣ Mask — add to the snap mask"), [vp, id, gs] { vp->smAddGroups(id, gs); }, !out,
             QObject::tr("Its polygons (and the other picked polygroups') into this mesh's snap mask — vertices then snap onto them"));
         act(gs.size() > 1 ? QObject::tr("⌫ Remove from the snap mask (%1 polygroups)").arg(gs.size()) : QObject::tr("⌫ Remove from the snap mask"), [vp, id, gs] { vp->smRemoveGroups(id, gs); }, !n,
@@ -1889,7 +2321,13 @@ void topoMeshProps(QVBoxLayout* v, Viewport* vp, Scene* sc, int id) {
     QObject::connect(mv, &QPushButton::clicked, vp, [vp, id, pickedGroups] { auto gs = pickedGroups(); if (gs.size() != 1) { ui::toast(QObject::tr("Pick exactly one polygroup in the list — the selected polygons go into it")); return; } int g = gs[0]; QTimer::singleShot(0, vp, [vp, id, g] { vp->tgMoveSelHere(id, g); }); });
     QObject::connect(rm, &QPushButton::clicked, vp, [vp, id, pickedGroups] { auto gs = pickedGroups(); if (gs.size() != 1) { ui::toast(QObject::tr("Pick one polygroup in the list")); return; } int g = gs[0]; QTimer::singleShot(0, vp, [vp, id, g] { vp->tgDelete(id, g); }); });
     const auto& ts = vp->topoSel(); mv->setEnabled(ts.id == id && !ts.f.empty()); if (!mv->isEnabled()) mv->setToolTip(mv->toolTip() + QObject::tr(" (select polygons first)"));
-    v->addWidget(hrow({up, dn, du, nw, mv, rm}));
+    // (◉: every polygon of the picked polygroups (a folder's too) selected — as a double click on a row does)
+    auto* sp = glyph("◉", QObject::tr("Select every polygon of the picked polygroups (Ctrl / Shift in the list — several; a folder — all in it). A double click on a row does it too"));
+    QObject::connect(sp, &QPushButton::clicked, vp, [vp, id, tw, underOf] { const PolyMesh* BB = baseOf(*vp->scene()->item(id)); std::set<int> seen; std::vector<int> fs;
+      for (auto* it : tw->selectedItems()) for (int g : underOf(it)) if (seen.insert(g).second) { auto f = topo::groupFaces(*BB, g); fs.insert(fs.end(), f.begin(), f.end()); }
+      if (seen.empty()) { ui::toast(QObject::tr("Pick polygroups in the list first")); return; }
+      QTimer::singleShot(0, vp, [vp, id, fs] { const int k = vp->tSelectFaces(id, fs); ui::hud(QObject::tr("%1 polygons selected").arg(k), 1000); }); });
+    v->addWidget(hrow({up, dn, du, nw, sp, mv, rm}));
     // (every polygroup picked in the list / none — the Ctrl+Shift picks too)
     auto* sa = btn(QObject::tr("Select all")), *sn = btn(QObject::tr("Deselect all"));
     sa->setToolTip(QObject::tr("Every polygroup picked (for the snap mask, Isolate, …)")); sn->setToolTip(QObject::tr("No polygroup picked — in the list or with Ctrl+Shift"));
@@ -1929,17 +2367,19 @@ void topoMeshProps(QVBoxLayout* v, Viewport* vp, Scene* sc, int id) {
   if (mOn) {
     auto* sh = btn(QObject::tr("Show mask"), QObject::tr("Show the mask (green) while its mesh is selected or Snap is on")); sh->setCheckable(true); sh->setChecked(vp->smo.show);
     QObject::connect(sh, &QPushButton::clicked, vp, [vp](bool x) { vp->smo.show = x; vp->saveTopoPrefs(); vp->topoChanged(); });
-    v->addWidget(sh);
-    { auto* mp = btn(QObject::tr("Mirror +X → −X")), *mn = btn(QObject::tr("Mirror −X → +X"));
-      for (auto [b, d] : {std::pair{mp, 1}, std::pair{mn, -1}}) { b->setEnabled(cnt0); b->setToolTip(QObject::tr("The mask of one side copied mirrored onto the other (across the mesh's X = 0); the other side's own mask is replaced")); int dd = d; QObject::connect(b, &QPushButton::clicked, vp, [vp, id, dd] { vp->smMirror(id, dd); }); }
-      v->addWidget(hrow({mp, mn})); }
-    auto* cl = btn(QObject::tr("Clear mask")); cl->setEnabled(cnt0); cl->setToolTip(QObject::tr("Every polygon taken off the mask")); QObject::connect(cl, &QPushButton::clicked, vp, [vp, id] { vp->smClear(id, false); }); v->addWidget(cl);
-    { auto* ga = btn(QObject::tr("+ Selected polygroups")), *gr = btn(QObject::tr("− Selected polygroups"));
-      ga->setToolTip(QObject::tr("The picked polygroups added to the mask (Ctrl+Shift in the Object mode, or in the list)")); gr->setToolTip(QObject::tr("The picked polygroups taken off the mask"));
-      QObject::connect(ga, &QPushButton::clicked, vp, [vp, id] { vp->smGroups(id, true); }); QObject::connect(gr, &QPushButton::clicked, vp, [vp, id] { vp->smGroups(id, false); });
-      v->addWidget(hrow({ga, gr})); }
-    auto* hd = btn(QObject::tr("− Hidden parts")); hd->setEnabled(cnt0); hd->setToolTip(QObject::tr("The hidden parts of the mesh (hidden polygroups, polygons hidden with H) taken off the mask"));
-    QObject::connect(hd, &QPushButton::clicked, vp, [vp, id] { vp->smHiddenOff(id); }); v->addWidget(hd);
+    // (the mask is painted with the brush below; what is done with the whole of it — mirrored, the polygroups added or taken off, the
+    // hidden parts taken off, cleared — is one menu beside Show. The items keep the captions and tips they had as buttons)
+    { QMenu* mm = nullptr; auto* mb = ui::moreButton(QObject::tr("More: the mask mirrored across X, the selected polygroups added or taken off, the hidden parts taken off, the mask cleared"), &mm);
+      const QString mt = QObject::tr("The mask of one side copied mirrored onto the other (across the mesh's X = 0); the other side's own mask is replaced");
+      ui::menuItem(mm, QObject::tr("Mirror +X → −X"), mt, vp, [vp, id] { vp->smMirror(id, 1); })->setEnabled(cnt0);
+      ui::menuItem(mm, QObject::tr("Mirror −X → +X"), mt, vp, [vp, id] { vp->smMirror(id, -1); })->setEnabled(cnt0);
+      mm->addSeparator();
+      ui::menuItem(mm, QObject::tr("+ Selected polygroups"), QObject::tr("The picked polygroups added to the mask (Ctrl+Shift in the Object mode, or in the list)"), vp, [vp, id] { vp->smGroups(id, true); });
+      ui::menuItem(mm, QObject::tr("− Selected polygroups"), QObject::tr("The picked polygroups taken off the mask"), vp, [vp, id] { vp->smGroups(id, false); });
+      ui::menuItem(mm, QObject::tr("− Hidden parts"), QObject::tr("The hidden parts of the mesh (hidden polygroups, polygons hidden with H) taken off the mask"), vp, [vp, id] { vp->smHiddenOff(id); })->setEnabled(cnt0);
+      mm->addSeparator();
+      ui::menuItem(mm, QObject::tr("Clear mask"), QObject::tr("Every polygon taken off the mask"), vp, [vp, id] { vp->smClear(id, false); })->setEnabled(cnt0);
+      v->addWidget(hrow({sh, mb})); }
     if (sc->room == "topo") {                                    // (the brush's settings, then the brush)
       v->addWidget(muted(QObject::tr("Mask brush")));
       { auto* bm = btn(QObject::tr("Brush")), *lm = btn(QObject::tr("Lasso"));   // (what a drag of the mask brush does)
@@ -1964,31 +2404,31 @@ void topoMeshProps(QVBoxLayout* v, Viewport* vp, Scene* sc, int id) {
   // ---- display: wire, textures (double click — their manager), the material (double click — its settings); smooth
   // shading, flat shading, the silhouette ----
   if (foldSec(v, vp, "disp", QObject::tr("Display"))) {
+    const std::vector<int> D = meshTargets(vp, id);   // (every selected mesh, when this one is among them)
 
-    const bool wireless = meshmods::wireless(*m), wireOn = !wireless && m->raw.value("twire").toBool(false), hasUV = looks::hasUV(*m);
+    const bool wireOn = (m->raw.contains("twire") ? m->raw.value("twire").toBool(false) : (!m->raw.value("tref").toBool() && (!baseOf(*m) || baseOf(*m)->faceCount() < 300000))), hasUV = looks::hasUV(*m);
     const bool texOn = hasUV && looks::lookOf(*m).value("tex").toBool(), matOn = m->raw.value("mat").isObject() && !m->raw.value("matOff").toBool();
-    { auto* tr = new SliderRow(QObject::tr("Transparency"), 0, 0.9, 0.05, 1 - std::clamp(m->raw.value("meshOp").toDouble(1.0), 0.1, 1.0), [](double x) { return QString::number(int(std::lround(x * 100))) + "%"; });   // (the high-poly seen through while the retopology is built — never all the way)
-      tr->setTip(QObject::tr("See through this mesh (the Topology room) — up to 90%, so it never disappears")); tr->setReset(0);
-      QObject::connect(tr, &SliderRow::changed, vp, [vp, id](double x) { if (Item* it = vp->scene()->item(id)) { if (x < 0.005) it->raw.remove("meshOp"); else it->raw.insert("meshOp", 1 - std::clamp(x, 0.0, 0.9)); } vp->requestUpdate(); });
+    { auto* tr = new SliderRow(QObject::tr("Transparency"), 0, (wireOn || vp->showWire) ? 1.0 : 0.9, 0.05, 1 - std::clamp(m->raw.value("meshOp").toDouble(1.0), (wireOn || vp->showWire) ? 0.0 : 0.1, 1.0), [](double x) { return QString::number(int(std::lround(x * 100))) + "%"; });   // (the high-poly seen through while the retopology is built — never all the way)
+      tr->setTip(QObject::tr("See through this mesh (the Topology room) — up to 90%, so it never disappears; with its wireframe on — all the way: only the wire stays")); tr->setReset(0);
+      QObject::connect(tr, &SliderRow::changed, vp, [vp, D](double x) { for (int t : D) if (Item* it = vp->scene()->item(t)) { if (x < 0.005) it->raw.remove("meshOp"); else it->raw.insert("meshOp", 1 - std::clamp(x, 0.0, 1.0)); } vp->requestUpdate(); });
       QObject::connect(tr, &SliderRow::released, vp, [vp](double) { vp->runEdit([](Scene&, Selection&, const CurveCache&) { return QString(); }, false); });
       v->addWidget(tr); }
-    auto* wb = picBtn(ui::icon("disp_wire"), wireless ? QObject::tr("Wireframe — too many polygons to draw it") : QObject::tr("Wireframe: the mesh's edges over it (👁 Display → Wire switches all of them)"), wireOn);
-    wb->setEnabled(!wireless);
-    QObject::connect(wb, &QPushButton::clicked, vp, [vp, id, wireOn] { rawEdit(vp, id, [wireOn](QJsonObject& r) { if (!wireOn) r.insert("twire", true); else r.remove("twire"); }); });
+    auto* wb = picBtn(ui::icon("disp_wire"), QObject::tr("Wireframe: the mesh's edges over it (👁 Display → Wire switches all of them)"), wireOn);
+    QObject::connect(wb, &QPushButton::clicked, vp, [vp, D, wireOn] { rawEditAll(vp, D, [wireOn](QJsonObject& r) { r.insert("twire", !wireOn); }); });   // (its own switch either way: on by default)
     auto* tb = picBtn(ui::icon("disp_tex"), hasUV ? QObject::tr("Textures: the mesh's texture maps — double click or RMB: the textures' manager (colour / opacity maps of every material, the folder)")
                                                   : QObject::tr("Textures — no UVs in the file, no textures"), texOn);
     tb->setEnabled(hasUV);
-    QObject::connect(tb, &QPushButton::clicked, vp, [vp, id, texOn] { lookChanged(vp, {id}, [on = !texOn](QJsonObject& L) { L.insert("tex", on); }); vp->topoDisplayChanged(); });
+    QObject::connect(tb, &QPushButton::clicked, vp, [vp, D, texOn] { lookChanged(vp, D, [on = !texOn](QJsonObject& L) { L.insert("tex", on); }); vp->topoDisplayChanged(); });
     tb->dblKey = QString("tex:%1").arg(id);
     // (the windows opened from the main window, found when asked: the panel is not in it yet as it is made — and is made
     // again by the first click)
     auto mainWin = [] { for (QWidget* w : QApplication::topLevelWidgets()) if (qobject_cast<QMainWindow*>(w)) return w; return static_cast<QWidget*>(nullptr); };
-    tb->dbl = [vp, sc, id, mainWin] { lookChanged(vp, {id}, [](QJsonObject& L) { L.insert("tex", true); }); vp->topoDisplayChanged(); openTexWindow(mainWin(), vp, sc, id); };
+    tb->dbl = [vp, sc, id, D, mainWin] { lookChanged(vp, D, [](QJsonObject& L) { L.insert("tex", true); }); vp->topoDisplayChanged(); openTexWindow(mainWin(), vp, sc, id); };
     auto* mb = picBtn(ui::icon("disp_mat"), QObject::tr("Custom material: a preset tuned here instead of the plain grey — double click or RMB: its settings (preset, colour, roughness, metal, specular)"), matOn);
-    auto matSet = [vp, id](bool on) { rawEdit(vp, id, [on](QJsonObject& r) {
+    auto matSet = [vp, D](bool on) { rawEditAll(vp, D, [on](QJsonObject& r) {
       if (!on) { r.insert("matOff", true); return; }               // (switched off: its settings kept)
       r.remove("matOff"); if (r.value("mat").isObject()) return;
-      QString k = r.value("matPreset").toString(); const MatP* p = &MATS[0];   // (first on: Sculpt clay) for (const MatP& x : MATS) if (k == x.name) p = &x;
+      QString k = r.value("matPreset").toString(); const MatP* p = &MATS[0];   /* (first on: Sculpt clay) */ for (const MatP& x : MATS) if (k == x.name) p = &x;
       r.insert("matPreset", p->name); r.insert("mat", matOf(*p)); }); };
     QObject::connect(mb, &QPushButton::clicked, vp, [matSet, matOn] { matSet(!matOn); });
     mb->dblKey = QString("mat:%1").arg(id);
@@ -2000,13 +2440,13 @@ void topoMeshProps(QVBoxLayout* v, Viewport* vp, Scene* sc, int id) {
     auto* sb = picBtn(ui::icon("disp_smooth"), QObject::tr("Smooth shading: the normals averaged at the vertices (only how it looks)"), smooth && !unlit);
     auto* fb = picBtn(ui::icon("disp_flat"), QObject::tr("Flat shading: every polygon flat (only how it looks)"), !smooth && !unlit);
     auto* xb = picBtn(ui::icon("disp_silhouette"), QObject::tr("Flat: the silhouette — its colour, no light: the shape's outline only"), unlit);
-    QObject::connect(sb, &QPushButton::clicked, vp, [vp, id] { rawEdit(vp, id, [](QJsonObject& r) { r.insert("smoothN", true); r.remove("unlit"); }); });
-    QObject::connect(fb, &QPushButton::clicked, vp, [vp, id] { rawEdit(vp, id, [](QJsonObject& r) { r.insert("smoothN", false); r.remove("unlit"); }); });
-    QObject::connect(xb, &QPushButton::clicked, vp, [vp, id] { rawEdit(vp, id, [](QJsonObject& r) { r.insert("unlit", true); }); });
+    QObject::connect(sb, &QPushButton::clicked, vp, [vp, D] { rawEditAll(vp, D, [](QJsonObject& r) { r.insert("smoothN", true); r.remove("unlit"); }); });
+    QObject::connect(fb, &QPushButton::clicked, vp, [vp, D] { rawEditAll(vp, D, [](QJsonObject& r) { r.insert("smoothN", false); r.remove("unlit"); }); });
+    QObject::connect(xb, &QPushButton::clicked, vp, [vp, D] { rawEditAll(vp, D, [](QJsonObject& r) { r.insert("unlit", true); }); });
     v->addWidget(hrow({sb, fb, xb}));
     const bool pg = m->raw.value("pgView").toBool();
     auto* pb = picBtn(ui::icon("disp_pgview"), QObject::tr("Polygroups: each polygroup in its own colour (only how it looks)"), pg);
-    QObject::connect(pb, &QPushButton::clicked, vp, [vp, id, pg] { rawEdit(vp, id, [pg](QJsonObject& r) { if (pg) r.remove("pgView"); else r.insert("pgView", true); }); vp->topoDisplayChanged(); });
+    QObject::connect(pb, &QPushButton::clicked, vp, [vp, D, pg] { rawEditAll(vp, D, [pg](QJsonObject& r) { if (pg) r.remove("pgView"); else r.insert("pgView", true); }); vp->topoDisplayChanged(); });
     // (the UV checker / stretch on the object — in every mode)
     auto* c3 = picBtn(ui::icon("display_uvchecker"), QObject::tr("UV Checker on the object: the labelled checker by its UV on the selected mesh — in every mode (the UV Editor has its own)"), vp->uvo.c3d);
     QObject::connect(c3, &QPushButton::clicked, vp, [vp] { vp->uvo.c3d = !vp->uvo.c3d; vp->saveUvPrefs(); vp->uvChanged(); emit vp->topoState(); });
@@ -2014,13 +2454,12 @@ void topoMeshProps(QVBoxLayout* v, Viewport* vp, Scene* sc, int id) {
     QObject::connect(s3, &QPushButton::clicked, vp, [vp] { vp->uvo.s3d = !vp->uvo.s3d; vp->saveUvPrefs(); vp->uvChanged(); emit vp->topoState(); });
     v->addWidget(hrow({pb, c3, s3}));
   }
-  // ---- the head ----
-  { auto* hb = picBtn(ui::icon("mesh_head"), QObject::tr("Mark this mesh as the head"), m->headTag, 53);
-    QObject::connect(hb, &QPushButton::clicked, vp, [vp, id, on = !m->headTag] { rawEdit(vp, id, [on](QJsonObject& r) { r.insert("headTag", on); }); vp->refreshSceneBox(); vp->sceneChanged(false); });
-    auto* l = new QLabel(m->headTag ? QObject::tr("<b>The head</b> — this mesh is a part of the Head: in the Hair room the hair is built over it (the brush, the curves and the walls keep off it)")
-                                    : QObject::tr("<b>Head</b> — mark this mesh as the head: in the Hair room every mesh marked so is the Head the hair is built over"));
-    l->setWordWrap(true); l->setTextFormat(Qt::RichText); l->setStyleSheet("color:#9a9a9a;font-size:11px");
-    auto* w = new QWidget; auto* h = new QHBoxLayout(w); h->setContentsMargins(0, 10, 0, 2); h->setSpacing(8); h->addWidget(hb, 0, Qt::AlignTop); h->addWidget(l, 1); v->addWidget(w); }
+  // ---- the Hair room: a copy of this mesh into Head Collision ----
+  if (vp->room() == "hair") {
+    auto* cb = btn(QObject::tr("Create collision object"), QObject::tr("A plain copy of this mesh into Head Collision — the drawn curves lie on it and keep off it; the mesh itself stays as it is"));
+    cb->setIcon(ui::icon("collision")); cb->setIconSize(QSize(20, 20));
+    QObject::connect(cb, &QPushButton::clicked, vp, [vp, id] { QTimer::singleShot(0, vp, [vp, id] { vp->collCreateFrom(id); }); });
+    v->addWidget(cb); }
   // ---- selection sets: polygons, edges, vertices — the pointer on one lights it, a click picks it (Shift adds, Ctrl
   // takes off), RMB deletes it; made with Shift+RMB → Selection Set ----
   if (foldSec(v, vp, "selsets", QObject::tr("Selection sets"))) {
@@ -2054,55 +2493,13 @@ void topoMeshProps(QVBoxLayout* v, Viewport* vp, Scene* sc, int id) {
   if (foldSec(v, vp, "clean", QObject::tr("Clean-up"))) {
     auto* cb = btn(QObject::tr("🧹 Clean the geometry"), QObject::tr("Make the mesh manifold, as the Hair room's conversion now leaves it: an edge of three polygons or more split into pairs that carry on into each other, a vertex where parts only touch split, doubled polygons out — nothing else changes. All the selected meshes"));
     QObject::connect(cb, &QPushButton::clicked, vp, [vp, id] { std::vector<int> ms = vp->selection().items; if (std::find(ms.begin(), ms.end(), id) == ms.end()) ms.push_back(id);
-      vp->runEdit([ms](Scene& s, Selection&, const CurveCache&) { int fixed = 0, changes = 0;
+      vp->runEdit([vp, ms](Scene& s, Selection&, const CurveCache&) { int fixed = 0, changes = 0;
         for (int m : ms) { Item* x = s.item(m); if (!x || !x->poly || (x->type != ItemType::IMesh && x->type != ItemType::Mesh)) continue; auto src = x->base ? x->base : x->poly; auto p = std::make_shared<PolyMesh>(*src); const int n = tedit::makeManifold(*p); if (!n) continue;
+          if (x->type == ItemType::IMesh) { vp->topoWrite(m, p); fixed++; changes += n; continue; }   // (as every geometry edit of the room: a live source saved with the project, the per-polygon data and the caches following)
           const bool sameShown = x->poly == src; if (x->base) x->base = p; if (sameShown || !x->base) x->poly = p; fixed++; changes += n; }
         return fixed ? QObject::tr("Clean geometry: %1 mesh%2 made manifold (%3 changes)").arg(fixed).arg(fixed == 1 ? "" : "es").arg(changes) : QObject::tr("Clean geometry: already manifold — nothing to clean"); }); });
     v->addWidget(cb);
   }
-  // ---- the Hair room: the collision — what the drawn curves lie on and keep off ----
-  if (vp->room() == "hair") { const bool open = foldSec(v, vp, "coll", QObject::tr("Collision"), true, "collision"); vp->showColl = open;
-    if (open) { const Item* cm = sc->item(id); const QJsonObject co = cm->raw.value("coll").toObject(); const bool head = cm->headTag, on = cm->raw.value("collide").toBool();
-      if (head) v->addWidget(muted(QObject::tr("The head: drawn curves always lie on it while it is shown")));
-      else { auto* cb = new QCheckBox(QObject::tr("⛨ Collision on")); cb->setChecked(on); cb->setToolTip(QObject::tr("Drawn curves stick to this mesh like to the head and go round it — even while it is hidden (⛨ in the outliner)"));
-        QObject::connect(cb, &QCheckBox::toggled, vp, [vp, id](bool x) { rawEdit(vp, id, [x](QJsonObject& r) { r.insert("collide", x); }); }); v->addWidget(cb); }
-      auto setC = [vp, id](const QString& k, const QJsonValue& x) { rawEdit(vp, id, [k, x](QJsonObject& r) { QJsonObject c = r.value("coll").toObject(); c.insert(k, x); r.insert("coll", c); }); };
-      auto* ty = new QComboBox; ty->addItem(QObject::tr("Its geometry, lifted"), "offset"); ty->addItem(QObject::tr("A capsule round it"), "capsule"); ty->addItem(QObject::tr("Another mesh"), "custom");
-      ty->setCurrentIndex(std::max(0, ty->findData(Viewport::collType(*cm))));
-      ty->setToolTip(QObject::tr("The shape the curves lie on: the mesh itself (a copy lifted by the distance below), a capsule round all of it (simple, smooth — shown in orange), or another mesh standing for it (a low proxy; it may be hidden)"));
-      QObject::connect(ty, &QComboBox::currentIndexChanged, vp, [vp, id, ty, setC](int) { const QString k = ty->currentData().toString(); setC("type", k);
-        if (k == "capsule" && vp->capsuleItem(id) < 0) { vp->makeCapsuleItem(id, true); vp->sceneChanged(true); } });   // (the capsule: a mesh of its own — placed with the gizmo)
-      auto* tr0 = new QWidget; auto* th = new QHBoxLayout(tr0); th->setContentsMargins(0, 0, 0, 0); th->addWidget(new QLabel(QObject::tr("Shape"))); th->addWidget(ty, 1); v->addWidget(tr0);
-      if (Viewport::collType(*cm) == "custom") {
-        auto* mc = new QComboBox; mc->addItem(QObject::tr("— pick a mesh —"), -1);
-        for (auto& [oid, o] : sc->items) if (oid != id && (o.type == ItemType::IMesh || o.type == ItemType::Mesh) && o.poly) mc->addItem(o.name, oid);
-        mc->setCurrentIndex(std::max(0, mc->findData(co.value("mesh").toInt(-1))));
-        QObject::connect(mc, &QComboBox::currentIndexChanged, vp, [mc, setC](int) { setC("mesh", mc->currentData().toInt()); });
-        auto* mr = new QWidget; auto* mh = new QHBoxLayout(mr); mh->setContentsMargins(0, 0, 0, 0); mh->addWidget(new QLabel(QObject::tr("Mesh"))); mh->addWidget(mc, 1); v->addWidget(mr); }
-      auto* d = new QDoubleSpinBox; d->setRange(0, 100); d->setDecimals(1); d->setSingleStep(0.5); d->setSuffix(QObject::tr(" mm")); d->setKeyboardTracking(false); d->setValue(Viewport::collOffset(*cm) * 10);
-      d->setToolTip(QObject::tr("How far off the shape the curves lie (the scene in centimetres: 2 mm — 0.2)"));
-      QObject::connect(d, &QDoubleSpinBox::valueChanged, vp, [setC](double x) { setC("d", x / 10.0); });
-      auto* dr = new QWidget; auto* dh = new QHBoxLayout(dr); dh->setContentsMargins(0, 0, 0, 0); dh->addWidget(new QLabel(QObject::tr("Lift off it"))); dh->addWidget(d, 1); v->addWidget(dr);
-      if (Viewport::collType(*cm) == "capsule") {                  // (the capsule fitted round the mesh, then made thinner / shorter / moved along its axis)
-        auto num = [&](const QString& label, const QString& key, double def, double lo, double hi, double k, int dec, const QString& suffix, const QString& tip) {
-          auto* s = new QDoubleSpinBox; s->setRange(lo, hi); s->setDecimals(dec); s->setSingleStep(dec ? 0.5 : 5); s->setSuffix(suffix); s->setKeyboardTracking(false); s->setToolTip(tip);
-          s->setValue(co.value(key).toDouble(def) * k);
-          QObject::connect(s, &QDoubleSpinBox::valueChanged, vp, [vp, id, setC, key, k](double x) { setC(key, x / k); if (vp->capsuleItem(id) >= 0) { vp->makeCapsuleItem(id, false); vp->sceneChanged(true); } });
-          auto* w = new QWidget; auto* h = new QHBoxLayout(w); h->setContentsMargins(0, 0, 0, 0); h->addWidget(new QLabel(label)); h->addWidget(s, 1); v->addWidget(w); };
-        num(QObject::tr("Radius"), "rs", 100, 2, 300, 1, 0, " %", QObject::tr("The capsule's radius — a share of the fitted one (100 % holds every point of the mesh)"));
-        num(QObject::tr("Cap stretch"), "cs", 100, 2, 400, 1, 0, " %", QObject::tr("How far the round ends reach along the axis — a share of the radius (100 % — half-spheres, less — flatter, more — pointed)"));
-        num(QObject::tr("Width"), "fu", 100, 2, 300, 1, 0, " %", QObject::tr("Squashed or widened across — along the mesh's second spread"));
-        num(QObject::tr("Depth"), "fw", 100, 2, 300, 1, 0, " %", QObject::tr("Squashed or widened across — along its third spread"));
-        num(QObject::tr("Cylinder height"), "hs", 100, 0, 300, 1, 0, " %", QObject::tr("The straight part between the round ends — a share of the fitted one (0 — the ends meet)"));
-        num(QObject::tr("Shift"), "sh", 0, -1000, 1000, 10, 1, QObject::tr(" mm"), QObject::tr("The capsule moved along its own axis"));
-        auto* rs = btn(QObject::tr("↺ Reset the capsule"), QObject::tr("Back to the automatic fit round the head: everything 100 %, no shift, its moves / turns / scale dropped"));
-        QObject::connect(rs, &QPushButton::clicked, vp, [vp, id] { rawEdit(vp, id, [](QJsonObject& r) { QJsonObject c = r.value("coll").toObject(); for (const char* k : {"rs", "ls", "cs", "fu", "fw", "hs", "sh"}) c.remove(k); r.insert("coll", c); });
-          vp->makeCapsuleItem(id, true); vp->sceneChanged(true); });
-        const int cap = vp->capsuleItem(id);
-        auto* sel = btn(cap >= 0 ? QObject::tr("◎ Select the capsule — move / turn / scale it") : QObject::tr("◆ Make the capsule placeable"),
-                        QObject::tr("The capsule is a mesh of its own: select it, then Move (E), Rotate (R), Scale (T) — the curves lie on it where you put it (it is not drawn — its rings in orange)"));
-        QObject::connect(sel, &QPushButton::clicked, vp, [vp, id] { int c = vp->capsuleItem(id); if (c < 0) { c = vp->makeCapsuleItem(id, true); vp->sceneChanged(true); } if (c >= 0) QTimer::singleShot(0, vp, [vp, c] { vp->setSelectedItems({c}); }); });
-        v->addWidget(sel); v->addWidget(rs); } } }
   // ---- the transform: the very last block ----
   v->addWidget(sec(QObject::tr("Transform")));
   { Vec3 c = vp->meshPivotLocal(id); double k = unitK(vp->tunit);
@@ -2122,10 +2519,139 @@ void topoMeshProps(QVBoxLayout* v, Viewport* vp, Scene* sc, int id) {
     auto* rs = btn(QObject::tr("Reset"), QObject::tr("Back to the imported position, rotation and size"));
     QObject::connect(rs, &QPushButton::clicked, vp, [vp, xid] { vp->runEdit([xid](Scene& s, Selection&, const CurveCache&) { Item* xi = s.item(xid); QJsonObject p = xi->raw.value("p").toObject();
       for (const char* k : {"px", "py", "pz", "rx", "ry", "rz"}) p.insert(k, 0); for (const char* k : {"sx", "sy", "sz"}) p.insert(k, 1); xi->raw.insert("p", p); return QString(); }, false); });
-    auto* bk = btn(QObject::tr("Bake"), heavy ? QObject::tr(HEAVY) : QObject::tr("Put the transform into the geometry: the points move where they are shown, the transform goes (one undo step)")); bk->setProperty("primary", true);
-    bk->setEnabled(x->visible && !heavy); QObject::connect(bk, &QPushButton::clicked, vp, [vp, id] { vp->topoBakeXform(id); });
+    auto* bk = btn(QObject::tr("Bake"), QObject::tr("Put the transform into the geometry: the points move where they are shown, the transform goes (one undo step)")); bk->setProperty("primary", true);
+    bk->setEnabled(x->visible); QObject::connect(bk, &QPushButton::clicked, vp, [vp, id] { vp->topoBakeXform(id); });
     v->addWidget(hrow({on, rs, bk}));
   }
+}
+
+// ---- Head Collision (the Hair room) ----
+namespace {
+// a mesh's preview (20.11, the shape tiles): its triangles seen from the front a little from the side and above, the far ones
+// drawn first, shaded by a light from the top left; made at twice the size and scaled down; kept per geometry
+QIcon meshPreview(const PolyMesh& M) {
+  static std::map<std::pair<const PolyMesh*, size_t>, QIcon> cache;
+  const auto key = std::make_pair(&M, M.pos.size() * 1000003u + size_t(M.faceCount()));
+  if (auto f = cache.find(key); f != cache.end()) return f->second;
+  const int S = 136; QImage img(S, S, QImage::Format_ARGB32_Premultiplied); img.fill(Qt::transparent);
+  const Box3 b = M.bounds(); const Vec3 c = b.center(), sz = b.size(); const double big = std::max({sz.x, sz.y, sz.z, 1e-9});
+  const double ya = 0.45, pa = 0.3, cy = std::cos(ya), sy = std::sin(ya), cp = std::cos(pa), sp = std::sin(pa);
+  auto view = [&](const Vec3& p) { const Vec3 q = (p - c) * (1.0 / big); const double x = q.x * cy + q.z * sy, z0 = -q.x * sy + q.z * cy; return Vec3(x, q.y * cp - z0 * sp, q.y * sp + z0 * cp); };
+  std::vector<Vec3> V(M.pos.size()); for (size_t i = 0; i < V.size(); i++) V[i] = view(M.pos[i]);
+  struct Tri { int a, b, c; double z; }; std::vector<Tri> T;
+  const int nf = M.faceCount(); const int step = std::max(1, nf / 40000);   // (a very heavy mesh: every n-th polygon is enough for a picture this small)
+  for (int f = 0; f < nf; f += step) { const int s = M.faceStart[size_t(f)], e = M.faceStart[size_t(f) + 1];
+    for (int k = s + 1; k + 1 < e; k++) { const int a = M.faceVerts[size_t(s)], bb = M.faceVerts[size_t(k)], cc = M.faceVerts[size_t(k + 1)]; T.push_back({a, bb, cc, V[size_t(a)].z + V[size_t(bb)].z + V[size_t(cc)].z}); } }
+  std::sort(T.begin(), T.end(), [](const Tri& x, const Tri& y) { return x.z < y.z; });   // (+z towards the viewer: the far ones first)
+  QPainter g(&img); g.setRenderHint(QPainter::Antialiasing); const double k = S * 0.86, o = S * 0.5;
+  const Vec3 L = Vec3(-0.45, 0.6, 0.66) * (1.0 / Vec3(-0.45, 0.6, 0.66).length());
+  for (const Tri& t : T) {
+    const Vec3 &p = V[size_t(t.a)], &q = V[size_t(t.b)], &r = V[size_t(t.c)]; Vec3 n = (q - p).cross(r - p); const double nl = n.length(); if (nl <= 0) continue; n = n * (1.0 / nl);
+    const double lit = 0.35 + 0.65 * std::abs(n.dot(L)); const int v = int(std::clamp(lit, 0.0, 1.0) * 225);
+    const QColor col(v, v, std::min(255, v + 6)); g.setPen(QPen(col, 0.6)); g.setBrush(col);
+    g.drawPolygon(QPolygonF{QPointF(o + p.x * k, o - p.y * k), QPointF(o + q.x * k, o - q.y * k), QPointF(o + r.x * k, o - r.y * k)});
+  }
+  g.end();
+  const QIcon ic(QPixmap::fromImage(img.scaled(68, 68, Qt::KeepAspectRatio, Qt::SmoothTransformation)));
+  if (cache.size() > 64) cache.clear();
+  return cache[key] = ic;
+}
+
+// the shapes an object may take, as tiles with their pictures (20.11): the primitives, the presets, then a copy of a mesh of the scene
+void addShapes(QMenu* m, Viewport* vp, Scene* sc, const std::function<void(const QString&)>& pick) {
+  auto* box = new QWidget; box->setObjectName("shapeTiles");
+  box->setStyleSheet("#shapeTiles QToolButton{border:1px solid transparent;border-radius:4px;color:#cfcfcf;font-size:10px;padding:2px}"
+                     " #shapeTiles QToolButton:hover{background:#3a3a3a;border-color:#555} #shapeTiles QLabel{color:#8a8a8a;font-size:10px}"
+                     " QScrollArea{border:none;background:transparent} #tileRows{background:transparent}");
+  auto* v = new QVBoxLayout(box); v->setContentsMargins(6, 4, 6, 6); v->setSpacing(2);
+  auto tile = [m, pick](const QIcon& ic, const QString& name, const QString& key) {
+    auto* b = new QToolButton; b->setIcon(ic); b->setIconSize(QSize(52, 52)); b->setText(QFontMetrics(b->font()).elidedText(name, Qt::ElideRight, 70)); b->setToolTip(name);
+    b->setToolButtonStyle(Qt::ToolButtonTextUnderIcon); b->setFixedSize(78, 78); b->setCursor(Qt::PointingHandCursor);
+    QObject::connect(b, &QToolButton::clicked, m, [m, pick, key] { m->close(); pick(key); });
+    return b; };
+  auto section = [&](const QString& title, const std::vector<QToolButton*>& tiles, bool scroll) {
+    if (tiles.empty()) return;
+    auto* t = new QLabel(title); v->addWidget(t);
+    auto* rows = new QWidget; rows->setObjectName("tileRows"); auto* gl = new QGridLayout(rows); gl->setContentsMargins(0, 0, 0, 0); gl->setSpacing(2); gl->setAlignment(Qt::AlignLeft | Qt::AlignTop);
+    for (size_t i = 0; i < tiles.size(); i++) gl->addWidget(tiles[i], int(i / 4), int(i % 4));
+    if (scroll && tiles.size() > 12) { auto* sa = new QScrollArea; sa->setWidget(rows); sa->setWidgetResizable(true); sa->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+      sa->setFixedSize(4 * 80 + 14, 3 * 80 + 2); v->addWidget(sa); }
+    else v->addWidget(rows); };
+  std::vector<QToolButton*> P, R, C;
+  for (const QString& t : prim::types()) P.push_back(tile(primitiveIcon(t), prim::label(t), t));
+  for (const QString& n : coll::presets()) { const PolyMesh pm = coll::presetBuild(n, Vec3(), 1.0, 1.0); R.push_back(tile(meshPreview(pm), coll::presetLabel(n), "preset:" + n)); }
+  std::vector<const Item*> L; for (auto& [oid, o] : sc->items) if ((o.type == ItemType::IMesh || o.type == ItemType::Mesh) && o.poly && !o.headTag) L.push_back(&o);
+  std::sort(L.begin(), L.end(), [](const Item* a, const Item* b) { return a->order < b->order; });
+  for (const Item* o : L) C.push_back(tile(meshPreview(*o->poly), o->name, "mesh:" + QString::number(o->id)));
+  section(QObject::tr("Primitives"), P, false); section(QObject::tr("Presets"), R, false); section(QObject::tr("Copy of a mesh"), C, true);
+  auto* wa = new QWidgetAction(m); wa->setDefaultWidget(box); m->addAction(wa);
+  (void)vp;
+}
+}  // namespace
+
+// (checks: the shape tiles shot)
+void shapeTilesShot(Viewport* vp, Scene* sc, const QString& png) {
+  QMenu m; addShapes(&m, vp, sc, [](const QString&) {}); m.popup(QPoint(200, 200)); for (int i = 0; i < 20; i++) QApplication::processEvents(); m.grab().save(png); m.close();
+}
+
+void collGroupProps(QVBoxLayout* v, Viewport* vp, Scene* sc, int gid) {
+  const Item* g = sc->item(gid); if (!g) return;
+  auto* add = btn(QObject::tr("＋ Add"), QObject::tr("A new collision object: a primitive at the point the camera turns round, or a plain copy of a mesh of the scene"));
+  add->setIcon(ui::icon("collision")); add->setIconSize(QSize(20, 20));
+  QObject::connect(add, &QPushButton::clicked, vp, [vp, sc, add] { QMenu m; addShapes(&m, vp, sc, [vp](const QString& k) { QTimer::singleShot(0, vp, [vp, k] { vp->collAdd(k); }); }); m.exec(add->mapToGlobal(QPoint(0, add->height()))); });
+  v->addWidget(hrow({add}));
+  auto* on = new QCheckBox(QObject::tr("Collision")); on->setChecked(!g->raw.value("collOff").toBool()); on->setFocusPolicy(Qt::NoFocus);
+  on->setToolTip(QObject::tr("On — the drawn curves lie on these objects and keep off them (hidden too); off — they have no effect (⛨ in the outliner)"));
+  QObject::connect(on, &QCheckBox::toggled, vp, [vp, gid](bool x) { rawEdit(vp, gid, [x](QJsonObject& r) { r.insert("collOff", !x); }); });
+  auto* lk = new QCheckBox(QObject::tr("Locked in the viewport")); lk->setChecked(g->raw.value("selLock").toBool(true)); lk->setFocusPolicy(Qt::NoFocus);
+  lk->setToolTip(QObject::tr("Its objects are not picked in the viewport — only in the outliner (🔒 there)"));
+  QObject::connect(lk, &QCheckBox::toggled, vp, [vp, gid](bool x) { rawEdit(vp, gid, [x](QJsonObject& r) { r.insert("selLock", x); }); });
+  v->addWidget(on); v->addWidget(lk);
+  v->addWidget(muted(QObject::tr("%1 object%2").arg(coll::count(*sc)).arg(coll::count(*sc) == 1 ? "" : "s")));
+}
+
+void collObjProps(QVBoxLayout* v, Viewport* vp, Scene* sc, int id) {
+  const Item* m = sc->item(id); const PolyMesh* B = m ? baseOf(*m) : nullptr; if (!B) return;
+  const QJsonObject pr = m->raw.value("prim").toObject(); const QString type = pr.value("type").toString();
+  const int src = m->raw.value("collSrc").toInt(-1); const Item* srcIt = sc->item(src);
+  const QJsonObject pre = m->raw.value("preset").toObject();
+  // ---- its shape: a primitive, a preset or a copy of a mesh ----
+  auto* sh = btn((!type.isEmpty() ? prim::label(type) : !pre.isEmpty() ? coll::presetLabel(pre.value("name").toString()) : srcIt ? srcIt->name : QObject::tr("A copy")) + "  ▾", QObject::tr("The object's shape: another primitive (where this one is, as big) or a plain copy of a mesh of the scene"));
+  QObject::connect(sh, &QPushButton::clicked, vp, [vp, sc, sh, id] { QMenu mm; addShapes(&mm, vp, sc, [vp, id](const QString& k) { QTimer::singleShot(0, vp, [vp, id, k] { vp->collSetShape(id, k); }); }); mm.exec(sh->mapToGlobal(QPoint(0, sh->height()))); });
+  QList<QWidget*> top{sh};
+  if (type.isEmpty() && pre.isEmpty() && srcIt && srcIt->poly) {   // (a copy: taken again from its mesh as it is now)
+    auto* again = btn("⟳", QObject::tr("Copy %1 again — as it is now").arg(srcIt->name)); again->setFixedWidth(34);
+    QObject::connect(again, &QPushButton::clicked, vp, [vp, id, src] { QTimer::singleShot(0, vp, [vp, id, src] { vp->collSetShape(id, "mesh:" + QString::number(src)); }); });
+    top << again; }
+  { auto* w = new QWidget; auto* h = new QHBoxLayout(w); h->setContentsMargins(0, 2, 0, 2); h->setSpacing(4); for (QWidget* x : top) h->addWidget(x); h->addStretch(1); v->addWidget(w); }
+  if (!type.isEmpty()) {                                        // (the primitive's settings: the mesh made again as they change)
+    const QJsonObject pp = pr.value("p").toObject();
+    for (const auto& d : prim::params(type)) {
+      const bool integer = d.integer;
+      auto* r = new SliderRow(QObject::tr(d.label), d.lo, d.hi, d.step, pp.value(d.key).toDouble(d.def), [integer](double x) { return integer ? QString::number(int(std::lround(x))) : QString::number(x, 'f', 2); });
+      const QString key = d.key;
+      QObject::connect(r, &SliderRow::changed, vp, [vp, id, key](double x) { vp->primSet(id, key, x, false); });
+      QObject::connect(r, &SliderRow::released, vp, [vp, id, key](double x) { vp->primSet(id, key, x, true); });
+      v->addWidget(r); }
+  }
+  if (!pre.isEmpty()) {                                         // (a preset: its size — the mesh made again)
+    auto* r = new SliderRow(QObject::tr("Size"), 0.05, 5, 0.01, pre.value("s").toDouble(1), [](double x) { return QString::number(x, 'f', 2); });
+    QObject::connect(r, &SliderRow::changed, vp, [vp, id](double x) { vp->collPresetSet(id, x, false); });
+    QObject::connect(r, &SliderRow::released, vp, [vp, id](double x) { vp->collPresetSet(id, x, true); });
+    v->addWidget(r);
+  }
+  // ---- how far off it the curves lie ----
+  auto* d = new QDoubleSpinBox; d->setRange(0, 100); d->setDecimals(2); d->setSingleStep(0.1); d->setSuffix(QObject::tr(" mm")); d->setKeyboardTracking(false); d->setValue(Viewport::collOffset(*m) * 10);
+  d->setToolTip(QObject::tr("How far off this object the drawn curves lie (the scene in centimetres: 2 mm — 0.2)"));
+  QObject::connect(d, &QDoubleSpinBox::valueChanged, vp, [vp, id](double x) { rawEdit(vp, id, [x](QJsonObject& r) { QJsonObject c = r.value("coll").toObject(); c.insert("d", x / 10.0); r.insert("coll", c); }); });
+  { auto* w = new QWidget; auto* h = new QHBoxLayout(w); h->setContentsMargins(0, 4, 0, 2); auto* l = new QLabel(QObject::tr("Lift off it")); l->setProperty("mut", true); h->addWidget(l); h->addWidget(d, 1); v->addWidget(w); }
+  v->addWidget(muted(QObject::tr("%1 vertices · %2 polygons").arg(B->pos.size()).arg(B->faceCount())));
+  // ---- its place: Move / Rotate / Scale (E / R / T) write a Transform; Reset — back ----
+  int xid = -1; for (int x : meshmods::modsOf(*sc, id)) if (sc->item(x)->raw.value("kind").toString() == "xform") xid = x;
+  if (xid >= 0) { auto* rs = btn(QObject::tr("↺ Reset the place"), QObject::tr("Its moves, turns and scale dropped — back where it was made"));
+    QObject::connect(rs, &QPushButton::clicked, vp, [vp, xid] { vp->runEdit([xid](Scene& s, Selection&, const CurveCache&) { Item* xi = s.item(xid); if (!xi) return QString("!"); QJsonObject p = xi->raw.value("p").toObject();
+      for (const char* k : {"px", "py", "pz", "rx", "ry", "rz"}) p.insert(k, 0); for (const char* k : {"sx", "sy", "sz"}) p.insert(k, 1); xi->raw.insert("p", p); return QString(); }, false); });
+    v->addWidget(hrow({rs})); }
 }
 
 }  // namespace hm

@@ -1,4 +1,4 @@
-﻿// The Topology room's selection edits and walks: Detach (the selected polygons a mesh of their own), Split (no longer
+// The Topology room's selection edits and walks: Detach (the selected polygons a mesh of their own), Split (no longer
 // welded to the rest), into a new polygroup, Melt (the edges between polygons gone — the polygons one), Mirror (a
 // mirrored copy in the same polygroup, welded at the middle when asked), Grow / Shrink, the selection mirrored, the
 // selection carried into another mode, H (the selected polygons hidden) / Unhide all; Fill's region and Outline's open
@@ -6,6 +6,7 @@
 #include "scene/MeshMods.h"
 #include "ui/Pie.h"
 #include "view/SceneGeometry.h"
+#include "scene/Uv.h"
 #include "view/Viewport.h"
 #include <QApplication>
 #include <QJsonArray>
@@ -46,17 +47,25 @@ int dissolveVerts(PolyMesh& d, const std::set<int>& cand, const std::set<int>* r
   for (int v : cand) { if (v < 0 || v >= T->n) continue; const int s = T->voff[size_t(v)], t = T->voff[size_t(v) + 1];
     if (t - s == 0) { n++; continue; }                            // (no polygon uses it: the subset drops it)
     if (t - s != 2) continue; bool rim = false; for (int j = s; j < t; j++) if (T->ef1[size_t(T->vE[size_t(j)])] < 0) rim = true;
-    if (!rim || (rimOk && rimOk->count(v))) { drop[size_t(v)] = 1; n++; } }
+    // (on the rim: gone too when the rim runs on nearly straight through it — a melted strip's side left as one side, its
+    //  real corners kept)
+    bool straight = false;
+    if (rim) { const int e0 = T->vE[size_t(s)], e1 = T->vE[size_t(s + 1)]; const int u = T->ea[size_t(e0)] == v ? T->eb[size_t(e0)] : T->ea[size_t(e0)], w = T->ea[size_t(e1)] == v ? T->eb[size_t(e1)] : T->ea[size_t(e1)];
+      const Vec3 d1 = d.pos[size_t(v)] - d.pos[size_t(u)], d2 = d.pos[size_t(w)] - d.pos[size_t(v)]; const double l = d1.length() * d2.length();
+      straight = l > 0 && d1.dot(d2) / l > 0.766; }
+    if (!rim || straight || (rimOk && rimOk->count(v))) { drop[size_t(v)] = 1; n++; } }
   if (!n) return 0;
   const bool uv = d.cornerUV.size() == d.faceVerts.size() && !d.cornerUV.empty(), nrm = d.cornerNormal.size() == d.faceVerts.size() && !d.cornerNormal.empty();
   std::vector<int> fs{0}, fv; std::vector<std::array<float, 2>> cu; decltype(d.cornerNormal) cn;
+  std::vector<char> su(d.setUV.size(), 0); for (size_t q = 0; q < su.size(); q++) su[q] = d.setUV[q].size() == d.faceVerts.size(); decltype(d.setUV) sn(d.setUV.size());   // (the UV Sets' corners: the same ones kept)
   for (int f = 0; f < d.faceCount(); f++) {
     const int s = d.faceStart[size_t(f)], e = d.faceStart[size_t(f) + 1]; int left = 0; for (int k = s; k < e; k++) if (!drop[size_t(d.faceVerts[size_t(k)])]) left++;
     for (int k = s; k < e; k++) { if (left >= 3 && drop[size_t(d.faceVerts[size_t(k)])]) continue;   // (a polygon kept whole if it would fall under three)
-      fv.push_back(d.faceVerts[size_t(k)]); if (uv) cu.push_back(d.cornerUV[size_t(k)]); if (nrm) cn.push_back(d.cornerNormal[size_t(k)]); }
+      fv.push_back(d.faceVerts[size_t(k)]); if (uv) cu.push_back(d.cornerUV[size_t(k)]); if (nrm) cn.push_back(d.cornerNormal[size_t(k)]);
+      for (size_t q = 0; q < su.size(); q++) if (su[q]) sn[q].push_back(d.setUV[q][size_t(k)]); }
     fs.push_back(int(fv.size()));
   }
-  d.faceStart = fs; d.faceVerts = fv; if (uv) d.cornerUV = cu; if (nrm) d.cornerNormal = cn;
+  d.faceStart = fs; d.faceVerts = fv; if (uv) d.cornerUV = cu; if (nrm) d.cornerNormal = cn; for (size_t q = 0; q < su.size(); q++) if (su[q]) d.setUV[q] = std::move(sn[q]);
   d = topo::subset(d, std::vector<char>(static_cast<size_t>(d.faceCount()), 1));   // (the vertices no polygon uses dropped)
   return n;
 }
@@ -79,7 +88,10 @@ void Viewport::setSelTool(const QString& t) {
 // what a click can pick: every shown mesh in the Object mode, only the active one in a component mode
 std::vector<int> Viewport::tPickable() const {
   if (topoMode == "object") return topoMeshes();
-  const int m = topoMesh(); return m >= 0 && !topoHeavy(m) ? std::vector<int>{m} : std::vector<int>{};
+  // (a component mode: every selected mesh can be picked from — a click on another one makes it the active one, the selection of meshes stays)
+  std::vector<int> o; for (int id : sel_.items) if (const Item* x = scene_->item(id); x && x->type == ItemType::IMesh && x->poly && scene_->isVisible(*x) && !x->raw.value("tref").toBool()) o.push_back(id);
+  if (!o.empty()) return o;
+  const int m = topoMesh(); return m >= 0 ? std::vector<int>{m} : std::vector<int>{};
 }
 
 std::vector<int> Viewport::tSelFaces(int m) const {
@@ -92,7 +104,24 @@ std::vector<int> Viewport::tSelFaces(int m) const {
 }
 
 // ---------- Fill, Outline ----------
+bool Viewport::fillHas(const QString& k) const { return tset.fillMode.split('+').contains(k); }
+void Viewport::setFillMode(const QString& k0) {                  // (a mode toggles in the mix; Normal clears it)
+  QStringList cur = tset.fillMode.split('+', Qt::SkipEmptyParts); cur.removeAll("normal"); QString k = k0;
+  if (k0 == "normal") cur.clear(); else if (cur.contains(k0)) cur.removeAll(k0); else cur << k0;
+  static const QStringList order{"shell", "hard", "crease", "group"}; QStringList o; for (const auto& s : order) if (cur.contains(s)) o << s;
+  tset.fillMode = o.isEmpty() ? QString("normal") : o.join('+'); saveTopoPrefs(); thov_ = {}; topoRev_++; emit topoState(); requestUpdate();
+  const int m = topoMesh(); const Item* it = m >= 0 ? scene_->item(m) : nullptr; const PolyMesh* B = it ? baseOf(*it) : nullptr;
+  if (B && fillHas(k) && ((k == "hard" && B->hardEdges.empty()) || (k == "crease" && B->creases.empty()))) ui::toast(k == "hard" ? tr("This mesh has no hard edges — Fill would take the whole piece (the Hard Edges button of Edit marks them)") : tr("This mesh has no creases — Fill would take the whole piece")); }
 std::vector<int> Viewport::fillRegion(int m, int f0, bool inv) const {
+  const Item* it = scene_->item(m); if (!it || f0 < 0) return {};
+  const void* B = baseSp(*it).get(); FillCache& c = fillCache_; const QString hid = it->raw.value("hidF").toString() + "|" + QString::number(it->raw.value("hidGroups").toArray().size());
+  if (c.m == m && c.B == B && c.mode == tset.fillMode && c.ver == tsel_.ver && c.rev == scene_->revision && c.inv == inv && c.key == tKey() && c.hid == hid && size_t(f0) < c.in.size() && c.in[size_t(f0)]) return c.region;
+  std::vector<int> r = fillRegionCalc(m, f0, inv);
+  c.m = m; c.B = B; c.mode = tset.fillMode; c.ver = tsel_.ver; c.rev = scene_->revision; c.inv = inv; c.key = tKey(); c.hid = hid;
+  int nf = 0; for (int f : r) nf = std::max(nf, f + 1); c.in.assign(size_t(std::max(nf, f0 + 1)), 0); for (int f : r) c.in[size_t(f)] = 1; c.region = r;
+  return r;
+}
+std::vector<int> Viewport::fillRegionCalc(int m, int f0, bool inv) const {
   const Item* it = scene_->item(m); if (!it || f0 < 0) return {};
   auto B = baseSp(*it); auto T = topo::ttopo(B); if (f0 >= T->nf) return {};
   const std::vector<char> hid = meshmods::hiddenFaces(*it, *B);
@@ -112,6 +141,12 @@ std::vector<int> Viewport::fillRegion(int m, int f0, bool inv) const {
     else if (key == 'e') for (int e : tsel_.e) { if (e < T->ne) blockE[size_t(e)] = 1; }
     else for (int e = 0; e < T->ne; e++) if (tsel_.v.count(T->ea[size_t(e)]) && tsel_.v.count(T->eb[size_t(e)])) blockE[size_t(e)] = 1;
   }
+  // the Fill modes: what else the region stops at — UV seams (a UV shell), hard edges, creases, or another polygroup
+  const QString fm = tset.fillMode;                                // (the modes mix: "shell+hard+group" — the region stops at any of them)
+  if (fillHas("shell")) { const auto sf = uv::seamFlags(*B, *T); for (int e = 0; e < T->ne; e++) if (sf[size_t(e)]) blockE[size_t(e)] = 1; }
+  if (fillHas("hard")) for (const auto& he : B->hardEdges) { const int e = T->edgeOf(he[0], he[1]); if (e >= 0) blockE[size_t(e)] = 1; }
+  if (fillHas("crease")) for (const auto& c : B->creases) if (c.w > 0) { const int e = T->edgeOf(c.a, c.b); if (e >= 0) blockE[size_t(e)] = 1; }
+  if (fillHas("group") && int(B->faceGroup.size()) == T->nf) { const int g0 = B->faceGroup[size_t(f0)]; for (int f = 0; f < T->nf; f++) if (B->faceGroup[size_t(f)] != g0) blockF[size_t(f)] = 1; }
   if (blockF[size_t(f0)] || (!hid.empty() && hid[size_t(f0)])) return {};
   std::vector<char> seen(size_t(T->nf), 0); std::vector<int> out, st{f0}; seen[size_t(f0)] = 1;
   while (!st.empty()) {
@@ -120,17 +155,11 @@ std::vector<int> Viewport::fillRegion(int m, int f0, bool inv) const {
       int g = T->ef0[size_t(e)] == f ? T->ef1[size_t(e)] : T->ef0[size_t(e)];
       if (g < 0 || seen[size_t(g)] || blockF[size_t(g)] || (!hid.empty() && hid[size_t(g)])) continue; seen[size_t(g)] = 1; st.push_back(g); }
   }
-  return out;
-}
-std::vector<int> Viewport::rimLoop(int m, int e0) const {
-  const Item* it = scene_->item(m); if (!it || e0 < 0) return {};
-  auto T = topo::ttopo(baseSp(*it)); if (e0 >= T->ne || T->ef1[size_t(e0)] >= 0) return {};
-  std::vector<char> seen(size_t(T->ne), 0); std::vector<int> out, st{e0}; seen[size_t(e0)] = 1;
-  while (!st.empty()) {
-    int e = st.back(); st.pop_back(); out.push_back(e);
-    for (int v : {T->ea[size_t(e)], T->eb[size_t(e)]}) for (int i = T->voff[size_t(v)]; i < T->voff[size_t(v) + 1]; i++) { int x = T->vE[size_t(i)];
-      if (T->ef1[size_t(x)] < 0 && !seen[size_t(x)]) { seen[size_t(x)] = 1; st.push_back(x); } }
-  }
+  for (int pass = 0; pass < 4; pass++) { bool ch = false;       // (a polygon the region went round — all its neighbours in it, but closed off by seams / hard edges: a hole of one, taken in)
+    for (int f = 0; f < T->nf; f++) { if (seen[size_t(f)] || blockF[size_t(f)] || (!hid.empty() && hid[size_t(f)])) continue; int nb = 0; bool all = true;
+      for (int k = T->fo[size_t(f)]; k < T->fo[size_t(f) + 1] && all; k++) { const int e = T->ce[size_t(k)], g = T->ef0[size_t(e)] == f ? T->ef1[size_t(e)] : T->ef0[size_t(e)]; if (g < 0) continue; nb++; if (!seen[size_t(g)]) all = false; }
+      if (all && nb >= 3) { seen[size_t(f)] = 1; out.push_back(f); ch = true; } }
+    if (!ch) break; }
   return out;
 }
 std::vector<int> Viewport::rimAll(int m) const {
@@ -149,7 +178,7 @@ int Viewport::rimEdgeNear(int m, const QPointF& mp, double px) const {
 }
 bool Viewport::topoClickTool(const QPointF& mp, bool shift, bool ctrl) {
   if (tset.selTool == "hard") {                                  // Hard edges: the lit line picked (Shift — added, Ctrl — taken off)
-    int am = topoMesh(); if (am < 0) if (auto r = tPick(mp, topoMeshes())) am = r->m; if (am < 0 || topoHeavy(am)) return true;
+    int am = topoMesh(); if (am < 0) if (auto r = tPick(mp, topoMeshes())) am = r->m; if (am < 0) return true;
     const int e = hardEdgeNear(am, mp); if (e < 0) { ui::hud(tr("Point at a hard edge — its line is picked"), 1000); return true; }
     if (sel_.items.size() != 1 || sel_.items[0] != am) { sel_ = {}; sel_.items = {am}; onSelChange(); }
     if (topoMode != "edge") setTopoMode("edge", true);
@@ -159,7 +188,7 @@ bool Viewport::topoClickTool(const QPointF& mp, bool shift, bool ctrl) {
   auto r = tPick(mp, tPickable());
   if (!r && tset.selTool == "outline") { const int am = topoMesh(); if (int e = am >= 0 ? rimEdgeNear(am, mp) : -1; e >= 0) { TopoPick p; p.m = am; p.e = e; r = p; } }   // (Outline just off the border: its nearest edge)
   if (!r) return true;
-  const int m = r->m; if (topoHeavy(m)) { ui::toast(tr("A high-poly mesh — Object mode only")); return true; }
+  const int m = r->m; 
   if (sel_.items.size() != 1 || sel_.items[0] != m) { sel_ = {}; sel_.items = {m}; onSelChange(); }
   const QString op = ctrl ? "remove" : shift ? "add" : "set";
   if (tset.selTool == "loop" || tset.selTool == "ring") {      // Loop / Ring: what was lit yellow
@@ -179,6 +208,7 @@ bool Viewport::topoClickTool(const QPointF& mp, bool shift, bool ctrl) {
   if (tset.selTool == "fill") {
     auto reg = fillRegion(m, r->f); if (reg.empty()) { ui::hud(tr("On the frame itself — click inside or outside it (Ctrl — the selected piece taken off)"), 1200); return true; }
     if (topoMode != "poly") setTopoMode("poly", true);              // (an edge / vertex frame: the region as polygons)
+    if (tset.fillMode != "normal" && tset.fillMode != "group") { auto Tn = topo::ttopo(baseSp(*scene_->item(m))); if (Tn && int(reg.size()) >= Tn->nf) ui::toast(tr("The region reached the whole mesh — the chosen borders (UV seams / hard edges / creases) do not close round the place you clicked")); }
     tselApply(m, reg, op, 'f'); ui::hud(tr("Region: %1 polygon%2").arg(reg.size()).arg(reg.size() == 1 ? "" : "s"), 1200);
     thov_ = {}; return true;
   }
@@ -203,18 +233,23 @@ void Viewport::tPaintAt(const QPointF& mp, const QString& mode) {
     if (!has) { sel_.items.push_back(r->m); onSelChange(); }
     return;
   }
-  const int m = topoMesh(); if (m < 0) return;
+  const int m0 = topoMesh(); if (m0 < 0) return;
+  const QString md = mode;                                       // (mode is td_.mode: the first dab changes it)
+  for (int m : tselTargets()) {
   auto list = tAreaPick(m, mp.x() - R, mp.y() - R, mp.x() + R, mp.y() + R, tKey(), [mp, R](double x, double y) { return std::hypot(x - mp.x(), y - mp.y()) <= R; });
   if (auto r = tPick(mp, {m})) { const char key = tKey(); const int el = key == 'f' ? r->f : key == 'e' ? r->e : r->v;   // (the element under the pointer always: a big polygon's middle may lie outside the circle)
     if (el >= 0 && std::find(list.begin(), list.end(), el) == list.end()) list.push_back(el); }
-  if (mode == "set") { tselApply(m, list, "set"); td_.mode = "add"; return; }   // (the first dab replaces, the rest add)
-  if (!list.empty()) tselApply(m, list, mode);
+  if (md == "set") { tselApply(m, list, "set"); td_.mode = "add"; continue; }   // (the first dab replaces, the rest add)
+  if (!list.empty()) tselApply(m, list, md);
+  }
+  tselActivate(m0);
 }
 
 // ---------- the edits ----------
 QString Viewport::tDetachSel() {
+  if (!eachBusy_ && tselMeshes().size() > 1) return tEachMesh([&] { return tDetachSel(); });
   const int m = topoMesh(); Item* it = m >= 0 ? scene_->item(m) : nullptr; if (!it) TOPO_NO(tr("Select a mesh"));
-  if (topoHeavy(m)) TOPO_NO(tr("A high-poly mesh — Object mode only"));
+  
   auto fs = tSelFaces(m); const PolyMesh d = *baseOf(*it);
   if (fs.empty()) TOPO_NO(tr("Select polygons first (or vertices / edges closing them)"));
   if (int(fs.size()) == d.faceCount()) TOPO_NO(tr("That is the whole mesh"));
@@ -239,8 +274,9 @@ QString Viewport::tDetachSel() {
 }
 
 QString Viewport::tSplitSel() {
+  if (!eachBusy_ && tselMeshes().size() > 1) return tEachMesh([&] { return tSplitSel(); });
   const int m = topoMesh(); Item* it = m >= 0 ? scene_->item(m) : nullptr; if (!it) TOPO_NO(tr("Select a mesh"));
-  if (topoHeavy(m)) TOPO_NO(tr("A high-poly mesh — Object mode only"));
+  
   auto fs = tSelFaces(m); if (fs.empty()) TOPO_NO(tr("Select polygons first (or vertices / edges closing them)"));
   PolyMesh d = *baseOf(*it); auto T = topo::ttopo(baseSp(*it));
   std::vector<char> in(static_cast<size_t>(d.faceCount()), 0); for (int f : fs) in[size_t(f)] = 1;
@@ -250,7 +286,8 @@ QString Viewport::tSplitSel() {
   std::vector<int> copy(d.pos.size(), -1); int n = 0;
   for (size_t v = 0; v < d.pos.size(); v++) if (useIn[v] && useOut[v]) { copy[v] = int(d.pos.size()) + n++; }
   if (!n) TOPO_NO(tr("They are not welded to the rest already"));
-  for (size_t v = 0; v < copy.size(); v++) if (copy[v] >= 0) d.pos.push_back(d.pos[v]);
+  const bool vc = !d.vcol.empty() && d.vcol.size() == d.pos.size();   // (the polypaint: each copy takes its vertex's colour)
+  for (size_t v = 0; v < copy.size(); v++) if (copy[v] >= 0) { d.pos.push_back(d.pos[v]); if (vc) d.vcol.push_back(d.vcol[v]); }
   for (int f : fs) for (int k = d.faceStart[size_t(f)]; k < d.faceStart[size_t(f) + 1]; k++) { int v = d.faceVerts[size_t(k)]; if (copy[size_t(v)] >= 0) d.faceVerts[size_t(k)] = copy[size_t(v)]; }
   topoWrite(m, std::make_shared<PolyMesh>(std::move(d)));
   tsel_.B = baseOf(*scene_->item(m));                              // (the polygons kept their numbers: the selection stays)
@@ -260,6 +297,7 @@ QString Viewport::tSplitSel() {
 // Hard / Soft edges: the shading broken along them (or smooth across again); the file's own normals (if it has them)
 // worked out anew so the export shades the same
 QString Viewport::tHardEdges(bool hard) {
+  if (!eachBusy_ && tselMeshes().size() > 1) return tEachMesh([&] { return tHardEdges(hard); });
   const int m = topoMesh(); Item* it = m >= 0 ? scene_->item(m) : nullptr;
   if (!it || tsel_.id != m || topoMode == "object") TOPO_NO(tr("Select edges, polygons or vertices first"));
   auto T = topo::ttopo(baseSp(*it)); const char key = tKey(); std::set<int> es;
@@ -294,6 +332,7 @@ QString Viewport::tHardEdges(bool hard) {
 }
 
 QString Viewport::tSplitToGroup() {
+  if (!eachBusy_ && tselMeshes().size() > 1) return tEachMesh([&] { return tSplitToGroup(); });
   const int m = topoMesh(); Item* it = m >= 0 ? scene_->item(m) : nullptr; if (!it) TOPO_NO(tr("Select a mesh"));
   auto fs = tSelFaces(m); if (fs.empty()) TOPO_NO(tr("Select polygons first (or vertices / edges closing them)"));
   PolyMesh d = *baseOf(*it); if (int(d.faceGroup.size()) != d.faceCount()) d.faceGroup.assign(size_t(d.faceCount()), 0);
@@ -309,8 +348,9 @@ QString Viewport::tSplitToGroup() {
 }
 
 QString Viewport::tMelt() {
+  if (!eachBusy_ && tselMeshes().size() > 1) return tEachMesh([&] { return tMelt(); });
   const int m = topoMesh(); Item* it = m >= 0 ? scene_->item(m) : nullptr; if (!it || tsel_.id != m) TOPO_NO(tr("Select edges (or polygons: the edges between them) first"));
-  if (topoHeavy(m)) TOPO_NO(tr("A high-poly mesh — Object mode only"));
+  
   const PolyMesh& B = *baseOf(*it); auto T = topo::ttopo(baseSp(*it)); const char key = tKey();
   std::vector<char> melt(size_t(T->ne), 0); int asked = 0;
   std::set<int> midV;                                            // (vertices: those with two edges — only taken out of their sides)
@@ -352,7 +392,7 @@ QString Viewport::tMelt() {
     loops[r] = loop;
   }
   if (loops.empty() && midV.empty()) TOPO_NO(tr("Can't melt there — the polygons would make a ring or a hole (not one polygon)"));
-  PolyMesh d; d.pos = B.pos; d.groupNames = B.groupNames; d.matNames = B.matNames; d.matMaps = B.matMaps; d.matColor = B.matColor; d.matAlpha = B.matAlpha; d.mtllib = B.mtllib; d.flipY = B.flipY;
+  PolyMesh d; d.pos = B.pos; d.vcol = B.vcol; d.groupNames = B.groupNames; d.matNames = B.matNames; d.matMaps = B.matMaps; d.matColor = B.matColor; d.matAlpha = B.matAlpha; d.mtllib = B.mtllib; d.flipY = B.flipY;
   d.hardEdges = B.hardEdges; d.creases = B.creases; d.seams = B.seams;
   const bool fg = int(B.faceGroup.size()) == B.faceCount(), fm = int(B.faceMat.size()) == B.faceCount(); int merged = 0;
   for (int f = 0; f < T->nf; f++) {
@@ -377,9 +417,10 @@ QString Viewport::tMelt() {
 // Del in a component mode: the picked polygons — or the polygons on the picked edges / vertices — deleted, the vertices
 // no polygon uses any more dropped (not the whole mesh)
 QString Viewport::tDeleteSel() {
+  if (!eachBusy_ && tselMeshes().size() > 1) return tEachMesh([&] { return tDeleteSel(); });
   const int m = topoMesh(); Item* it = m >= 0 ? scene_->item(m) : nullptr;
   if (!it || tsel_.id != m || topoMode == "object") TOPO_NO(tr("Select polygons, edges or vertices first"));
-  if (topoHeavy(m)) TOPO_NO(tr("A high-poly mesh — Object mode only"));
+  
   const PolyMesh& B = *baseOf(*it); auto T = topo::ttopo(baseSp(*it)); const char key = tKey();
   std::vector<char> keep(size_t(T->nf), 1); int gone = 0;
   for (int f = 0; f < T->nf; f++) {
@@ -399,7 +440,7 @@ QString Viewport::tDeleteSel() {
 
 QString Viewport::tMirrorGeo() {
   const int m = topoMesh(); Item* it = m >= 0 ? scene_->item(m) : nullptr; if (!it) TOPO_NO(tr("Select a mesh"));
-  if (topoHeavy(m)) TOPO_NO(tr("A high-poly mesh — Object mode only"));
+  
   auto fs = tSelFaces(m); if (fs.empty()) TOPO_NO(tr("Select polygons first (or vertices / edges closing them)"));
   PolyMesh d = *baseOf(*it); const double eps = std::max(1e-9, d.bounds().size().length() * 1e-4);
   std::set<int> used; for (int f : fs) for (int k = d.faceStart[size_t(f)]; k < d.faceStart[size_t(f) + 1]; k++) used.insert(d.faceVerts[size_t(k)]);
@@ -409,7 +450,8 @@ QString Viewport::tMirrorGeo() {
   else if (onPlane) weld = QMessageBox::question(nullptr, tr("Mirror"), tr("The copy meets the original along the middle (X = 0, %1 vert%2). Weld them along that seam?").arg(onPlane).arg(onPlane == 1 ? "ex" : "ices"),
                                             QMessageBox::Yes | QMessageBox::No, QMessageBox::Yes) == QMessageBox::Yes;
   std::map<int, int> mv;                                           // (vertex → its mirror)
-  for (int v : used) { if (weld && std::abs(d.pos[size_t(v)].x) < eps) { mv[v] = v; continue; } const Vec3& p = d.pos[size_t(v)]; mv[v] = int(d.pos.size()); d.pos.push_back({-p.x, p.y, p.z}); }
+  const bool vc = !d.vcol.empty() && d.vcol.size() == d.pos.size(), sets = topo::hasUvSets(d);   // (the polypaint and the UV Sets carried to the copy)
+  for (int v : used) { if (weld && std::abs(d.pos[size_t(v)].x) < eps) { mv[v] = v; continue; } const Vec3 p = d.pos[size_t(v)]; mv[v] = int(d.pos.size()); d.pos.push_back({-p.x, p.y, p.z}); if (vc) d.vcol.push_back(d.vcol[size_t(v)]); }
   const bool uv = d.cornerUV.size() == d.faceVerts.size() && !d.cornerUV.empty(), nrm = d.cornerNormal.size() == d.faceVerts.size() && !d.cornerNormal.empty();
   const bool fg = int(d.faceGroup.size()) == d.faceCount(), fm = int(d.faceMat.size()) == d.faceCount();
   const int nf0 = d.faceCount(); std::vector<int> made;
@@ -421,6 +463,8 @@ QString Viewport::tMirrorGeo() {
     d.addFace(vs.data(), int(vs.size())); made.push_back(d.faceCount() - 1);
     d.cornerUV.insert(d.cornerUV.end(), uvs.begin(), uvs.end()); d.cornerNormal.insert(d.cornerNormal.end(), ns.begin(), ns.end());
     if (fg) d.faceGroup.push_back(g); if (fm) d.faceMat.push_back(mt);
+    if (sets) { const uint32_t fsb = d.faceSets[size_t(f)]; const int8_t fl = d.faceLive[size_t(f)]; d.faceSets.push_back(fsb); d.faceLive.push_back(fl);
+      for (auto& S : d.setUV) { std::vector<std::array<float, 2>> su; for (int k : cs) su.push_back(S[size_t(k)]); S.insert(S.end(), su.begin(), su.end()); } }
   }
   for (auto* L : {&d.hardEdges, &d.seams}) { auto add = *L; for (auto& p : add) if (mv.count(p[0]) && mv.count(p[1])) L->push_back({mv[p[0]], mv[p[1]]}); }
   { auto add = d.creases; for (auto& c : add) if (mv.count(c.a) && mv.count(c.b)) d.creases.push_back({mv[c.a], mv[c.b], c.w}); }
@@ -433,6 +477,7 @@ QString Viewport::tMirrorGeo() {
 
 // ---------- the selection's walks ----------
 QString Viewport::tGrowSel(bool shrink) {
+  if (!eachBusy_ && tselMeshes().size() > 1) return tEachMesh([&] { return tGrowSel(shrink); });
   const int m = topoMesh(); Item* it = m >= 0 ? scene_->item(m) : nullptr; if (!it || tsel_.id != m || topoMode == "object") TOPO_NO(tr("Select something in a component mode first"));
   auto B = baseSp(*it); auto T = topo::ttopo(B); const auto hid = meshmods::hiddenFaces(*it, *B); const char key = tKey();
   auto shownF = [&](int f) { return hid.empty() || !hid[size_t(f)]; };
@@ -461,6 +506,7 @@ QString Viewport::tGrowSel(bool shrink) {
 }
 
 QString Viewport::tMirrorSel(int dir) {
+  if (!eachBusy_ && tselMeshes().size() > 1) return tEachMesh([&] { return tMirrorSel(dir); });
   const int m = topoMesh(); Item* it = m >= 0 ? scene_->item(m) : nullptr; if (!it || tsel_.id != m || topoMode == "object") TOPO_NO(tr("Select something in a component mode first"));
   auto B = baseSp(*it); auto T = topo::ttopo(B); const char key = tKey(); const auto& P = B->pos;
   const auto pairs = symFirstPairs(m, P); const double eps = std::max(1e-9, B->bounds().size().length() * 1e-4);
@@ -489,6 +535,7 @@ QString Viewport::tMirrorSel(int dir) {
 }
 
 QString Viewport::tConvertSel(const QString& mode) {
+  if (!eachBusy_ && tselMeshes().size() > 1) return tEachMesh([&] { return tConvertSel(mode); });
   const int m = topoMesh(); Item* it = m >= 0 ? scene_->item(m) : nullptr;
   if (!it || tsel_.id != m || topoMode == "object" || mode == "object" || mode == topoMode) { setTopoMode(mode); return {}; }
   auto T = topo::ttopo(baseSp(*it)); const char from = tKey(), to = mode == "poly" ? 'f' : mode == "edge" ? 'e' : 'v';
@@ -523,7 +570,8 @@ bool Viewport::tIsolateSel() {
   if (room() != "topo") return false;
   if (tcIso_) {
     TcIso z = *tcIso_; tcIso_.reset();
-    if (Item* it = scene_->item(z.id)) { if (z.hid.isString()) it->raw.insert("hidF", z.hid); else it->raw.remove("hidF"); pickCache_.erase(z.id); }
+    if (Item* it = scene_->item(z.id)) { int nf0 = -1; if (z.hid.isString()) { nf0 = 0; for (const QString& t : z.hid.toString().split('.')) nf0 += t.toInt(nullptr, 36); }   // (the runs add up to the polygon count it was made for)
+      const PolyMesh* B = baseOf(*it); if (z.hid.isString() && B && nf0 == B->faceCount()) it->raw.insert("hidF", z.hid); else it->raw.remove("hidF"); pickCache_.erase(z.id); }   // (polygons added / deleted since: the old mask no longer theirs)
     scene_->iso = z.iso; staticRev_++; topoRev_++; allWalls_ = true; emit sceneEdited(); emit topoState(); requestUpdate(); ui::toast(tr("Everything shown again")); return true;
   }
   if (topoMode == "object") return false;
@@ -536,7 +584,7 @@ bool Viewport::tIsolateSel() {
   it->raw.insert("hidF", topo::smEnc(h)); pickCache_.erase(m);
   Scene::Isolation iso; iso.keep.insert(m); for (int x : meshmods::modsOf(*scene_, m)) iso.keep.insert(x); scene_->iso = iso;
   staticRev_++; topoRev_++; allWalls_ = true; emit sceneEdited(); emit topoState(); requestUpdate();
-  ui::toast(tr("Only the selected shown (%1 polygon%2) — Ctrl+Shift+H again to show everything").arg(fs.size()).arg(fs.size() == 1 ? "" : "s"));
+  ui::toast(tr("Only the selected shown (%1 polygon%2) — Ctrl+X shows everything").arg(fs.size()).arg(fs.size() == 1 ? "" : "s"));
   return true;
 }
 // the visibility layers (the mesh's panel): one shown — its hidden polygons hidden, the polygroups' hiding off
@@ -556,6 +604,7 @@ QString Viewport::visSelect(int m, const QString& hid) {
 }
 
 QString Viewport::tHideSel() {
+  if (!eachBusy_ && tselMeshes().size() > 1) return tEachMesh([&] { return tHideSel(); });
   const int m = topoMesh(); Item* it = m >= 0 ? scene_->item(m) : nullptr; if (!it || tsel_.id != m) TOPO_NO(tr("Select polygons (or edges / vertices) to hide"));
   auto T = topo::ttopo(baseSp(*it)); const std::set<int> fs = tTouchedFaces(m);
   if (fs.empty()) TOPO_NO(tr("Nothing selected to hide"));

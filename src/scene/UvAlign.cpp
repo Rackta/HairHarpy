@@ -97,7 +97,7 @@ int rectify(PolyMesh& m, const topo::TTopo& T, const std::vector<int>& faces, co
 }
 
 // ---------- Straighten a chain ----------
-int straightenChain(PolyMesh& m, const topo::TTopo& T, const std::vector<int>& edges, const PackOpts* po) {
+int straightenChain(PolyMesh& m, const topo::TTopo& T, const std::vector<int>& edges, const PackOpts* po, int sideFace) {
   if (!has(m) || edges.empty()) return 0; const Tex tx = texOf(po); const Points P = points(m, T); const Shells S = shells(m, T, P);
   std::map<int, std::vector<int>> adj; for (int e : edges) if (e >= 0 && e < T.ne) { adj[T.ea[size_t(e)]].push_back(T.eb[size_t(e)]); adj[T.eb[size_t(e)]].push_back(T.ea[size_t(e)]); }
   int start = adj.begin()->first; for (auto& [v, nb] : adj) if (nb.size() == 1) { start = v; break; }
@@ -105,7 +105,7 @@ int straightenChain(PolyMesh& m, const topo::TTopo& T, const std::vector<int>& e
   for (int cur = start; ; ) { int nx = -1; for (int w : adj[cur]) if (!used.count(w)) { nx = w; break; } if (nx < 0) break; chain.push_back(nx); used.insert(nx); cur = nx; }
   if (chain.size() < 3) return 0;
   // (the shell: the first edge's first polygon; each vertex's UV point there)
-  const int e0 = T.edgeOf(chain[0], chain[1]); const int sh = S.of[size_t(T.ef0[size_t(e0)])];
+  const int e0 = T.edgeOf(chain[0], chain[1]); const int sh = S.of[size_t(sideFace >= 0 ? sideFace : T.ef0[size_t(e0)])];
   auto pointAt = [&](int v) { for (int i = T.vfo[size_t(v)]; i < T.vfo[size_t(v) + 1]; i++) { const int f = T.vF[size_t(i)]; if (S.of[size_t(f)] != sh) continue; const int k = cornerAt(T, f, v); if (k >= 0) return P.of[size_t(k)]; } return -1; };
   std::vector<int> pts; for (int v : chain) { const int p = pointAt(v); if (p < 0) return 0; pts.push_back(p); }
   auto uvOf = [&](int p) { const UV& q = m.cornerUV[size_t(P.list[size_t(P.off[size_t(p)])])]; return std::array<double, 2>{q[0] * tx.w, q[1] * tx.h}; };
@@ -117,9 +117,9 @@ int straightenChain(PolyMesh& m, const topo::TTopo& T, const std::vector<int>& e
 }
 
 // ---------- Orient ----------
-double orientByEdge(PolyMesh& m, const topo::TTopo& T, int edge, const PackOpts* po) {
+double orientByEdge(PolyMesh& m, const topo::TTopo& T, int edge, const PackOpts* po, int sideFace) {
   if (!has(m) || edge < 0 || edge >= T.ne) return 0; const Tex tx = texOf(po);
-  const ShellSet ss = shellSet(m, T); const int f = T.ef0[size_t(edge)]; const int ka = cornerAt(T, f, T.ea[size_t(edge)]), kb = cornerAt(T, f, T.eb[size_t(edge)]);
+  const ShellSet ss = shellSet(m, T); const int f = sideFace >= 0 ? sideFace : T.ef0[size_t(edge)]; const int ka = cornerAt(T, f, T.ea[size_t(edge)]), kb = cornerAt(T, f, T.eb[size_t(edge)]);
   const UV &a = m.cornerUV[size_t(ka)], &b = m.cornerUV[size_t(kb)];
   const double ang = std::atan2((double(b[1]) - a[1]) * tx.h, (double(b[0]) - a[0]) * tx.w), target = std::round(ang / (M_PI / 2)) * (M_PI / 2);
   const auto ks = cornersOf(T, ss.faces[size_t(ss.S.of[size_t(f)])]); const auto c = centre(m, ks);
@@ -157,6 +157,42 @@ int stackOnto(PolyMesh& m, const topo::TTopo& T, const std::vector<int>& faces, 
   const Shape R = shape(ref); if (R.p.empty()) return 0;
   auto miss = [&](const std::vector<std::array<double, 2>>& Q) { double d = 0; const size_t step = std::max<size_t>(1, Q.size() / 300);   // (how far its points lie from the reference's)
     for (size_t i = 0; i < Q.size(); i += step) { double b = 1e300; const size_t st2 = std::max<size_t>(1, R.p.size() / 600); for (size_t j = 0; j < R.p.size(); j += st2) b = std::min(b, std::hypot(Q[i][0] - R.p[j][0], Q[i][1] - R.p[j][1])); d += b; } return d; };
+  // the shell brought onto the reference exactly. The same mesh (polygon for polygon): each point on the point it matches. Another mesh: its border on the reference's border, the inside following
+  std::vector<char> cont(size_t(T.ne), 0); for (int e = 0; e < T.ne; e++) cont[size_t(e)] = continuous(m, T, ss.P, e);
+  auto uvOfPt = [&](int p) { const UV& q = m.cornerUV[size_t(ss.P.list[size_t(ss.P.off[size_t(p)])])]; return std::array<double, 2>{q[0] * double(tx.w), q[1] * double(tx.h)}; };
+  auto other = [&](int e, int f) { return T.ef0[size_t(e)] == f ? T.ef1[size_t(e)] : T.ef0[size_t(e)]; };
+  auto deg = [&](int f) { return T.fo[size_t(f) + 1] - T.fo[size_t(f)]; };
+  auto mapFrom = [&](int fS0, int fR0, int o0, int d0, std::unordered_map<int, int>& mp) {
+    mp.clear(); std::unordered_map<int, int> rev, seen; struct St { int fS, fR, o, d; }; std::vector<St> st;
+    auto wr = [](int x, int n) { return ((x % n) + n) % n; };
+    auto take = [&](int fS, int fR, int o, int d) { const int n = deg(fS); for (int i = 0; i < n; i++) { const int pS = ss.P.of[size_t(T.fo[size_t(fS)] + i)], pR = ss.P.of[size_t(T.fo[size_t(fR)] + wr(o + d * i, n))]; auto a = mp.find(pS); if (a != mp.end() && a->second != pR) return false; auto b = rev.find(pR); if (b != rev.end() && b->second != pS) return false; mp[pS] = pR; rev[pR] = pS; } seen[fS] = fR; st.push_back({fS, fR, o, d}); return true; };
+    if (!take(fS0, fR0, o0, d0)) return false;
+    while (!st.empty()) { const St c = st.back(); st.pop_back(); const int n = deg(c.fS);
+      for (int i = 0; i < n; i++) { const int eS = T.ce[size_t(T.fo[size_t(c.fS)] + i)], eR = T.ce[size_t(T.fo[size_t(c.fR)] + (c.d > 0 ? wr(c.o + i, n) : wr(c.o - i - 1, n)))]; if (cont[size_t(eS)] != cont[size_t(eR)]) return false; if (!cont[size_t(eS)]) continue;
+        const int gS = other(eS, c.fS), gR = other(eR, c.fR); if (gS < 0 || gR < 0 || deg(gS) != deg(gR)) return false; if (auto q = seen.find(gS); q != seen.end()) { if (q->second != gR) return false; continue; }
+        const int ng = deg(gS); int pe = -1, qe = -1; for (int j = 0; j < ng; j++) { if (T.ce[size_t(T.fo[size_t(gS)] + j)] == eS) pe = j; if (T.ce[size_t(T.fo[size_t(gR)] + j)] == eR) qe = j; } if (pe < 0 || qe < 0) return false;
+        bool placed = false; for (int d : {1, -1}) { const int o = d > 0 ? wr(qe - pe, ng) : wr(qe + pe + 1, ng); bool fit = true; for (int j : {pe, wr(pe + 1, ng)}) { const auto a = mp.find(ss.P.of[size_t(T.fo[size_t(gS)] + j)]); if (a == mp.end() || a->second != ss.P.of[size_t(T.fo[size_t(gR)] + wr(o + d * j, ng))]) fit = false; } if (fit) { if (!take(gS, gR, o, d)) return false; placed = true; break; } } if (!placed) return false; } }
+    return true; };
+  auto borderLoop = [&](int s, std::vector<int>& L) { std::unordered_map<int, int> nx; for (int f : ss.faces[size_t(s)]) for (int k = T.fo[size_t(f)]; k < T.fo[size_t(f) + 1]; k++) { if (cont[size_t(T.ce[size_t(k)])]) continue; const int nk = k + 1 < T.fo[size_t(f) + 1] ? k + 1 : T.fo[size_t(f)]; if (!nx.emplace(ss.P.of[size_t(k)], ss.P.of[size_t(nk)]).second) return false; }
+    if (nx.size() < 3) return false; L.clear(); const int p0 = nx.begin()->first; int p = p0; do { L.push_back(p); auto g = nx.find(p); if (g == nx.end() || L.size() > nx.size()) return false; p = g->second; } while (p != p0); return L.size() == nx.size(); };   // (one border, once round: a disc)
+  auto conform = [&](int s, const std::vector<int>& ks, const std::vector<std::array<double, 2>>& Q) {
+    const auto& FS = ss.faces[size_t(s)]; const auto& FR = ss.faces[size_t(ref)];
+    std::unordered_map<int, int> mp, bestMp; double bestD = 1e300;
+    if (FS.size() == FR.size() && !FS.empty()) { const int f0 = FS[0], nd = deg(f0);
+      for (int d : {1, -1}) for (int fR : FR) { if (deg(fR) != nd) continue; for (int o = 0; o < nd; o++) { if (!mapFrom(f0, fR, o, d, mp) || mp.size() != [&] { std::set<int> a; for (int k : ks) a.insert(ss.P.of[size_t(k)]); return a.size(); }()) continue;
+        double D = 0; for (size_t i = 0; i < ks.size(); i++) { const auto q = uvOfPt(mp[ss.P.of[size_t(ks[i])]]); D += std::hypot(q[0] - Q[i][0], q[1] - Q[i][1]); } if (D < bestD - 1e-9) { bestD = D; bestMp = mp; } } } }
+    if (!bestMp.empty()) { for (int k : ks) m.cornerUV[size_t(k)] = m.cornerUV[size_t(ss.P.list[size_t(ss.P.off[size_t(bestMp[ss.P.of[size_t(k)]])])])]; return; }
+    std::vector<int> LS, LR; if (!borderLoop(s, LS) || !borderLoop(ref, LR)) return;
+    std::unordered_map<int, std::array<double, 2>> X; for (size_t i = 0; i < ks.size(); i++) X[ss.P.of[size_t(ks[i])]] = Q[i];
+    std::vector<std::array<double, 2>> RP; for (int p : LR) RP.push_back(uvOfPt(p)); std::vector<double> cR{0}; for (size_t i = 0; i < RP.size(); i++) { const auto& a = RP[i]; const auto& b = RP[(i + 1) % RP.size()]; cR.push_back(cR.back() + std::hypot(b[0] - a[0], b[1] - a[1])); }
+    std::vector<double> cS{0}; for (size_t i = 0; i < LS.size(); i++) { const auto& a = X[LS[i]]; const auto& b = X[LS[(i + 1) % LS.size()]]; cS.push_back(cS.back() + std::hypot(b[0] - a[0], b[1] - a[1])); } if (!(cS.back() > 0) || !(cR.back() > 0)) return;
+    auto onR = [&](double t) { t = t - std::floor(t); const double l = t * cR.back(); size_t i = size_t(std::upper_bound(cR.begin(), cR.end(), l) - cR.begin()); i = i == 0 ? 0 : std::min(i - 1, RP.size() - 1); const double seg = cR[i + 1] - cR[i], w = seg > 0 ? (l - cR[i]) / seg : 0; const auto& a = RP[i]; const auto& b = RP[(i + 1) % RP.size()]; return std::array<double, 2>{a[0] + (b[0] - a[0]) * w, a[1] + (b[1] - a[1]) * w}; };
+    double bs = 1e300; std::vector<std::array<double, 2>> bT; if (LS.size() == LR.size()) { const int nb = int(LS.size()); for (int d : {1, -1}) for (int st = 0; st < nb; st++) { std::vector<std::array<double, 2>> Tg; double D = 0; for (int i = 0; i < nb; i++) { const auto& q = RP[size_t(((st + d * i) % nb + nb) % nb)]; const auto& x = X[LS[size_t(i)]]; D += std::hypot(q[0] - x[0], q[1] - x[1]); Tg.push_back(q); } if (D < bs) { bs = D; bT = std::move(Tg); } } }   /* (as many border points: each on a border point of the reference) */
+    else for (int d : {1, -1}) for (int st = 0; st < 256; st++) { std::vector<std::array<double, 2>> Tg; double D = 0; for (size_t i = 0; i < LS.size(); i++) { const auto q = onR(st / 256.0 + d * cS[i] / cS.back()); const auto& x = X[LS[i]]; D += std::hypot(q[0] - x[0], q[1] - x[1]); Tg.push_back(q); } if (D < bs) { bs = D; bT = std::move(Tg); } }
+    std::map<int, std::array<double, 2>> Dp; std::map<int, std::set<int>> adj; for (int f : FS) for (int k = T.fo[size_t(f)]; k < T.fo[size_t(f) + 1]; k++) { const int nk = k + 1 < T.fo[size_t(f) + 1] ? k + 1 : T.fo[size_t(f)]; const int a = ss.P.of[size_t(k)], b = ss.P.of[size_t(nk)]; adj[a].insert(b); adj[b].insert(a); Dp[a] = {0, 0}; }
+    std::set<int> rim(LS.begin(), LS.end()); for (size_t i = 0; i < LS.size(); i++) Dp[LS[i]] = {bT[i][0] - X[LS[i]][0], bT[i][1] - X[LS[i]][1]};
+    for (int it = 0; it < 3000; it++) { double mv = 0; for (auto& [p, dv] : Dp) { if (rim.count(p)) continue; double sx = 0, sy = 0; for (int q : adj[p]) { sx += Dp[q][0]; sy += Dp[q][1]; } const double n2 = double(adj[p].size()), nx = dv[0] + 1.5 * (sx / n2 - dv[0]), ny = dv[1] + 1.5 * (sy / n2 - dv[1]); mv = std::max(mv, std::abs(nx - dv[0]) + std::abs(ny - dv[1])); dv = {nx, ny}; } if (mv < 1e-4) break; }
+    for (int k : ks) { const int p = ss.P.of[size_t(k)]; const auto& x = X[p]; const auto& dv = Dp[p]; m.cornerUV[size_t(k)] = {float((x[0] + dv[0]) / tx.w), float((x[1] + dv[1]) / tx.h)}; } };
   int done = 0;
   for (int s : want) {
     const Shape S = shape(s); if (S.p.empty() || !(std::abs(S.area) > 0)) continue;
@@ -165,8 +201,12 @@ int stackOnto(PolyMesh& m, const topo::TTopo& T, const std::vector<int>& faces, 
     for (bool mir : {false, true}) for (double extra : {0.0, M_PI}) {   // (as it lies or mirrored — a mirror twin — each turned two ways)
       const double ang = R.ang - (mir ? -S.ang : S.ang) + extra, c = std::cos(ang), sn = std::sin(ang); std::vector<std::array<double, 2>> Q;
       for (auto& q : S.p) { double x = (q[0] - S.c[0]) * k, y = (q[1] - S.c[1]) * k; if (mir) x = -x; Q.push_back({R.c[0] + x * c - y * sn, R.c[1] + x * sn + y * c}); }
+      { const double cR = std::cos(R.ang), sR = std::sin(R.ang); auto ext = [&](const std::vector<std::array<double, 2>>& A) { std::array<double, 4> e{1e300, 1e300, -1e300, -1e300}; for (auto& q : A) { const double x = (q[0] - R.c[0]) * cR + (q[1] - R.c[1]) * sR, y = -(q[0] - R.c[0]) * sR + (q[1] - R.c[1]) * cR; e[0] = std::min(e[0], x); e[1] = std::min(e[1], y); e[2] = std::max(e[2], x); e[3] = std::max(e[3], y); } return e; };   // (its box along the reference's own axes brought to the reference's box: the same size, both ways)
+        const auto eQ = ext(Q), eR = ext(R.p); const double wQ = eQ[2] - eQ[0], hQ = eQ[3] - eQ[1];
+        if (wQ > 0 && hQ > 0) for (auto& q : Q) { const double x = (q[0] - R.c[0]) * cR + (q[1] - R.c[1]) * sR, y = -(q[0] - R.c[0]) * sR + (q[1] - R.c[1]) * cR; const double X = eR[0] + (x - eQ[0]) / wQ * (eR[2] - eR[0]), Y = eR[1] + (y - eQ[1]) / hQ * (eR[3] - eR[1]); q = {R.c[0] + X * cR - Y * sR, R.c[1] + X * sR + Y * cR}; } }
       const double d = miss(Q); if (d < best) { best = d; bestQ = std::move(Q); } }
     const auto ks = cornersOf(T, ss.faces[size_t(s)]); for (size_t i = 0; i < ks.size(); i++) m.cornerUV[size_t(ks[i])] = {float(bestQ[i][0] / tx.w), float(bestQ[i][1] / tx.h)};
+    conform(s, ks, bestQ);
     done++;
   }
   return done;

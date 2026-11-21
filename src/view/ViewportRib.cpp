@@ -1,6 +1,5 @@
 // ▬ Flat locks in the viewport: the ribbons kept in step with their curves and settings, the root of a lock started from
-// anchors following them, the Extrude / Offset / Glue brush; and the drawn curve kept off collision meshes (anchors in
-// between, over the mesh).
+// anchors following them, the Extrude / Offset / Glue brush; and collideBetween (unused now: it gets no collision meshes).
 #include "scene/Rib.h"
 #include "ui/Pie.h"
 #include "view/Viewport.h"
@@ -83,10 +82,11 @@ void Viewport::ribConvert(int c) {
   runEdit([c, cd, scale](Scene& s, Selection& sl, const CurveCache& cc) { return rib::convert(s, cc, sl, c, cd, scale); }, true);
 }
 
-// the straight way from the last anchor to a new one crosses a collision mesh: anchors go in between, lifted onto the
-// mesh's outer side (towards the camera)
+// meant for: the straight way from the last anchor to a new one crossing a collision mesh — anchors in between, lifted
+// onto the mesh's outer side (towards the camera). collisionMeshes(false, …) gives no meshes (it asks for none without
+// the head), so this returns nothing and no anchor is put in between
 std::vector<Vec3> Viewport::collideBetween(const Vec3& a, const Vec3& b, int depth) const {
-  std::map<int, double> off; const std::vector<PickMesh> ms = collisionMeshes(false, off);   // (the meshes with ⛨ on — their collision shapes)
+  std::map<int, double> off; const std::vector<PickMesh> ms = collisionMeshes(false, off);   // (empty: see above)
   const double scale = cam_.sceneScale;
   if (ms.empty() || depth > 3) return {};
   Vec3 d = b - a; double L = d.length(); if (L < scale * 1e-3) return {};

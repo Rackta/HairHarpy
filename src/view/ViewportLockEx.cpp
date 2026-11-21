@@ -21,7 +21,7 @@ bool Viewport::lockExBuild() {
     // (the head's side: the middle of the head's vertices near the lock — the scene's middle may be far from the head)
     Vec3 c; int n = 0; Box3 lb; for (int id : st) if (const Item* x = scene_->item(id)) for (int a : x->anchors) { c += scene_->anchor(a)->pos; n++; lb.expand(scene_->anchor(a)->pos); }
     c = c / double(std::max(1, n)); const double R = std::max(1e-6, lb.size().length() * 1.5);
-    Vec3 hc; int hn = 0; for (auto& [id, it] : scene_->items) if ((it.headTag || it.type == ItemType::Head) && it.poly && scene_->isVisible(it)) for (const Vec3& p : it.poly->pos) if (p.distanceTo(c) < R) { hc += p; hn++; }
+    Vec3 hc; int hn = 0; for (auto& [id, it] : scene_->items) if (it.headTag && it.poly) for (const Vec3& p : it.poly->pos) if (p.distanceTo(c) < R) { hc += p; hn++; }
     const Vec3 head = hn ? hc / double(hn) : cam_.sceneCenter;
     auto B = lockex::create(*scene_, hair_.curves, st, head, lx_.P.segs); if (!B.copy.empty()) lx_.built.push_back(std::move(B)); }
   if (lx_.built.empty()) { ui::toast(tr("These locks can't be extruded")); return false; }

@@ -20,12 +20,14 @@
 #include <QMouseEvent>
 #include <QPainter>
 #include <QPushButton>
+#include <QToolButton>
 #include <QRadioButton>
 #include <QRegularExpression>
 #include <QScrollArea>
 #include <QSettings>
 #include <QTimer>
 #include <cmath>
+#include <iterator>
 #include <map>
 #include <QVBoxLayout>
 
@@ -38,20 +40,29 @@ Keymap::Keymap() {
     {"cursor", "Cursor / previous tool", "KeyQ", false, "Tools"},
     {"move", "Move", "KeyE", false, "Tools"}, {"rotate", "Rotate", "KeyR", false, "Tools"}, {"gizmo", "Scale", "KeyT", false, "Tools"},
     {"draw", "Draw curve", "KeyC", false, "Tools"}, {"cut", "Scissors (cut a curve)", "KeyK", false, "Tools"}, {"brush", "Brush", "KeyM", false, "Tools"},
-    {"guide", "Shell modifiers", "KeyG", false, "Tools"}, {"modifier", "Curve modifiers", "KeyA", false, "Tools"}, {"crown", "Crown", "KeyS", false, "Tools"}, {"lockex", "Lock Extrude", "", false, "Tools"}, {"braid", "Braid", "", false, "Tools"},
+    {"guide", "Shell modifiers", "KeyG", false, "Tools"}, {"modifier", "Curve modifiers", "KeyA", false, "Tools"}, {"crown", "Crown", "KeyS", false, "Tools"}, {"lockex", "Lock Extrude", "", false, "Tools"}, {"lockfix", "Lock lines (from the mesh)", "", false, "Tools"}, {"braid", "Braid", "", false, "Tools"},
     {"edge", "Edges (select edges on a mesh)", "KeyV", false, "Tools"},
     {"brushSmaller", "Brush smaller", "BracketLeft", true, "Tools"}, {"brushBigger", "Brush bigger", "BracketRight", true, "Tools"},
-    {"gizmoSpace", "Gizmo: local / world axes", "KeyW", false, "Gizmo"},
-    {"axisX", "Gizmo: lock / unlock the X axis", "KeyX", false, "Gizmo"}, {"axisY", "Gizmo: lock / unlock the Y axis", "KeyY", false, "Gizmo"},
-    {"axisZ", "Gizmo: lock / unlock the Z axis", "KeyZ", false, "Gizmo"},
+    {"brushSofter", "Paint room: brush softer (hardness)", "Shift+BracketLeft", true, "Tools"}, {"brushHarder", "Paint room: brush harder (hardness)", "Shift+BracketRight", true, "Tools"},
+    {"paintWire", "Paint room: the wire over the model on / off", "KeyW", false, "View"}, {"paintUvFull", "Paint room: the texture over the whole viewport / back", "KeyU", false, "View"},
+    {"paintLocate", "Paint room: show the point under the pointer in the other view (model ↔ texture)", "KeyL", false, "View"},
+    {"paintSolo", "Paint room: only the active layer shown while the key is held", "Backslash", false, "View"},
+    {"paintThrough", "Paint room: the brush Through — the walls behind the seen surface too (a tap switches it, held — only while the key is down)", "KeyY", false, "Tools"},
+    {"brushAngleDown", "Paint room: the alpha's angle −15°", "Digit9", true, "Tools"}, {"brushAngleUp", "Paint room: the alpha's angle +15°", "Digit0", true, "Tools"},
+    {"gizmoSpace", "Gizmo: local / world axes", "Shift+KeyW", false, "Gizmo"},
+    {"axisX", "Gizmo: lock / unlock the X axis", "Shift+KeyX", false, "Gizmo"}, {"axisY", "Gizmo: lock / unlock the Y axis", "Shift+KeyY", false, "Gizmo"},
+    {"axisZ", "Gizmo: lock / unlock the Z axis", "Shift+KeyZ", false, "Gizmo"},
     {"toolPie", "Tool pie (hold, release towards a tool — or click one)", "Space", false, "Pie menus"},
     {"mainPie", "Main pie at the pointer (as Shift + RMB)", "", false, "Pie menus"},
     {"isolatePie", "Hiding / isolating pie (as H held)", "", false, "Pie menus"},
     {"topoOpsPie", "Topology: the edits pie (as Ctrl + RMB)", "", false, "Pie menus"},
     {"camMenu", "Camera menu + split screen (double press — the active window alone)", "Tab", false, "View"},
     {"frame", "Frame selection (over the outliner: reveal it there)", "KeyF", false, "View"},
-    {"hide", "Hide / show selected", "KeyH", false, "Selection & visibility"}, {"isolate", "Isolate selection", "Ctrl+KeyH", false, "Selection & visibility"},
-    {"isolateHead", "Isolate selection + head", "Shift+KeyH", false, "Selection & visibility"}, {"isolateGroup", "Isolate the working group", "Ctrl+Shift+KeyH", false, "Selection & visibility"},
+    {"hide", "Hide — Paint, Topology: the selection, else what is under the pointer · Hair: the selected hidden / shown", "KeyH", false, "Selection & visibility"}, {"isolate", "Paint, Topology: hide the whole object · Hair: isolate the selection (again — all)", "Ctrl+KeyH", false, "Selection & visibility"},
+    {"isolateHead", "Paint, Topology: show only the selection, else what is under the pointer · Hair: isolate the selection + the meshes tagged HEAD", "Shift+KeyH", false, "Selection & visibility"}, {"isolateGroup", "Paint, Topology: show only the whole object · Hair: isolate the working group", "Ctrl+Shift+KeyH", false, "Selection & visibility"},
+    {"isolateAlt", "Topology: the reference meshes hidden / shown", "Alt+KeyH", false, "Selection & visibility"},
+    {"paintDisp1", "Paint room: display — Standard", "Digit1", false, "View"}, {"paintDisp2", "Paint room: display — Flat, no light", "Digit2", false, "View"}, {"paintDisp3", "Paint room: display — the normal map", "Digit3", false, "View"},
+    {"paintShowAll", "Show everything hidden by H and its kin; the Hair room — the isolation ended", "Ctrl+KeyX", false, "Selection & visibility"},
     {"deselect", "Deselect (the Topology room)", "Ctrl+KeyD", false, "Selection & visibility"},
     {"selAll", "Select all (Topology: the mode's components)", "Ctrl+KeyA", false, "Selection & visibility"}, {"invertSel", "Invert the selection (Topology)", "Ctrl+KeyI", false, "Selection & visibility"},
     {"copySel", "Copy the selection — the curves for ⇶ Snap to path, their data to the clipboard (as ⧉ SEL)", "Ctrl+KeyC", false, "Selection & visibility"},
@@ -59,7 +70,7 @@ Keymap::Keymap() {
     {"groupSel", "Group the selected (a new group in their place)", "Alt+KeyG", false, "Edit"}, {"parent", "Parent to the last selected", "KeyP", false, "Edit"}, {"unparent", "Unparent (out of hierarchy)", "Shift+KeyP", false, "Edit"},
     {"rename", "Rename", "F2", false, "Edit"}, {"smartRename", "Smart Rename (tidy names, prefixes, find & replace, sort)", "Shift+F2", false, "Edit"},
     {"relax", "Relax the mesh (Topology)", "Ctrl+KeyR", false, "Edit"},
-    {"symmetry", "Symmetry on / off (both rooms; the Topology room's UV too) — its settings by its button", "Shift+KeyX", false, "Edit"},
+    {"symmetry", "Symmetry on / off (both rooms; the Topology room's UV too) — its settings by its button", "Shift+KeyS", false, "Edit"},
     {"undo", "Undo", "Ctrl+KeyZ", true, "Edit"}, {"redo", "Redo", "Ctrl+Shift+KeyZ", true, "Edit"}, {"redo2", "Redo (alternative)", "Ctrl+KeyY", true, "Edit"},
     {"save", "Save project", "Ctrl+KeyS", false, "Files"}, {"saveAs", "Save project as", "Ctrl+Shift+KeyS", false, "Files"},
     {"open", "File window (open / migrate)", "Ctrl+KeyO", false, "Files"},
@@ -71,6 +82,12 @@ Keymap::Keymap() {
 // ---- kept in the settings ----
 void Keymap::load() {
   { QSettings st; st.beginGroup("keys"); for (auto& d : defs_) keys_[d.id] = st.contains(d.id) ? st.value(d.id).toString() : d.defKey; }
+  // (the gizmo's W / X / Y / Z moved to Shift+, Symmetry from Shift+X to Shift+S; X and V are held for the snaps — a key still on its old default goes to the new one)
+  { const struct { const char* id; const char* from; const char* to; } mv[] = {{"gizmoSpace", "KeyW", "Shift+KeyW"}, {"axisX", "KeyX", "Shift+KeyX"}, {"axisY", "KeyY", "Shift+KeyY"}, {"axisZ", "KeyZ", "Shift+KeyZ"}, {"symmetry", "Shift+KeyX", "Shift+KeyS"}};
+    QSettings st; if (st.value("keysRev", 0).toInt() < 2) {
+      // (the symmetry first: Shift+X is the gizmo's X now)
+      for (int i = 4; i >= 0; i--) if (keys_.value(mv[i].id) == mv[i].from) keys_[mv[i].id] = mv[i].to;
+      st.setValue("keysRev", 2); st.beginGroup("keys"); for (auto& d : defs_) st.setValue(d.id, keys_.value(d.id)); } }
   if (keys_.value("braid") == "KeyB") keys_["braid"] = QString();   // (B is held for an anchor's smoothness — the braid's old key kept from earlier settings dropped)
   const QJsonObject x = QJsonDocument::fromJson(QSettings().value("keysExtra").toByteArray()).object();
   custom_.clear(); pies_.clear(); nav_ = NavScheme();
@@ -80,7 +97,7 @@ void Keymap::load() {
   if (x.value("nav").isObject()) {
     const QJsonObject n = x.value("nav").toObject(); auto b = [&](const char* k, NavBind& t) { const QJsonArray a = n.value(k).toArray(); if (a.size() == 2) t = {a[0].toInt(), a[1].toInt()}; };
     nav_.preset = n.value("preset").toString("standard"); b("orbit", nav_.orbit); b("pan", nav_.pan); b("pan2", nav_.pan2); b("zoom", nav_.zoom); b("mainPie", nav_.mainPie); b("opsPie", nav_.opsPie);
-    nav_.rotation = n.value("rotation").toString("turntable"); }
+    nav_.rotation = n.value("rotation").toString("turntable"); nav_.paint = n.value("paint").toString("coat"); }
 }
 void Keymap::save() const {
   { QSettings st; st.beginGroup("keys"); for (auto& d : defs_) st.setValue(d.id, keys_.value(d.id)); }
@@ -91,7 +108,7 @@ QJsonObject Keymap::toJson() const {
   QJsonArray c; for (auto& b : custom_) c.append(QJsonObject{{"id", b.id}, {"label", b.label}, {"text", b.text}, {"tip", b.tip}, {"combo", b.combo}, {"tool", b.tool}});
   QJsonArray p; for (auto& q : pies_) p.append(QJsonObject{{"id", q.id}, {"name", q.name}, {"combo", q.combo}, {"items", QJsonArray::fromStringList(q.items)}});
   auto b = [](const NavBind& t) { return QJsonArray{t.button, t.mods}; };
-  QJsonObject n{{"preset", nav_.preset}, {"orbit", b(nav_.orbit)}, {"pan", b(nav_.pan)}, {"pan2", b(nav_.pan2)}, {"zoom", b(nav_.zoom)}, {"mainPie", b(nav_.mainPie)}, {"opsPie", b(nav_.opsPie)}, {"rotation", nav_.rotation}};
+  QJsonObject n{{"preset", nav_.preset}, {"orbit", b(nav_.orbit)}, {"pan", b(nav_.pan)}, {"pan2", b(nav_.pan2)}, {"zoom", b(nav_.zoom)}, {"mainPie", b(nav_.mainPie)}, {"opsPie", b(nav_.opsPie)}, {"rotation", nav_.rotation}, {"paint", nav_.paint}};
   return QJsonObject{{"app", "hmc-hotkeys"}, {"version", 1}, {"keys", k}, {"custom", c}, {"pies", p}, {"nav", n}};
 }
 bool Keymap::fromJson(const QJsonObject& o) {
@@ -131,7 +148,11 @@ void Keymap::setKey(const QString& id, const QString& combo) {
   if (!c.isEmpty()) put(c, QString());
   put(id, combo); save();
 }
-void Keymap::reset() { for (auto& d : defs_) keys_[d.id] = d.defKey; save(); }
+void Keymap::reset() {
+  for (auto& d : defs_) keys_[d.id] = d.defKey;
+  // (a button or pie given a key that is an action's standard one again: it lets it go — one thing per key, as setKey keeps it)
+  for (auto& d : defs_) if (!d.defKey.isEmpty()) { for (auto& b : custom_) if (b.combo == d.defKey) b.combo.clear(); for (auto& p : pies_) if (p.combo == d.defKey) p.combo.clear(); }
+  save(); }
 void Keymap::factoryReset() { for (auto& d : defs_) keys_[d.id] = d.defKey; custom_.clear(); pies_.clear(); nav_ = NavScheme(); save(); }
 QString Keymap::actionFor(const QString& combo) const {
   if (combo.isEmpty()) return {};
@@ -161,7 +182,22 @@ QAbstractButton* Keymap::customButton(const QString& id, bool justMade) const {
     if (b->text() == c->text && b->toolTip() == c->tip) return b; }
   return nullptr;
 }
-bool Keymap::triggerCustom(const QString& id, bool justMade) const { if (auto* b = customButton(id, justMade)) { b->click(); return true; } return false; }
+// (a command that lives in a button's menu — ui::moreMenu: found by the caption and the tip it had as a button of its own)
+QAction* Keymap::customAction(const QString& id, bool justMade) const {
+  const CustomBind* c = customBind(id); if (!c) return nullptr;
+  auto willShow = [](QWidget* b) { for (QWidget* p = b; p; p = p->parentWidget()) { if (p->isWindow()) return p->isVisible(); if (p->isHidden() && p->testAttribute(Qt::WA_WState_ExplicitShowHide)) return false; } return false; };
+  std::function<QAction*(QMenu*)> in = [&](QMenu* m) -> QAction* { for (QAction* a : m->actions()) { if (a->isSeparator() || !a->isEnabled()) continue;
+      if (a->menu()) { if (QAction* f = in(a->menu())) return f; continue; } if (a->text() == c->text && (a->toolTip() == c->tip || (c->tip.isEmpty() && a->toolTip() == a->text()))) return a; } return nullptr; };   // (an item with no tip of its own gives its caption as one)
+  for (QWidget* w : QApplication::allWidgets()) { auto* b = qobject_cast<QAbstractButton*>(w); if (!b || !(justMade ? willShow(b) : b->isVisible()) || !b->isEnabled()) continue;
+    QMenu* m = nullptr; if (auto* pb = qobject_cast<QPushButton*>(b)) m = pb->menu(); else if (auto* tb = qobject_cast<QToolButton*>(b)) m = tb->menu();
+    if (m) if (QAction* a = in(m)) return a; }
+  return nullptr;
+}
+bool Keymap::triggerCustom(const QString& id, bool justMade) const {
+  if (auto* b = customButton(id, justMade)) { b->click(); return true; }
+  if (QAction* a = customAction(id, justMade)) { a->trigger(); return true; }
+  return false;
+}
 void Keymap::setPies(const std::vector<CustomPie>& p) { pies_ = p; save(); }
 
 // ---- the mouse ----
@@ -190,8 +226,9 @@ QString Keymap::navLabel(const NavBind& b) {
   return s + (b.button == 1 ? "LMB" : b.button == 2 ? "MMB" : "RMB");
 }
 
-// (Windows virtual keys: the same for a letter key in any layout — as the browser's e.code)
 QString Keymap::codeOf(const QKeyEvent* e) {
+#ifdef Q_OS_WIN
+  // (Windows virtual keys: the same for a letter key in any layout — as the browser's e.code)
   quint32 vk = e->nativeVirtualKey();
   if (vk >= 'A' && vk <= 'Z') return QString("Key%1").arg(QChar(char(vk)));
   if (vk >= '0' && vk <= '9') return QString("Digit%1").arg(QChar(char(vk)));
@@ -207,6 +244,19 @@ QString Keymap::codeOf(const QKeyEvent* e) {
     default: break;
   }
   int k = e->key();                                              // (no native key — a synthetic event: Qt's key)
+#else
+  // (Linux: the native "virtual key" is an X keysym, not a Windows code — z is 0x7a, Windows' F11. A latin letter is Qt's
+  // key; what shift or another layout has changed (Shift+1, a Cyrillic letter) — by the physical key, evdev's code + 8)
+  int k = e->key();
+  if (k < Qt::Key_A || k > Qt::Key_Z) {
+    static const char* const ROW[] = {"Digit1", "Digit2", "Digit3", "Digit4", "Digit5", "Digit6", "Digit7", "Digit8", "Digit9", "Digit0", "Minus", "Equal", nullptr, nullptr,
+      "KeyQ", "KeyW", "KeyE", "KeyR", "KeyT", "KeyY", "KeyU", "KeyI", "KeyO", "KeyP", "BracketLeft", "BracketRight", nullptr, nullptr,
+      "KeyA", "KeyS", "KeyD", "KeyF", "KeyG", "KeyH", "KeyJ", "KeyK", "KeyL", "Semicolon", "Quote", "Backquote", nullptr, "Backslash",
+      "KeyZ", "KeyX", "KeyC", "KeyV", "KeyB", "KeyN", "KeyM", "Comma", "Period", "Slash"};
+    const quint32 sc = e->nativeScanCode();
+    if (sc >= 10 && sc < 10 + std::size(ROW) && ROW[sc - 10]) return ROW[sc - 10];
+  }
+#endif
   if (k >= Qt::Key_A && k <= Qt::Key_Z) return QString("Key%1").arg(QChar(char('A' + k - Qt::Key_A)));
   if (k >= Qt::Key_0 && k <= Qt::Key_9) return QString("Digit%1").arg(QChar(char('0' + k - Qt::Key_0)));
   if (k >= Qt::Key_F1 && k <= Qt::Key_F24) return QString("F%1").arg(k - Qt::Key_F1 + 1);
@@ -214,7 +264,9 @@ QString Keymap::codeOf(const QKeyEvent* e) {
     case Qt::Key_Space: return "Space"; case Qt::Key_Tab: return "Tab"; case Qt::Key_Delete: return "Delete";
     case Qt::Key_Backspace: return "Backspace"; case Qt::Key_Return: case Qt::Key_Enter: return "Enter";
     case Qt::Key_Escape: return "Escape"; case Qt::Key_BracketLeft: return "BracketLeft"; case Qt::Key_BracketRight: return "BracketRight";
-    case Qt::Key_End: return "End"; case Qt::Key_Home: return "Home";
+    case Qt::Key_End: return "End"; case Qt::Key_Home: return "Home"; case Qt::Key_Insert: return "Insert";
+    case Qt::Key_PageUp: return "PageUp"; case Qt::Key_PageDown: return "PageDown"; case Qt::Key_Left: return "ArrowLeft";
+    case Qt::Key_Up: return "ArrowUp"; case Qt::Key_Right: return "ArrowRight"; case Qt::Key_Down: return "ArrowDown";
     default: return {};
   }
 }
@@ -476,7 +528,7 @@ void HotkeyDialog::mousePage(QVBoxLayout* v) {
   for (auto& [k, l] : P) pr->addItem(l, k);
   pr->setCurrentIndex(std::max(0, pr->findData(n.preset))); v->addWidget(pr);
   connect(pr, &QComboBox::activated, this, [this, pr](int) { const QString k = pr->currentData().toString(); NavScheme s = k == "custom" ? Keymap::get().nav() : Keymap::navPreset(k);
-    s.preset = k; s.rotation = Keymap::get().nav().rotation; if (k != "custom") { s.mainPie = Keymap::get().nav().mainPie; s.opsPie = Keymap::get().nav().opsPie; } Keymap::get().setNav(s); fill(); });
+    s.preset = k; s.rotation = Keymap::get().nav().rotation; s.paint = Keymap::get().nav().paint; if (k != "custom") { s.mainPie = Keymap::get().nav().mainPie; s.opsPie = Keymap::get().nav().opsPie; } Keymap::get().setNav(s); fill(); });
   auto bindRow = [&](const QString& label, NavBind NavScheme::*field) {
     auto* r = new QWidget; auto* h = new QHBoxLayout(r); h->setContentsMargins(0, 0, 0, 0);
     h->addWidget(new QLabel(label), 1);
@@ -493,6 +545,13 @@ void HotkeyDialog::mousePage(QVBoxLayout* v) {
   auto* tt = new QRadioButton(tr("Turntable — the up stays up (round the vertical, then tilt)")); auto* tb = new QRadioButton(tr("Trackball — free, round the view's own axes (it can roll)"));
   (n.rotation == "trackball" ? tb : tt)->setChecked(true); v->addWidget(tt); v->addWidget(tb);
   connect(tt, &QRadioButton::toggled, this, [](bool on) { NavScheme s = Keymap::get().nav(); s.rotation = on ? "turntable" : "trackball"; Keymap::get().setNav(s); });
+  v->addWidget(head(tr("Paint room: the brush on the mouse")));
+  { auto* pc = new QComboBox;
+    pc->addItem(tr("Like 3D-Coat (standard): RMB drag - the brush size, LMB on empty space - the camera turns, V - the colour"), "coat");
+    pc->addItem(tr("Like Photoshop / Substance: [ ] and Ctrl + RMB drag - the size (sideways) and hardness (up / down), Alt + click - the colour, Alt + drag - the camera"), "ps");
+    pc->setCurrentIndex(std::max(0, pc->findData(n.paint))); v->addWidget(pc);
+    connect(pc, &QComboBox::activated, this, [pc](int) { NavScheme s = Keymap::get().nav(); s.paint = pc->currentData().toString(); Keymap::get().setNav(s); }); }
+  v->addWidget(mut(tr("V (the colour under the pointer), [ ] (the size), Shift + [ ] (the hardness) and Y (Through) work with either.")));
   v->addWidget(head(tr("Pie menus on the mouse")));
   bindRow(tr("Main pie"), &NavScheme::mainPie); bindRow(tr("Topology: edits pie"), &NavScheme::opsPie);
 }
@@ -565,4 +624,11 @@ void KeyCapture::finish(bool ok) {
   close(); if (ok && d) d(c);
 }
 
+}  // namespace hm::ui
+
+namespace hm::ui {
+int Keymap::latinKey(const QKeyEvent* e) {
+  const QString c = codeOf(e); if (c.size() == 4 && c.startsWith("Key") && c[3] >= 'A' && c[3] <= 'Z') return Qt::Key_A + (c[3].unicode() - 'A');
+  return e->key();
+}
 }  // namespace hm::ui

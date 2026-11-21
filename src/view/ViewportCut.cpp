@@ -116,15 +116,10 @@ void Viewport::splitEnds(const PickedCurve& ch, const QPointF& m) {
   runEdit([&](Scene& sc, Selection& sel, const CurveCache& cc) -> QString {
     Network net(sc, cc, sel.items, sel.anchors);
     int cid = pl->c.id;
-    // (the tip at the curve's first anchor: the curve turned to run root → tip first, then planned again on it)
-    if (pl->c.rev) {
-      int nA = int(sc.item(cid)->anchors.size()), ns = int(pl->c.P.size());
-      net.reverseCurves({cid});
-      PickedCurve c2 = ch; c2.sample = std::min(ns - 2 - std::min(ch.sample, ns - 2), ns - 2); c2.t = 1 - ch.t; c2.seg = nA - 2 - ch.seg;
-      QString e2; auto p2 = splitPlan(c2, m, &e2); if (!p2) return "!" + e2;
-      if (p2->c.rev) return QString("!") + tr("The curve could not be turned root → tip");
-      pl = p2;
-    }
+    // (the tip at the curve's first anchor: the curve turned to run root → tip. The plan was made on the curve seen so
+    // already — its anchor, segment and place along it are the turned curve's; planning again would read the samples of
+    // the curve before the turn)
+    if (pl->c.rev) net.reverseCurves({cid});
     Item* c = sc.item(cid); const Vec3 w = pl->w; const double rw = pl->rw;
     int J = pl->J >= 0 ? c->anchors[size_t(pl->J)] : net.insertKeepShape(cid, pl->seg, pl->u);
     c = sc.item(cid); sc.reindex();
@@ -178,6 +173,13 @@ bool Viewport::cutPress(QMouseEvent* e) {
     if (e->button() == Qt::RightButton && ctrl) { bd_ = {}; bd_.start = m; bd_.r0 = splitR; drag_ = Drag::BrushAdjust; return true; }   // (the spread)
     if (e->button() != Qt::LeftButton) return false;
     if (auto ch = pickCurve(m, true, false)) splitEnds(*ch, m); else ui::toast(tr("Click a curve where its end should split"));
+    return true;
+  }
+  if (cutMode == "branches") {                                         // (a lock's branches into groups of their own)
+    if (e->button() != Qt::LeftButton) return false;
+    int id = -1; if (auto ch = pickCurve(m, true, false)) id = ch->id; else if (auto s = pickSurface(m)) id = s->itemId;
+    if (id < 0) { ui::toast(tr("Click a curve or a wall of the lock to split by its branches")); return true; }
+    runEdit([id](Scene& s, Selection& sl, const CurveCache& cc) { return edit::splitLockBranches(s, cc, id, sl); }, true);
     return true;
   }
   if (e->button() == Qt::RightButton) {                                // scissors: RMB picks the curve to cut

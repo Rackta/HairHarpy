@@ -116,4 +116,21 @@ std::vector<RemovedOverride> releaseFrozenAround(Scene& sc, const std::vector<in
   return out;
 }
 
+std::vector<RemovedOverride> releaseFrozenBrushed(Scene& sc, const std::map<int, double>& w) {
+  std::vector<RemovedOverride> out; if (w.empty()) return out;
+  auto full = [&](int a) { auto f = w.find(a); return f != w.end() && f->second >= 0.999; };
+  for (auto& [id, c] : sc.items) {
+    if (c.type != ItemType::Curve || c.ovr.empty() || c.junc || c.hasPath() || c.ring >= 0 || !c.conn.isEmpty() || c.closed || c.hasRib || groupLogic(sc, c) != 2) continue;   // (the curves an anchor's drag frees)
+    const auto& A = c.anchors; const int n = int(A.size()); std::set<int> rel;
+    for (int k = 0; k < n; k++) {
+      if (!w.count(A[size_t(k)])) continue;
+      bool rigid = full(A[size_t(k)]); for (int j : {k - 1, k + 1}) if (j >= 0 && j < n && !full(A[size_t(j)])) rigid = false;
+      if (rigid) continue;
+      for (int d = -2; d <= 2; d++) { const int j = k + d; if (j >= 0 && j < n) rel.insert(A[size_t(j)]); }
+    }
+    for (int a : rel) { auto it = c.ovr.find(a); if (it != c.ovr.end()) { out.push_back({c.id, a, it->second}); c.ovr.erase(it); } }
+  }
+  return out;
+}
+
 }  // namespace hm

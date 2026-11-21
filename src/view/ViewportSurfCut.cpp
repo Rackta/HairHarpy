@@ -522,7 +522,6 @@ QString Viewport::applyEdgeToCurveCut() {
   const double RL = G->R - 1, ML = G->M - 1;
   std::vector<Q> ctl{Q{qs0->r, qs0->t}}; for (auto& p : scut_->pts) ctl.push_back(Q{p.r, std::clamp(p.t, 0.04 * ML, 0.96 * ML)});
   ctl.back().r = ctl.back().r < 0.5 * RL ? 0.0 : RL;                           // (its edge end right on the edge)
-  const bool curveFirst = true; (void)curveFirst;
   std::vector<Q> ord = ctl; if (ord.front().r > ord.back().r) std::reverse(ord.begin(), ord.end());   // (along the rows, as the wall's path goes)
   std::vector<Vec3> path; for (auto& q : wallPath(*G, ord).dense) path.push_back(gridAt(*G, q.r, q.t));
   if (path.size() < 2) return "!";
@@ -677,7 +676,8 @@ void Viewport::applySurfCut() {
     // the ends not put in yet go into their curves now (keeping the shape)
     std::vector<SurfCutEnd*> pend; for (auto* E : {&*P.start, &*P.end}) if (E->a < 0) pend.push_back(E);
     std::stable_sort(pend.begin(), pend.end(), [](auto* x, auto* y) { return x->c == y->c ? (x->seg != y->seg ? x->seg > y->seg : x->u > y->u) : false; });
-    for (auto* E : pend) { E->a = net.insertKeepShape(E->c, E->seg, E->u); E->pos = sc.anchor(E->a)->pos; E->vh.clear(); }
+    for (size_t i = 0; i < pend.size(); i++) { auto* E = pend[i]; E->a = net.insertKeepShape(E->c, E->seg, E->u); E->pos = sc.anchor(E->a)->pos; E->vh.clear();
+      if (i + 1 < pend.size() && pend[i + 1]->c == E->c && pend[i + 1]->seg == E->seg && E->u > 1e-12) pend[i + 1]->u /= E->u; }   // (the other end on the same segment: that segment now ends at this one — its place along it scaled so)
     sc.reindex();
     auto R = cutBuild(sc, P, Gc, sceneScale(sc)); if (auto* e = std::get_if<QString>(&R)) return "!" + *e;
     Build B = std::get<Build>(R); Ctx X{sc, P, Gc, B.mids}; cutCurveHandles(X, B, true);

@@ -43,6 +43,9 @@ std::set<int> curvesTouching(const Scene& sc, const std::vector<int>& anchors);
 // the two anchors on from them each side, become automatic again → what was removed (for undo)
 struct RemovedOverride { int curve, anchor; HandleOverride h; };
 std::vector<RemovedOverride> releaseFrozenAround(Scene& sc, const std::vector<int>& moved);
+// (a brush stroke: each anchor its own share of the move — the frozen handles of the anchors not moved as one piece with both
+//  neighbours (weight 1 all three) let go, and of the two anchors on each side: the curve smooth again, as after an anchor's drag)
+std::vector<RemovedOverride> releaseFrozenBrushed(Scene& sc, const std::map<int, double>& weights);
 
 int groupLogic(const Scene& sc, const Item& it);
 

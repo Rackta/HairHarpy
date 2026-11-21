@@ -210,7 +210,8 @@ std::vector<char> Viewport::faceLocked(int m) const {
 const Viewport::PxVis& Viewport::pxVis(int m, const MaskProxy& X) const {
   ProfScope prof_("pxVis");
   const Item* it = scene_->item(m); auto& c = pxVis_[m];
-  const QByteArray key = QByteArray::number(quintptr(&X)) + "|" + QJsonDocument(it ? it->raw.value("hidGroups").toArray() : QJsonArray()).toJson(QJsonDocument::Compact)
+  // (the proxy by its address, its mesh's and tree's and its size — a proxy made again at the same address is still told apart)
+  const QByteArray key = QByteArray::number(quintptr(&X)) + "|" + QByteArray::number(quintptr(X.mesh.get())) + "|" + QByteArray::number(quintptr(X.bvh.get())) + "|" + QByteArray::number(qlonglong(X.mesh->faceCount())) + "|" + QJsonDocument(it ? it->raw.value("hidGroups").toArray() : QJsonArray()).toJson(QJsonDocument::Compact)
                          + "|" + QByteArray::number(it ? qHash(it->raw.value("hidF").toString()) : 0);
   if (c.key == key) return c;
   c = {}; c.key = key; const size_t np = size_t(X.mesh->faceCount());
@@ -303,9 +304,10 @@ bool Viewport::pxSeen(int m, const MaskProxy& X, const PxVis& V, int t, const Ve
 
 namespace hm {
 int Viewport::maskOccluded(int m, int g) const {
-  const Item* it = scene_->item(m); if (!it) return -1; auto B = baseSp(*it); const auto a = smArr(m); if (a.empty()) return 0;
+  const Item* it = scene_->item(m); if (!it) return -1; auto B = baseSp(*it); if (!B) return -1; const auto a = smArr(m); if (a.empty()) return 0;
   const Affine M = meshmods::meshMatrix(*scene_, *it); int n = 0;
-  for (int f = 0; f < B->faceCount(); f++) { if (!a[size_t(f)] || B->faceGroup[size_t(f)] != g) continue;
+  const int nf = int(std::min({size_t(B->faceCount()), a.size(), B->faceGroup.size()}));   // (the mask's and the groups' records may be shorter than the mesh)
+  for (int f = 0; f < nf; f++) { if (!a[size_t(f)] || B->faceGroup[size_t(f)] != g) continue;
     Vec3 c; const int s = B->faceStart[size_t(f)], e = B->faceStart[size_t(f) + 1]; for (int k = s; k < e; k++) c += B->pos[size_t(B->faceVerts[size_t(k)])]; c = M.apply(c * (1.0 / (e - s)));
     const ScreenPt sp = projector().toScreen(c); if (sp.z >= 1 || sp.x < 0 || sp.y < 0 || sp.x > width() || sp.y > height()) continue;
     const Vec3 d = (c - cam_.pos).normalized(); auto hr = heavyRay(m, Ray{cam_.pos, d}, false); if (!hr || !*hr) continue;

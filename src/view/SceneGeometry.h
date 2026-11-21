@@ -43,6 +43,7 @@ LineBatch buildFloor(double scale, const Vec3& center, double floorY, double opa
 // the snapping grid of a view (its own step): the floor for the perspective, orthographic and top views (at floorY), a
 // wall through the origin for the side ones — front / back: X–Y, left / right: Z–Y
 LineBatch buildViewGrid(const QString& view, double scale, const Vec3& center, double floorY, double step);
+LineBatch buildViewGridInf(const QString& view, double floorY, double step, double u0, double v0, double halfU, double halfV);   // (an orthographic view's: over what the camera sees)
 LineBatch buildAxes(double scale, double opacity = 0.6);
 
 }  // namespace hm

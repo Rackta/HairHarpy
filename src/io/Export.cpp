@@ -1,4 +1,5 @@
 #include "io/Export.h"
+#include "scene/Topo.h"
 #include "view/SceneGeometry.h"
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -63,7 +64,7 @@ QByteArray exportText(const QString& fmt, const std::vector<ExportMesh>& list, d
       const PolyMesh& m = *em.mesh; const int nf = m.faceCount(); const size_t nc = m.faceVerts.size();
       out += "o " + objName(em.name) + "\n";
       for (auto& p : m.pos) out += "v " + fx(p.x * sc) + " " + fx(p.y * sc) + " " + fx(p.z * sc) + "\n";
-      const bool uv = m.cornerUV.size() == nc;
+      const bool uv = nc && m.cornerUV.size() == nc;   // (a mesh without polygons: no UV list to number)
       std::vector<int> ti(uv ? nc : 0), ni;
       if (uv) { std::map<std::pair<float, float>, int> at;
         for (size_t k = 0; k < nc; k++) { auto r = at.emplace(std::make_pair(m.cornerUV[k][0], m.cornerUV[k][1]), int(at.size()));
@@ -88,11 +89,29 @@ QByteArray exportText(const QString& fmt, const std::vector<ExportMesh>& list, d
         std::map<int, int> num; sg.resize(static_cast<size_t>(nf));
         for (int f = 0; f < nf; f++) { auto r = num.emplace(find(f), int(num.size()) + 1); sg[size_t(f)] = r.first->second; }
       }
-      int curS = -1;
+      int curS = -1; QString curG;
+      // (a polygroup per object — what ZBrush, Maya and the like read as the polygroups: `o` alone they take for the one group; a mesh that has
+      // several polygroups of its own: <object>_<polygroup>)
+      const bool hasG = m.faceGroup.size() == size_t(nf) && m.groupNames.size() > 1; const QString on = objName(em.name);
+      // (a polygon's UV set: usemtl by the set's name — a painter makes a texture per material, one per set)
+      const bool sets = !m.uvSetNames.empty() && int(m.faceSets.size()) == nf; QString curM;
+      auto setName = [&](int f) -> QString { int s = size_t(f) < m.faceLive.size() ? m.faceLive[size_t(f)] : -1;
+        if (s < 0 || size_t(s) >= m.uvSetNames.size() || !(m.faceSets[size_t(f)] >> s & 1u)) { s = -1; for (size_t k = 0; k < m.uvSetNames.size(); k++) if (m.faceSets[size_t(f)] >> k & 1u) { s = int(k); break; } }
+        return s >= 0 ? objName(m.uvSetNames[size_t(s)]) : QString(); };
       for (int f = 0; f < nf; f++) {
+        const QString gn = hasG ? on + "_" + objName(m.groupNames[size_t(std::clamp(m.faceGroup[size_t(f)], 0, int(m.groupNames.size()) - 1))]) : on;
+        if (gn != curG) { curG = gn; out += "g " + gn + "\n"; }
+        { QString mm = sets ? setName(f) : QString(); if (mm.isEmpty()) mm = objName(topo::defaultUvSetName(m)); if (mm != curM) { curM = mm; out += "usemtl " + mm + "\n"; } }   // (no set: the project's "UV Set 1")
         if (!sg.empty() && sg[size_t(f)] != curS) { curS = sg[size_t(f)]; out += "s " + QString::number(curS) + "\n"; }
+        // (a polygon that names one vertex twice — a corner doubled where two points were welded — is written without the double (a quad becomes
+        // a triangle); one left with fewer than three is not written: ZBrush says "faces with multiple references to the same vertex" and mends them
+        // by welding the edges round them)
+        std::vector<int> ks; for (int k = m.faceStart[size_t(f)]; k < m.faceStart[size_t(f) + 1]; k++) if (ks.empty() || m.faceVerts[size_t(k)] != m.faceVerts[size_t(ks.back())]) ks.push_back(k);
+        while (ks.size() > 1 && m.faceVerts[size_t(ks.back())] == m.faceVerts[size_t(ks.front())]) ks.pop_back();
+        { std::set<int> uniq; for (int k : ks) uniq.insert(m.faceVerts[size_t(k)]); if (uniq.size() != ks.size()) { ks.clear(); } }   // (a vertex twice not side by side: not a polygon)
+        if (ks.size() < 3) continue;
         out += "f";
-        for (int k = m.faceStart[size_t(f)]; k < m.faceStart[size_t(f) + 1]; k++) {
+        for (int k : ks) {
           out += " " + QString::number(m.faceVerts[size_t(k)] + off);
           if (uv || !ni.empty()) out += "/" + (uv ? QString::number(ti[size_t(k)] + offT) : QString());
           if (!ni.empty()) out += "/" + QString::number(ni[size_t(k)] + offN);

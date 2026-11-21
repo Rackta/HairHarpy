@@ -6,6 +6,7 @@
 #include "scene/MeshMods.h"
 #include "ui/Theme.h"
 #include "view/Viewport.h"
+#include <QMenu>
 #include <QDoubleSpinBox>
 #include <QHBoxLayout>
 #include <QJsonArray>
@@ -64,11 +65,7 @@ void imeshExtras(QVBoxLayout* v, Viewport* vp, Scene* sc, int id) {
   }
   auto mods = meshmods::modsOf(*sc, id);
   QStringList ml; for (int x : mods) { const Item* xi = sc->item(x); ml << kindName(xi->raw.value("kind").toString()) + (xi->visible ? QString() : QObject::tr(" (off)")); }
-  if (meshmods::heavy(*m)) {                                  // (a heavy mesh: nothing to edit — Move / Rotate / Scale still work)
-    auto* l = muted(QObject::tr("Over 300 000 triangles: no wireframe and not editable (it can be moved, rotated, scaled).")); l->setStyleSheet("color:#e0b060"); v->addWidget(l);
-    if (!ml.isEmpty()) v->addWidget(muted(QObject::tr("Modifiers: ") + ml.join(", ")));
-    return;
-  }
+  
   // one Thickness modifier (with its mask inside): added, or selected when there is one
   int has = -1; for (int x : mods) if (sc->item(x)->raw.value("kind").toString() == "thick") has = x;
   auto* b = button(has >= 0 ? QObject::tr("⬤ Thickness & mask…") : QObject::tr("+ ⬤ Thickness & mask"), QObject::tr("Paint where the mesh gets thicker or thinner, and a mask that holds it back — one modifier, two brushes"));
@@ -112,11 +109,17 @@ void meshXmodProps(QVBoxLayout* v, Viewport* vp, Scene* sc, int id) {
   }
   auto weights = [vp, id](const char* key, std::function<double(double)> f) {
     vp->runEdit([id, key, f](Scene& s, Selection&, const CurveCache&) { Item* it = s.item(id); QJsonArray a = it->raw.value(key).toArray(), o;
-      if (a.isEmpty()) a = it->raw.value("mask").toArray();
-      for (const QJsonValue& w : a) o.append(f(w.toDouble())); it->raw.insert(key, o); return QString(); }, false);
+      const bool none = a.isEmpty(); if (none) a = it->raw.value("mask").toArray();   // (nothing painted in this one yet: only the length taken from the weights — every value 0)
+      for (const QJsonValue& w : a) o.append(f(none ? 0.0 : w.toDouble())); it->raw.insert(key, o); return QString(); }, false);
   };
   auto brushBtn = [vp](const QString& k, const QString& label) { auto* b = new QPushButton(label); b->setIcon(ui::icon("brush_paint")); b->setIconSize(QSize(18, 18)); b->setCheckable(true); b->setChecked(vp->maskBrush.on && vp->maskBrush.kind == k);
     QObject::connect(b, &QPushButton::clicked, vp, [vp, k] { brushFor(vp, k); }); return b; };
+  // (the brush — the button; the whole mask cleared, filled, inverted — the "more" menu beside it)
+  auto maskMore = [vp, weights](const char* key) { QMenu* mm = nullptr; auto* mb = ui::moreButton(QObject::tr("The whole mask: cleared, filled, inverted"), &mm);
+    ui::menuItem(mm, QObject::tr("Clear"), {}, vp, [weights, key] { weights(key, [](double) { return 0.0; }); });
+    ui::menuItem(mm, QObject::tr("Fill"), {}, vp, [weights, key] { weights(key, [](double) { return 1.0; }); });
+    ui::menuItem(mm, QObject::tr("Invert"), {}, vp, [weights, key] { weights(key, [](double w) { return 1 - w; }); });
+    return mb; };
   if (kind == "thick") {
     QJsonObject p = x->raw.value("p").toObject(); double amt = p.value("amt").toDouble(), ref = p.value("amtRef").toDouble(amt); if (!(ref > 0)) ref = m ? meshmods::baseSize(*m) * 0.02 : 0.01;
     double mx = std::max(ref * 4, amt * 1.05);
@@ -129,17 +132,11 @@ void meshXmodProps(QVBoxLayout* v, Viewport* vp, Scene* sc, int id) {
     v->addWidget(hbox({cl, brushBtn("thick", QObject::tr("🖌 Thickness brush"))}));
     v->addWidget(h4(QObject::tr("◐ Mask")));
     v->addWidget(muted(QObject::tr("Painted mask (dark): where it is 100% the thickness does nothing.")));
-    auto* c2 = button(QObject::tr("Clear")); QObject::connect(c2, &QPushButton::clicked, vp, [weights] { weights("hold", [](double) { return 0.0; }); });
-    auto* f2 = button(QObject::tr("Fill")); QObject::connect(f2, &QPushButton::clicked, vp, [weights] { weights("hold", [](double) { return 1.0; }); });
-    auto* i2 = button(QObject::tr("Invert")); QObject::connect(i2, &QPushButton::clicked, vp, [weights] { weights("hold", [](double w) { return 1 - w; }); });
-    v->addWidget(hbox({c2, f2, i2, brushBtn("mask", QObject::tr("🖌 Mask brush"))}));
+    v->addWidget(hbox({brushBtn("mask", QObject::tr("🖌 Mask brush")), maskMore("hold")}));
     return;
   }
   v->addWidget(muted(QObject::tr("Painted mask (dark): where it is 100% the Thickness modifiers of this mesh do nothing.")));
-  auto* c = button(QObject::tr("Clear")); QObject::connect(c, &QPushButton::clicked, vp, [weights] { weights("mask", [](double) { return 0.0; }); });
-  auto* f = button(QObject::tr("Fill")); QObject::connect(f, &QPushButton::clicked, vp, [weights] { weights("mask", [](double) { return 1.0; }); });
-  auto* i = button(QObject::tr("Invert")); QObject::connect(i, &QPushButton::clicked, vp, [weights] { weights("mask", [](double w) { return 1 - w; }); });
-  v->addWidget(hbox({c, f, i, brushBtn("mask", QObject::tr("🖌 Mask brush"))}));
+  v->addWidget(hbox({brushBtn("mask", QObject::tr("🖌 Mask brush")), maskMore("mask")}));
 }
 
 }  // namespace hm

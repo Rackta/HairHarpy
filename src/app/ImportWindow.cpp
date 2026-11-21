@@ -1,4 +1,4 @@
-﻿#include "app/ImportWindow.h"
+#include "app/ImportWindow.h"
 #include "app/ImportMesh.h"
 #include "scene/Primitives.h"
 #include "scene/Scene.h"
@@ -89,7 +89,6 @@ struct Choice { const char* key; const char* label; const char* tip; bool TopoIm
 const Choice CHOICES[] = {
   {"groups", "Import polygroups", "Keep the file's polygroups (OBJ g / o, the meshes of a glTF / FBX file); off — one mesh, one polygroup", &TopoImport::groups},
   {"objects", "Split polygroups into separate meshes", "Every polygroup a mesh of its own, in a group named after the file", &TopoImport::objects},
-  {"head", "Import as head", "The model is the head — the reference the hair is made on (a head there already: the model joins it)", &TopoImport::head},
   {"uvs", "Import UVs", "The file's UV layout (needed for the textures)", &TopoImport::uvs},
   {"textures", "Import textures", "The textures the file carries or refers to, and the images / .mtl picked with it", &TopoImport::textures},
   {"polypaint", "Import polypaint", "The colours painted on the vertices (ZBrush polypaint, vertex colours) — shown with the standard material", &TopoImport::polypaint},
@@ -104,7 +103,7 @@ const Choice CHOICES[] = {
 class ImportDialog : public QDialog {
 public:
   ImportDialog(QWidget* parent, Viewport* vp, Scene* sc, const QStringList& files, bool head) : QDialog(parent), vp_(vp), sc_(sc), headDefault_(head) {
-    topo_ = sc->room == "topo";
+    topo_ = sc->room != "hair";
     setObjectName("ioWin"); setStyleSheet(ioWindowStyle()); setWindowTitle(tr("Import"));
     setMinimumSize(460, 320);
     auto* v = new QVBoxLayout(this); v->setContentsMargins(10, 8, 10, 10); v->setSpacing(6);
@@ -153,9 +152,11 @@ public:
   TopoImport choices(const QString& f) const { auto it = opts_.find(f); return it != opts_.end() ? it->second : fresh(); }
 
 private:
-  TopoImport fresh() const { TopoImport o; o.groups = true; o.objects = false; o.head = headDefault_; o.uvs = o.textures = o.creases = o.hard = o.polypaint = true; o.curves = false; o.parts = false;
+  TopoImport fresh() const { TopoImport o; o.groups = true; o.objects = false; o.head = false; o.uvs = o.textures = o.creases = o.hard = o.polypaint = true; o.curves = false; o.parts = false;
     const QJsonObject s = QJsonDocument::fromJson(QSettings().value("import/choices").toByteArray()).object();   // (the choices of the last import — as they were left)
     for (const Choice& ch : CHOICES) if (QString(ch.key) != "head" && s.contains(ch.key)) o.*ch.f = s.value(ch.key).toBool();
+    // (pictures or an .mtl brought with the model — the textures are wanted: UVs and textures ticked whatever was left last time)
+    for (const QString& f : paths_) if (EXTRAS.contains(ext(f)) && ext(f) != "bin") { o.uvs = o.textures = true; break; }
     return o; }
   void keepChoices() const { if (opts_.empty()) return; const TopoImport& o = opts_.begin()->second; QJsonObject s; for (const Choice& ch : CHOICES) if (QString(ch.key) != "head") s.insert(ch.key, o.*ch.f);
     QSettings().setValue("import/choices", QJsonDocument(s).toJson(QJsonDocument::Compact)); }
@@ -303,8 +304,9 @@ void openImportWindow(Viewport* vp, Scene* sc, const QStringList& files, bool he
   if (d.exec() != QDialog::Accepted) return;
   const QStringList models = d.models(), extras = d.extras();
   for (const QString& m : models) {
-    const TopoImport o = d.choices(m);
-    if (sc->room == "topo") topoImportFiles(QStringList{m} + extras, o, vp, sc);
+    TopoImport o = d.choices(m);
+    if (sc->room == "paint") o.uvs = true;                         // (the Paint room: a mesh is painted through its UVs — brought in whatever the window's choice was)
+    if (sc->room != "hair") topoImportFiles(QStringList{m} + extras, o, vp, sc);
     else importFilesWith(QStringList{m} + extras, o, vp, sc);
   }
 }
@@ -316,4 +318,6 @@ void importWindowShot(Viewport* vp, Scene* sc, const QStringList& files, const Q
   ImportDialog d(mainWindow(), vp, sc, files, false); d.show(); QApplication::processEvents(); QApplication::processEvents();
   d.grab().save(png);
 }
+QIcon primitiveIcon(const QString& type) { return primIcon(type); }
+
 }  // namespace hm
