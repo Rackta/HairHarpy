@@ -70,7 +70,13 @@ int main(int argc, char** argv) {
     for (size_t q = 1; q < rs.size() && G.N > 1; q++) { const int i = std::clamp(int(std::lround(hm::cocoonStation(G, (rs[q - 1]->s + rs[q]->s) / 2))), 0, G.N - 1); bool x = false;
       for (int j = 0; j < 12 && !x; j++) { const hm::Vec3 Lt = hm::cocoonPoint(G, i, j * 3.14159265 / 6) - G.c[size_t(i)]; if (along(*rs[q], i, Lt) < along(*rs[q - 1], i, Lt)) x = true; }
       cross += x; }
-    std::printf("    crossing neighbour loops %d, steepest loop %.0f deg off square; under: %s\n", cross, tiltMax, sc.item(it->parent) ? qPrintable(sc.item(it->parent)->name) : "-");
+    // how the loops' tilt changes from one to the next: the largest turn between neighbours, and the zigzags — a loop turned
+    // over 12 deg from both its neighbours while those two lie nearly alike (Parent influence drawn in half-tones made them)
+    double jump = 0; int zig = 0; { std::vector<hm::Vec3> nn; for (auto* R : rs) nn.push_back((R->pn ? *R->pn : R->n).normalized());
+      auto ang = [&](size_t a, size_t b) { return std::acos(std::clamp(std::abs(nn[a].dot(nn[b])), 0.0, 1.0)) * 57.2958; };
+      for (size_t q = 1; q < nn.size(); q++) jump = std::max(jump, ang(q - 1, q));
+      for (size_t q = 2; q < nn.size(); q++) { const double a1 = ang(q - 2, q - 1), a2 = ang(q - 1, q), a02 = ang(q - 2, q); if (a1 > 12 && a2 > 12 && a02 < 0.5 * std::max(a1, a2)) zig++; } }
+    std::printf("    crossing neighbour loops %d, steepest loop %.0f deg off square, largest turn between neighbours %.0f deg, zigzags %d; under: %s\n", cross, tiltMax, jump, zig, sc.item(it->parent) ? qPrintable(sc.item(it->parent)->name) : "-");
     const bool gap = h > 0 && worst > 2.2 * h; bad += gap;
     std::printf("%-34s step %7.2f len %8.1f rings %3zu (par %3d snap %2d) lockSegs %4zu  worst gap %5.2f steps at s=%.1f (%.0f%%)%s\n",
                 qPrintable(it->name), h, L, s.size(), par, snap, res.lockSegs.size() / 2, h > 0 ? worst / h : 0, at, L > 0 ? 100 * at / L : 0, gap ? "  <-- GAP" : "");
@@ -88,7 +94,8 @@ int main(int argc, char** argv) {
         std::printf(" %.0f:%.1f", CG.D[size_t(i)], (L - (rp + rc + h)) / h); }
       std::printf("\n"); }
     if (qEnvironmentVariable("RING_LIST") == it->name && res.geo.N) std::printf("    root %.3f %.3f %.3f\n", res.geo.c[0].x, res.geo.c[0].y, res.geo.c[0].z);
-    if (qEnvironmentVariable("RING_LIST") == it->name) { auto dd = cs->deps(id); for (const auto& R : res.rings) std::printf("    s %7.1f n %.2f %.2f %.2f par %d prio %d (%s) run %s\n", R.s, (R.pn ? *R.pn : R.n).x, (R.pn ? *R.pn : R.n).y, (R.pn ? *R.pn : R.n).z, R.par, R.prio.value_or(-1), R.prio && size_t(*R.prio) < dd.size() && sc.item(dd[size_t(*R.prio)]) ? qPrintable(sc.item(dd[size_t(*R.prio)])->name) : "own", R.run.c_str()); }
+    if (qEnvironmentVariable("RING_LIST") == it->name) { auto dd = cs->deps(id); for (const auto& R : res.rings) std::printf("    s %7.1f n %.2f %.2f %.2f snap %5.2f drawn %d off %2.0f par %d prio %d (%s) run %s\n", R.s, (R.pn ? *R.pn : R.n).x, (R.pn ? *R.pn : R.n).y, (R.pn ? *R.pn : R.n).z, R.snap ? R.snap->a : -1.0, int(R.pn.has_value()),
+      std::acos(std::clamp(std::abs(res.geo.t[size_t(std::clamp(int(std::lround(hm::cocoonStation(res.geo, R.s))), 0, res.geo.N - 1))].dot((R.pn ? *R.pn : R.n).normalized())), 0.0, 1.0)) * 57.2958, R.par, R.prio.value_or(-1), R.prio && size_t(*R.prio) < dd.size() && sc.item(dd[size_t(*R.prio)]) ? qPrintable(sc.item(dd[size_t(*R.prio)])->name) : "own", R.run.c_str()); }
     if (gap && detail) for (const auto& R : res.rings) std::printf("    s %8.2f par %d fold %d ri %d prio %d run %s snap %d\n", R.s, R.par, R.fold, R.ri.value_or(-1), R.prio.value_or(-1), R.run.c_str(), R.snap.has_value());
   }
   std::printf("%d cocoon(s) with a gap over 2.2 loop steps\n", bad);

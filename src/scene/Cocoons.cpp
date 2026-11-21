@@ -1064,6 +1064,22 @@ private:
       return rings;
     };
 
+    // Parent influence along the cocoon: a strength evened over one loop step each way (a tent of weights by arc length), its
+    // ends closed (under 3 % — none, over 97 % — all), and the stations the mask reaches with that spread
+    const double pinfR = h;
+    auto pinfEven = [&](const std::vector<double>& A) {
+      std::vector<double> o(A.size());
+      for (int i = 0; i < N; i++) { double sum = 0, wsum = 0;
+        for (int j = i; j >= 0 && G.D[i] - G.D[j] <= pinfR; j--) { const double w = 1 - (G.D[i] - G.D[j]) / pinfR + 1e-3; sum += w * A[size_t(j)]; wsum += w; }
+        for (int j = i + 1; j < N && G.D[j] - G.D[i] <= pinfR; j++) { const double w = 1 - (G.D[j] - G.D[i]) / pinfR + 1e-3; sum += w * A[size_t(j)]; wsum += w; }
+        const double v = wsum > 0 ? sum / wsum : A[size_t(i)]; o[size_t(i)] = v < 0.03 ? 0.0 : v > 0.97 ? 1.0 : v; }
+      return o;
+    };
+    std::vector<char> pinfNear(size_t(std::max(N, 0)), 0);
+    if (!pinfs.empty()) for (int i = 0; i < N; i++) { if (std::abs(pinfAt(G.D[i])) <= 0.002) continue;
+      for (int j = i; j >= 0 && G.D[i] - G.D[j] <= pinfR; j--) pinfNear[size_t(j)] = 1;
+      for (int j = i + 1; j < N && G.D[j] - G.D[i] <= pinfR; j++) pinfNear[size_t(j)] = 1; }
+
     std::vector<CocoonRing> PR; int iOut = 0;
     struct RootIn { K* P; int prio; };
     struct SrcA { K* P; std::vector<double> A; std::vector<CocoonRing> X; };
@@ -1078,11 +1094,16 @@ private:
       std::vector<double> Aw;
       if (!pinfs.empty()) {
         Aw.assign(N, 0);
-        // (the source's pull here, 0…1 — taken as all or nothing, at half: where the mask weakens it by half or more the loops are
-        // the cocoon's own, square to it; elsewhere the source's. Blended by the mask's strength, a stroke's soft edge gave loops
-        // at every angle in between, and neighbours zigzagged across the lock — 21.11, the author: "loops must run square to the
-        // cocoon; where there is no mask, the parent's influence must work")
-        for (int i = 0; i < N; i++) { double ov = overlap(G, PG, i, h), pm = pinfAt(G.D[i]); Aw[i] = ov <= 0 ? clamp(1 + pm, 0, 1) : clamp(2 * pm * std::max(0.0, 1 - ov / (4 * h)), 0, 1); Aw[i] = Aw[i] >= 0.5 ? 1.0 : 0.0; }
+        // (the source's pull here, 0…1: full where there is no mask, none where the mask is painted at full strength. 21.11 it
+        // was made all or nothing at half, after an unevenly painted mask gave neighbouring loops at unlike angles — a zigzag
+        // across the lock; the author then: "loops must run square to the cocoon; where there is no mask, the parent's
+        // influence must work")
+        // 22.11, the author: "the brush works as either 100 % or 0 %, so a smooth transition can't be made" — the pull follows
+        // the mask's strength again, but evened along the cocoon over one loop step each way first (pinfEven): the zigzag
+        // came from neighbouring loops getting unlike strengths out of an unevenly painted mask, not from the half-tones
+        // themselves; evened, a soft edge turns the loops gradually from the source's to the cocoon's own
+        for (int i = 0; i < N; i++) { double ov = overlap(G, PG, i, h), pm = pinfAt(G.D[i]); Aw[i] = ov <= 0 ? clamp(1 + pm, 0, 1) : clamp(2 * pm * std::max(0.0, 1 - ov / (4 * h)), 0, 1); }
+        Aw = pinfEven(Aw);
         std::vector<CocoonRing> X;
         for (int i = 0; i < N;) { if (Aw[i] <= 0.001) { i++; continue; } int j = i; while (j < N && Aw[j] > 0.001) j++; for (auto& r : parRings(i, j, P, PG)) if (r.pp) X.push_back(r); i = j; }
         srcA.push_back({&P, Aw, X});
@@ -1099,7 +1120,8 @@ private:
       }
     }
     auto isCut = [&](double s) { for (double c : cuts) if (std::abs(c - s) < 1e-6) return true; return false; };
-    auto pinfStrength = [&](int i) { return std::abs(pinfAt(G.D[i])) > 0.002 ? 1.0 : 0.0; };
+    // (where the mask reaches — its strokes and one loop step round them, the stretch pinfEven spreads them over)
+    auto pinfStrength = [&](int i) { return pinfNear[size_t(i)] ? 1.0 : 0.0; };
     auto pinfSnap = [&](std::vector<CocoonRing> rs) {
       if (srcA.empty()) return rs;
       std::vector<CocoonRing> out;
