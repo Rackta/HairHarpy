@@ -1,5 +1,7 @@
 #include "app/SymPanel.h"
 #include "app/MainWindow.h"
+#include "app/ToonUi.h"
+#include "scene/Topo.h"
 #include "paint/LayerFx.h"
 #include "app/InspectorWindow.h"
 #include "app/KeyCastWindow.h"
@@ -74,6 +76,7 @@
 #include <QColorDialog>
 #include <QDesktopServices>
 #include <QDir>
+#include <QSaveFile>
 #include <QPointer>
 #include <thread>
 #include <QElapsedTimer>
@@ -155,6 +158,17 @@ void MainWindow::buildUi(QVulkanInstance* vk) {
   viewport_->setVulkanInstance(vk);
   viewport_->setPieHost(this);
   paint_ = new PaintSession(this);
+  // the shader mode: one switch (the buttons in Topology and Paint), the Materials & Shader window, its maps followed after strokes
+  { auto* hub = ToonHub::get();
+    hub->isOn = [this] { return scene_.toonView.on; };
+    hub->setOn = [this](bool on) { toonSetOn(on); };
+    hub->openMenu = [this] { toonWindow(&scene_, viewport_, [this] { toonLibWrite(); }, this); };
+    hub->headGuess = [this](double c[3], double& size) { return toonHeadGuess(c, size); };
+    hub->exportTo = [this](const QString& dir) { return toonExport(dir); };
+    toonTimer_ = new QTimer(this); toonTimer_->setSingleShot(true); toonTimer_->setInterval(250);
+    connect(toonTimer_, &QTimer::timeout, this, [this] { if (scene_.toonView.on) toonMapsRefresh(paint_->doc.activeSet()); });
+    connect(paint_, &PaintSession::pixelsChanged, this, [this] { if (scene_.toonView.on) toonTimer_->start(); });
+    connect(paint_, &PaintSession::layersChanged, this, [this] { if (scene_.toonView.on) toonTimer_->start(); }); }
   // (the live gradients: where the surface lies under every texel of a UV set — the bake's own picture of it, made again only when
   // the scene's shapes or UVs changed)
   paint_->doc.positionsOf = [this](const QString& set, int w, int h, const float*& p, const float*& n) {
@@ -207,7 +221,7 @@ void MainWindow::buildUi(QVulkanInstance* vk) {
     syncPanels();
   });
   dpConv_ = new ui::DockPanel(tr("Convert to geometry"), dock_, true, false, false);
-  convPanel_ = new ConvertPanel(viewport_, &scene_); dpConv_->setBody(convPanel_);
+  convPanel_ = new ConvertPanel(viewport_, &scene_); dpConv_->setBody(convPanel_); dpConv_->setFooter(convPanel_->footer());   // (Convert under the scrolled part — never pushed out of sight)
   // (the Topology room: its transform table right under Settings)
   dpTtab_ = new ui::DockPanel(tr("Transform"), dock_, true, false, false); ttab_ = new TransformTable(viewport_); dpTtab_->setBody(ttab_);
   for (auto* p : {dpTool_, dpProps_, dpTtab_, dpConv_}) dock_->addPanel(p);
@@ -805,7 +819,7 @@ void MainWindow::openCustomPie(const QString& id) {
 }
 
 // (the Topology room: only its own tools — the Cursor, the gizmo's three, the snap mask brush)
-static const QStringList TOPO_TOOLS = {"cursor", "move", "rotate", "gizmo", "tmask", "tbrush", "tpen", "tloop", "tknife", "tchain", "tweld", "tplane", "tbevel", "tinset", "tbridge", "tfill", "tshaper", "tslide", "tnormals", "toptimize", "tmirror", "treveal", "tpatch", "tlobe", "tfixmesh", "tmodgroups", "tsubdiv"};
+static const QStringList TOPO_TOOLS = {"cursor", "move", "rotate", "gizmo", "tmask", "tbrush", "tpen", "tloop", "tknife", "tchain", "tweld", "tplane", "tbevel", "tinset", "tbridge", "tfill", "tshaper", "tslide", "tnormals", "toptimize", "tmirror", "treveal", "tpatch", "tlobe", "tfixmesh", "tmodgroups", "tsubdiv", "tscissors"};
 
 void MainWindow::runAction(const QString& id) {
 #ifdef HM_DEVTOOLS
@@ -1228,35 +1242,95 @@ void MainWindow::syncUvTools() {
 // The model's own textures into the Paint room: the first time a UV set is shown there, what its polygons wear in the other rooms (the
 // meshes' colour maps — a file's own or linked ones) becomes the pixels of a "Model texture" layer of that set, above the base fill and
 // under the paint — painted over, masked, hidden or exported like any layer. Nothing to take (no colour maps): nothing is made
-void MainWindow::paintImportTexture(bool quiet) {
-  ui::DevOp devT("paintImportTexture", 15);
-  if (!paint_ || paint_->doc.width() <= 0) return; const QString set = paint_->doc.activeSet(); if (paint_->texIn.contains(set)) return;
-  const int W = paint_->doc.width(), H = paint_->doc.height(); QImage ground; std::map<QString, QImage> imgs;
+// the model's own textures (the meshes' colour maps, as the other rooms show them) laid into one picture of a UV set — W × H, the
+// picture's alpha as the model wears it; seeThruOut: where the see-through texture sets lie (white)
+QImage MainWindow::modelTexturePicture(const QString& set, int W, int H, QImage* seeThruOut) const {
+  QImage ground; std::map<QString, QImage> imgs; if (seeThruOut) *seeThruOut = QImage(); QImage seeThru;
   for (auto& [id, it] : scene_.items) {
     if (it.type != ItemType::IMesh || scene_.noPaint(it)) continue; const PolyMesh* B = it.base ? it.base.get() : it.poly.get(); if (!B || B->cornerUV.size() != B->faceVerts.size() || B->cornerUV.empty()) continue;
-    int ks = -1; if (!set.isEmpty()) { for (size_t i = 0; i < B->uvSetNames.size(); i++) if (B->uvSetNames[i] == set) ks = int(i); if (ks < 0) continue; }
+    int ks = -1;   // (a mesh with no UV sets: all of it in its material's set — as the UV Sets bar shows it)
+    if (!set.isEmpty()) { if (topo::hasUvSets(*B)) { for (size_t i = 0; i < B->uvSetNames.size(); i++) if (B->uvSetNames[i] == set) ks = int(i); if (ks < 0) continue; }
+      else if (topo::defaultUvSetName(*B) != set) continue; }
     const auto sets = looks::setsOf(it); std::map<int, size_t> setOf; for (size_t i = 0; i < sets.size(); i++) setOf.emplace(sets[i].mat, i);
     std::vector<QPainterPath> paths(sets.size()); std::vector<char> any(sets.size(), 0);
     for (int f = 0; f < B->faceCount(); f++) {
       if (ks >= 0 && (!(size_t(f) < B->faceSets.size() && (B->faceSets[size_t(f)] >> ks & 1u)) || (size_t(f) < B->faceLive.size() && B->faceLive[size_t(f)] != ks))) continue;   // (the set's polygons that wear its UV now: the textures are drawn through it)
-      const int mat = size_t(f) < B->faceMat.size() ? B->faceMat[size_t(f)] : -1; const auto si = setOf.find(mat); if (si == setOf.end()) continue;
+      const int mat = size_t(f) < B->faceMat.size() ? B->faceMat[size_t(f)] : -1; auto si = setOf.find(mat);
+      if (si == setOf.end()) { if (sets.empty()) continue; si = setOf.find(sets[0].mat); if (si == setOf.end()) continue; }   // (a material the look has no set for: the first set's, as the model is drawn — buildTexDraw. Before, the eyes' shadow was left out)
       const int s = B->faceStart[size_t(f)], e = B->faceStart[size_t(f) + 1]; if (e - s < 3) continue;
       double cu = 0, cv = 0; for (int c = s; c < e; c++) { cu += B->cornerUV[size_t(c)][0]; cv += B->cornerUV[size_t(c)][1]; } const double ou = std::floor(cu / (e - s)), ov = std::floor(cv / (e - s));
       QPolygonF poly; for (int c = s; c < e; c++) { const double u = B->cornerUV[size_t(c)][0] - ou, v = B->cornerUV[size_t(c)][1] - ov; poly << QPointF(u * W, (B->flipY ? 1 - v : v) * H); }
+      // (one winding for all: a two-sided layer — the same polygon twice, wound both ways — summed to nothing under the winding fill, its
+      //  picture left out but for the pen's edge: the eyes' shadow came in as outlines only, 2026-11-22)
+      { double a2 = 0; for (int k = 0; k < poly.size(); k++) { const QPointF& p = poly[k]; const QPointF& q = poly[(k + 1) % poly.size()]; a2 += p.x() * q.y() - q.x() * p.y(); } if (a2 < 0) std::reverse(poly.begin(), poly.end()); }
       paths[si->second].addPolygon(poly); paths[si->second].closeSubpath(); any[si->second] = 1; }
-    for (size_t i = 0; i < sets.size(); i++) { if (!any[i]) continue; const looks::MapSrc src = looks::resolve(it, int(i), 0); if (src.kind == looks::MapSrc::None || src.missing || src.removed) continue;
+    auto loadAt = [&](const looks::MapSrc& src) -> QImage {
+      if (src.kind == looks::MapSrc::None || src.missing || src.removed) return {};
       auto c = imgs.find(src.key); if (c == imgs.end()) { QImage im = src.kind == looks::MapSrc::Linked ? looks::loadImage(src.path) : looks::decodeImage(src.bytes);
-        c = imgs.emplace(src.key, im.isNull() ? QImage() : im.scaled(W, H, Qt::IgnoreAspectRatio, Qt::SmoothTransformation).convertToFormat(QImage::Format_ARGB32_Premultiplied)).first; }
-      if (c->second.isNull()) continue;
+        c = imgs.emplace(src.key, im.isNull() ? QImage() : im.scaled(W, H, Qt::IgnoreAspectRatio, Qt::SmoothTransformation).convertToFormat(QImage::Format_ARGB32)).first; }
+      return c->second; };
+    for (size_t i = 0; i < sets.size(); i++) { if (!any[i]) continue; QImage tex = loadAt(looks::resolve(it, int(i), 0)); if (tex.isNull()) continue;
+      // (the picture's alpha as the other rooms wear it: a separate alpha map's green, or the colour map's own alpha when the set uses it,
+      //  else solid — a see-through set (an eye's shadow, a glare) stays see-through here, a solid one never gets holes)
+      const QImage am = loadAt(looks::resolve(it, int(i), 1)); const bool mapA = looks::setAlpha(it, int(i)), tr = !am.isNull() || mapA;
+      if (!tr || !am.isNull()) { tex.detach();
+        for (int y = 0; y < H; y++) { QRgb* r = reinterpret_cast<QRgb*>(tex.scanLine(y)); const QRgb* a = am.isNull() ? nullptr : reinterpret_cast<const QRgb*>(am.constScanLine(y));
+          for (int x = 0; x < W; x++) { const int al = !tr ? 255 : a ? (mapA ? qAlpha(r[x]) * qGreen(a[x]) / 255 : qGreen(a[x])) : qAlpha(r[x]); r[x] = qRgba(qRed(r[x]), qGreen(r[x]), qBlue(r[x]), al); } } }
       if (ground.isNull()) { ground = QImage(W, H, QImage::Format_ARGB32_Premultiplied); ground.fill(Qt::transparent); }
-      QPainter p(&ground); paths[i].setFillRule(Qt::WindingFill); const QBrush tex(c->second); p.setBrush(tex); p.setPen(QPen(tex, 4, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin)); p.drawPath(paths[i]); }   // (the pen: a few texels past the shells' edges — no seam on the model)
+      paths[i].setFillRule(Qt::WindingFill);
+      // (the polygons' cover first — the pen a few texels past the shells' edges: no seam on the model — then the picture through it once:
+      //  a see-through picture drawn straight with the pen had its alpha doubled where the edges overlapped — light lines over the eyes)
+      { QImage cover(W, H, QImage::Format_ARGB32_Premultiplied); cover.fill(Qt::transparent);
+        { QPainter p(&cover); p.setBrush(Qt::white); p.setPen(QPen(Qt::white, 4, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin)); p.drawPath(paths[i]); }
+        QImage put = tex.convertToFormat(QImage::Format_ARGB32_Premultiplied);
+        { QPainter p(&put); p.setCompositionMode(QPainter::CompositionMode_DestinationIn); p.drawImage(0, 0, cover); }
+        QPainter p(&ground); p.drawImage(0, 0, put); }
+      if (tr) { if (seeThru.isNull()) { seeThru = QImage(W, H, QImage::Format_ARGB32_Premultiplied); seeThru.fill(Qt::transparent); }
+        QPainter p(&seeThru); p.setBrush(Qt::white); p.setPen(QPen(Qt::white, 4, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin)); p.drawPath(paths[i]); } }
   }
+  if (seeThruOut) *seeThruOut = seeThru;
+  return ground;
+}
+
+// Does an object's UV set wear a see-through texture set (an alpha map, or the colour map's own alpha as the set uses it)? The same rule
+// the rooms draw by: such a part is blended, every other part solid — its map's alpha (0 outside the shells) never cuts holes in it
+bool MainWindow::toonPartSeeThru(const Item& it, const QString& set) const {
+  const PolyMesh* B = it.base ? it.base.get() : it.poly.get(); if (!B) return false;
+  int ks = -1;
+  if (topo::hasUvSets(*B)) { for (size_t i = 0; i < B->uvSetNames.size(); i++) if (B->uvSetNames[i] == set) ks = int(i); if (ks < 0) return false; }
+  else if (topo::defaultUvSetName(*B) != set) return false;
+  const auto sets = looks::setsOf(it); if (sets.empty()) return false;
+  std::map<int, size_t> setOf; for (size_t i = 0; i < sets.size(); i++) setOf.emplace(sets[i].mat, i);
+  std::vector<char> used(sets.size(), 0);
+  for (int f = 0; f < B->faceCount(); f++) {
+    if (ks >= 0 && (!(size_t(f) < B->faceSets.size() && (B->faceSets[size_t(f)] >> ks & 1u)) || (size_t(f) < B->faceLive.size() && B->faceLive[size_t(f)] != ks))) continue;
+    const int mat = size_t(f) < B->faceMat.size() ? B->faceMat[size_t(f)] : -1; auto si = setOf.find(mat);
+    used[si == setOf.end() ? 0 : si->second] = 1; }
+  auto usable = [](const looks::MapSrc& s) { return s.kind != looks::MapSrc::None && !s.missing && !s.removed; };
+  for (size_t i = 0; i < sets.size(); i++)
+    if (used[i] && (usable(looks::resolve(it, int(i), 1)) || (usable(looks::resolve(it, int(i), 0)) && looks::setAlpha(it, int(i))))) return true;
+  return false;
+}
+
+void MainWindow::paintImportTexture(bool quiet) {
+  ui::DevOp devT("paintImportTexture", 15);
+  if (!paint_ || paint_->doc.width() <= 0) return; const QString set = paint_->doc.activeSet(); if (paint_->texIn.contains(set)) return;
+  const int W = paint_->doc.width(), H = paint_->doc.height(); QImage seeThru; const QImage ground = modelTexturePicture(set, W, H, &seeThru);
   paint_->texIn << set;                                         // (asked once per set — also when there was nothing to take)
   if (ground.isNull()) return;
   const QString name = tr("Model texture"); int id = -1, fill = -1;
   for (const paint::Layer& l : paint_->doc.layers()) { if (l.kind == paint::LayerKind::Paint && l.channel == paint::Channel::Color && l.name == name) id = l.id; if (fill < 0 && l.kind == paint::LayerKind::Fill && l.channel == paint::Channel::Color) fill = l.id; }
-  if (id < 0) id = paint_->doc.addPaint(paint::Channel::Color, name, fill);
-  paint_->doc.ensurePixels(id); if (paint::Layer* l = paint_->doc.layer(id)) l->image = ground.convertToFormat(QImage::Format_ARGB32);
+  const bool had = id >= 0; if (id < 0) id = paint_->doc.addPaint(paint::Channel::Color, name, fill);
+  paint_->doc.ensurePixels(id);
+  if (paint::Layer* l = paint_->doc.layer(id)) {
+    if (had && l->image.size() == ground.size()) { QImage cur = l->image.convertToFormat(QImage::Format_ARGB32_Premultiplied); QPainter p(&cur); p.setCompositionMode(QPainter::CompositionMode_DestinationOver); p.drawImage(0, 0, ground); p.end(); l->image = cur.convertToFormat(QImage::Format_ARGB32); }   // (brought in again — meshes joined the set: what was on the layer kept over it)
+    else l->image = ground.convertToFormat(QImage::Format_ARGB32); }
+  // (the base fill kept off a see-through set's polygons — a mask of the fill in this set, editable as any mask — so the set's picture keeps
+  //  the alpha the model wears there: no gray band over the eyes)
+  if (paint::Layer* f = fill >= 0 ? paint_->doc.layer(fill) : nullptr; f && !seeThru.isNull() && f->mask.isNull()) {
+    QImage m(W, H, QImage::Format_Grayscale8); m.fill(255);
+    for (int y = 0; y < H; y++) { const QRgb* s = reinterpret_cast<const QRgb*>(seeThru.constScanLine(y)); uchar* o = m.scanLine(y); for (int x = 0; x < W; x++) if (qAlpha(s[x])) o[x] = 0; }
+    f->mask = m; f->maskOn = true; }
   if (quiet) return;
   emit paint_->layersChanged(); emit paint_->pixelsChanged({});
   ui::toast(tr("The model's texture brought in as the layer \"%1\" of this UV set").arg(name));
@@ -1474,9 +1548,11 @@ void MainWindow::applyRoom(const QString& room) {
             for (int x = r.left(); x <= r.right(); x++) { const int open = cmode >= 3 ? int(cr[x]) : std::clamp((cmode == 1 ? 128 - cr[x] : cr[x] - 128) * 6, 0, 255); hold[size_t(x)] = uchar(std::max(m ? int(m[x]) : 0, 255 - open)); }   // (128 — flat; darker — a hollow, lighter — a ridge)
             paint::keepTexels(target, before, y, r.left(), r.right(), hold.data()); } }; } }
     paint_->ensureDoc(paint_->bakeS.size);
+    for (const QString& n : viewport_->uvEnsureAllSets()) paint_->texIn.removeAll(n);   // (meshes in a set by their material's name only: now in it — their texture brought in)
     // (a project not painted yet whose model has UV sets: its first set shown, not the single texture nothing of it lies in)
     if (paint_->doc.activeSet().isEmpty() && paint_->undo.empty() && paint_->texIn.isEmpty() && paint_->doc.sets().size() <= 1) { const auto names = viewport_->uvSetNamesAll(); if (!names.empty()) { const auto t = viewport_->uvSetProps(names[0]); paint_->setSet(names[0], t.w, t.h); } }
-    paintImportTexture(); paintImportAll(); paintOthersRefresh(); emit paint_->viewChanged(); paintLeft_->refresh(); }
+    paintImportTexture(); paintImportAll(); paintOthersRefresh(); emit paint_->viewChanged(); paintLeft_->refresh();
+    if (scene_.toonView.on) toonMapsRefresh(); }
   else { paintLeft_->setFull(false); if (scene_.paintView.on) { scene_.paintView.on = false; scene_.paintView.flat = {}; viewport_->paintOnModel = false; viewport_->paintViewChanged(); } }
   if (topo) { ttools_->place(vpBox_); ttools_->show(); ttools_->raise(); ttools_->sync(); } else ttools_->hide();
   if (hairR) { htools_->place(vpBox_); htools_->show(); htools_->raise(); } else htools_->hide();
@@ -1794,6 +1870,19 @@ QString MainWindow::runEvents(const QString& script) {
     if (w.size() >= 2 && w[0] == "open") {                    // (checks) open <project>: as the File window opens one — after the window has drawn
       const QString p = cmd.trimmed().mid(5).trimmed(); const bool ok = openProject(p); for (int i = 0; i < 6; i++) { viewport_->beforeFrame(); QApplication::processEvents(); }
       log << QString("open %1: %2 · room %3").arg(p).arg(ok).arg(scene_.room); continue; }
+    // (toon on|off · toon set <param> <value> — the default instance's material · toon menu: the shader mode checked from a script)
+    if (w.size() >= 2 && w[0] == "toon") { QString r;
+      if (w[1] == "on" || w[1] == "off") { toonSetOn(w[1] == "on"); r = QString("on %1 sets %2").arg(scene_.toonView.on).arg(scene_.toonView.maps.size()); }
+      else if (w[1] == "set" && w.size() > 3) { auto& L = scene_.toonView.lib; if (const auto* i = L.inst(L.def)) if (auto* m = L.mat(i->material)) { bool ok = false; const double v = w[3].toDouble(&ok);
+          m->params[w[2]] = ok ? QJsonValue(v) : (w[3] == "true" || w[3] == "false") ? QJsonValue(w[3] == "true") : QJsonValue(w[3]); toonLibWrite(); r = "set"; } }
+      else if (w[1] == "export" && w.size() > 2) r = toonExport(w[2]);
+      else if (w[1] == "role" && w.size() > 4) { int id = -1; for (const auto& [i, it] : scene_.items) if (it.name == w[2] && it.type == ItemType::IMesh) id = i;
+        if (id >= 0) { const QString k = QString("%1:%2").arg(id).arg(w[3]); if (w[4] == "-") scene_.toonView.lib.roles.remove(k); else scene_.toonView.lib.roles[k] = w[4]; toonLibWrite(); r = "role " + k; } else r = "no object"; }
+      else if (w[1] == "head") { double c[3], sz; auto& H = scene_.toonView.lib.head; if (toonHeadGuess(c, sz)) { H.on = true; for (int i = 0; i < 3; i++) H.pos[i] = c[i]; H.size = sz; }
+        const Vec3 d = viewport_->camera().dir() * -1.0; H.yaw = std::atan2(d.x, d.z) * 180 / M_PI; H.pitch = 0; toonLibWrite(); r = QString("head %1 %2 %3 yaw %4").arg(H.pos[0]).arg(H.pos[1]).arg(H.pos[2]).arg(H.yaw); }
+      else if (w[1] == "menu") { QWidget* tw = toonWindow(&scene_, viewport_, [this] { toonLibWrite(); }, this); QApplication::processEvents(); r = "menu";
+        if (w.size() > 2) r += QString(" saved %1").arg(tw->grab().save(w[2])); }
+      viewport_->beforeFrame(); QApplication::processEvents(); log << "toon " + w.mid(1).join(' ') + ": " + r; continue; }
     if (w.size() == 2 && w[0] == "room") { goRoom(w[1]); viewport_->beforeFrame(); log << "room " + scene_.room + QString(": items %1").arg(scene_.items.size()); continue; }
     if (w.size() == 4 && w[0] == "tt") { auto tg = viewport_->ttTarget(); viewport_->ttSet(tg, w[1].toInt(), w[2].toInt(), w[3].toDouble()); viewport_->ttDone(tg); viewport_->beforeFrame();
       auto v = viewport_->ttValues(viewport_->ttTarget()); QStringList L; for (auto& r : v) L << (r ? QString("%1 %2 %3").arg((*r)[0]).arg((*r)[1]).arg((*r)[2]) : QString("-")); log << QString("tt kind %1: %2").arg(tg.kind).arg(L.join(" | ")); continue; }
@@ -2292,6 +2381,17 @@ QString MainWindow::runEvents(const QString& script) {
             o << p.x << " " << p.y << " " << p.z << " " << n.x << " " << n.y << " " << n.z << "\n"; } } }
       log << "ndump " + w[1]; continue; }
     if (w.size() == 3 && w[0] == "selset") { viewport_->tSelSetApply(w[1].toInt(), w[2].toInt(), "set"); viewport_->beforeFrame(); log << "selset " + w[1] + " " + w[2]; continue; }   // selset <mesh> <index>: a kept selection set made the selection
+    if (w.size() == 2 && w[0] == "tobj") { const Item* it = scene_.item(viewport_->topoMesh()); const PolyMesh* B = it ? (it->base ? it->base.get() : it->poly.get()) : nullptr;   // (checks) tobj <path>: the active mesh as an OBJ
+      QFile f(w[1]); if (B && f.open(QIODevice::WriteOnly)) { QTextStream o(&f); for (auto& p : B->pos) o << "v " << p.x << " " << p.y << " " << p.z << '\n';
+        for (int i = 0; i < B->faceCount(); i++) { o << "f"; for (int k = B->faceStart[size_t(i)]; k < B->faceStart[size_t(i) + 1]; k++) o << " " << B->faceVerts[size_t(k)] + 1; o << '\n'; } }
+      log << QString("tobj %1: %2").arg(w[1]).arg(B ? B->faceCount() : -1); continue; }
+    if (w.size() == 2 && w[0] == "tscismode") { viewport_->ttools.scisMode = w[1]; log << "tscismode " + w[1]; continue; }   // (checks) the Scissors' mode: part | carve
+    if (w.size() == 2 && w[0] == "tscisprof") { viewport_->ttools.scisProfile = w[1]; log << "tscisprof " + w[1]; continue; }   // (checks) the Scissors' profile: s | line | arcout | arcin
+    if (w.size() == 2 && w[0] == "tscis" && w[1] == "?") { log << QString("tscis spread %1 px").arg(viewport_->ttools.scisPx); continue; }
+    if (w.size() == 2 && w[0] == "tscis") { viewport_->ttools.scisPx = w[1].toDouble(); log << "tscis: " + viewport_->tScissors(); viewport_->beforeFrame(); continue; }   // (checks) tscis <spread px>: the Scissors on the selection
+    if (w.size() == 2 && w[0] == "tselpath") { const int m = viewport_->topoMesh(); const Item* it = m >= 0 ? scene_.item(m) : nullptr; std::vector<int> es;   // tselpath a,b,c…: the edges between consecutive vertices picked (Edge mode)
+      if (it) { auto T = topo::ttopo(it->base ? it->base : it->poly); const QStringList vs = w[1].split(QChar(0x2c)); for (int i = 0; i + 1 < vs.size(); i++) { const int e = T->edgeOf(vs[i].toInt(), vs[i + 1].toInt()); if (e >= 0) es.push_back(e); } }
+      viewport_->setTopoMode("edge"); viewport_->tselApply(m, es, "set", 'e'); log << QString("tselpath %1 edges").arg(es.size()); continue; }
     if (w.size() == 3 && w[0] == "tsel") { std::vector<int> l; for (const QString& x : w[2].split(QChar(0x2c))) { const auto ab = x.split('-');   // (a-b: a range)
         if (ab.size() == 2) for (int i = ab[0].toInt(); i <= ab[1].toInt(); i++) l.push_back(i); else l.push_back(x.toInt()); } viewport_->tselApply(viewport_->topoMesh(), l, "set", w[1][0].toLatin1()); log << "tsel " + w[1]; continue; }
     if (w.size() >= 4 && w[0] == "tg") { int m = w[2].toInt(), g = w[3].toInt(), g2 = w.size() > 4 ? w[4].toInt() : -1; QString op = w[1], r;
@@ -2381,6 +2481,10 @@ QString MainWindow::runEvents(const QString& script) {
     if (w.size() == 1 && w[0] == "cocoon") { CocoonSystem* cs = viewport_->hair().cocoonSystem();
       QString msg; viewport_->runEdit([cs, &msg](Scene& sc, Selection& sel, const CurveCache& cc) { int k = edit::makeLiveCocoon(sc, cc, cs, sel, &msg); return k < 0 ? "!" + msg : msg; }); viewport_->beforeFrame();
       log << "cocoon: " + QString::number(viewport_->selection().items.empty() ? -1 : viewport_->selection().items.back()) + " " + msg; continue; }
+    if (w.size() == 2 && w[0] == "capmk") { std::vector<int> as; for (const QString& x : w[1].split(',')) as.push_back(x.toInt());   // capmk <a,b,…>: ◒ a cap of these anchors (as the pie's item)
+      QString m; viewport_->runEdit([as, &m](Scene& s2, Selection& sl, const CurveCache&) { m = edit::makeCap(s2, as, sl); return m; }, true); viewport_->beforeFrame(); log << "capmk: " + m; continue; }
+    if (w.size() == 1 && w[0] == "facesizes") { for (auto& [id, it] : scene_.items) if (const PolyMesh* B = it.base ? it.base.get() : it.poly.get(); B && !it.headTag && it.type != ItemType::Head) { std::map<int, int> n; for (int f = 0; f < B->faceCount(); f++) n[B->faceStart[size_t(f) + 1] - B->faceStart[size_t(f)]]++;
+        QStringList q; for (auto& [k, c] : n) q << QString("%1:%2").arg(k).arg(c); log << QString("facesizes %1 \"%2\": %3").arg(id).arg(it.name, q.join(' ')); } continue; }
     if (w.size() == 1 && w[0] == "meshdump") { for (auto& [id, it] : scene_.items) if (it.type == ItemType::Mesh && it.poly) log << QString("mesh %1 \"%2\": verts %3 faces %4 crowns %5").arg(id).arg(it.name).arg(it.poly->pos.size()).arg(it.poly->faceCount()).arg(QString(QJsonDocument(it.raw.value("srcCrowns").toArray()).toJson(QJsonDocument::Compact))); continue; }
     if (w.size() == 3 && w[0] == "crownsharp") {   // crownsharp <i> <0|1>: the last crown's lower connector — a sharp corner at its i-th anchor
       auto ks = crown::crowns(scene_); const Item* k = ks.empty() ? nullptr : scene_.item(ks.back()); const Item* lo = k ? scene_.item(k->raw.value("low").toInt(-1)) : nullptr;
@@ -2753,6 +2857,7 @@ QString MainWindow::runEvents(const QString& script) {
       else if (o == "filled" && w.size() > 2) paint_->shapeOutline = w[2] != "1";
       else if (o == "selkind" && w.size() > 2) paintLeft_->tools()->selKind = w[2];
       else if (o == "sel") r = QString("%1 polygons selected").arg(viewport_->pvSelCount());
+      else if (o == "viewms") { viewport_->camera().pos.x += 1e-3; const auto& V = viewport_->pvView(); r = QString("pvView %1 ms, %2 faces, %3x%4").arg(V.ms).arg(V.faces.size()).arg(V.W).arg(V.H); }   // (pv viewms: the paint view made anew, timed)
       else if (o == "tscopy" && w.size() > 2) r = paintLeft_->tools()->topoCopy(w[2].toInt());
       else if (o == "tspick" && w.size() > 3) { const QStringList p = w[2].split(QChar(0x2c)); r = viewport_->pvTsPick(QPointF(p[0].toDouble(), p[1].toDouble()), w[3] == "blue"); }
       else if (o == "lay") paintLeft_->tools()->layCurve();
@@ -3108,6 +3213,115 @@ void MainWindow::paintImportAll() {
     d.setActiveSet(name, p.w, p.h); paintImportTexture(true); n++; }
   if (n) { d.setActiveSet(cur, cw, ch); QApplication::restoreOverrideCursor(); emit paint_->layersChanged(); }
 }
+// ---- the shader mode (HairHarpy Toon) ----
+// (the pictures the materials name — the face SDF — read once per path; a path no material names any more forgotten)
+static void toonLoadFiles(Scene& sc) {
+  auto& T = sc.toonView; std::set<QString> want;
+  for (const auto& m : T.lib.mats) { const QString p = toon::str(m.params, "sdfPath"); if (!p.isEmpty()) want.insert(p); }
+  for (const auto& i : T.lib.insts) { const QString p = toon::str(i.over, "sdfPath"); if (!p.isEmpty()) want.insert(p); }
+  for (auto it = T.files.begin(); it != T.files.end();) { if (want.count(it->first)) ++it; else it = T.files.erase(it); }
+  for (const QString& p : want) if (!T.files.count(p)) T.files[p] = QImage(p);
+}
+void MainWindow::toonLoadLib() { auto& T = scene_.toonView; T.lib = toon::Lib::fromJson(scene_.fileRaw.value("toon").toObject()); T.lib.ensureDefault(); toonLoadFiles(scene_); T.rev++; }
+void MainWindow::toonLibWrite() {
+  auto& T = scene_.toonView; scene_.fileRaw.insert("toon", T.lib.toJson()); toonLoadFiles(scene_); T.rev++; viewport_->bumpChanges(); viewport_->overlayTouch(); emit ToonHub::get()->changed(); }
+void MainWindow::toonSetOn(bool on) {
+  auto& T = scene_.toonView;
+  if (on) { toonLoadLib(); T.on = true; toonMapsRefresh(); } else { T.on = false; T.maps.clear(); }
+  viewport_->overlayTouch(); emit ToonHub::get()->changed();
+  ui::hud(on ? tr("Shader mode: on (double click — Materials & Shader)") : tr("Shader mode: off"), 1100);
+}
+// (each UV set's toon maps composed from the Paint room's layers: the maps with layers in the set — the others left out, their modules
+//  take their plain values; the gray masks laid over their ground as the shader will read them)
+void MainWindow::toonMapsRefresh(const QString& onlySet) {
+  auto& T = scene_.toonView;
+  if (!paint_ || paint_->doc.width() <= 0) { T.maps.clear(); viewport_->requestUpdate(); return; }
+  paint::Document& d = paint_->doc; const QString cur = d.activeSet(); const int cw = d.width(), chh = d.height();
+  using C = paint::Channel;   // (per slot: the Paint room's map; Count — not a painted map: the normal map made from the bump and the bake, the face SDF from its file)
+  static const paint::Channel chOf[toon::SlotCount] = {C::Color, C::Shade, C::ShadowMask, C::Specular, C::Rim, C::Emission, C::Count, C::Flow, C::Count, C::Outline, C::OverHair, C::MatId};
+  std::vector<QString> names; if (onlySet.isEmpty()) names = viewport_->uvSetNamesAll(); else names.push_back(onlySet);
+  for (const QString& name : names) {
+    if (name.isEmpty()) continue; const QSize sz = name == cur ? QSize(cw, chh) : d.setSize(name); if (sz.isEmpty()) continue;
+    if (name != d.activeSet()) { d.ensureLoaded(name); d.setActiveSet(name, sz.width(), sz.height()); }
+    auto& M = T.maps[name];
+    for (int s = 0; s < toon::SlotCount; s++) {
+      const paint::Channel ch = chOf[s]; QImage img;
+      if (s == toon::SNormal) img = paint_->normalResult();
+      else if (ch != C::Count && ch == C::Flow) { if (d.hasLayers(ch)) img = d.compose(ch).convertToFormat(QImage::Format_RGBA8888); }
+      else if (ch != C::Count && d.hasLayers(ch)) {
+        img = d.compose(ch).convertToFormat(QImage::Format_ARGB32);
+        const paint::MapInfo& mi = paint::mapInfo(ch);
+        if (mi.gray) { const int gr = qRed(mi.ground);   // (a mask over its ground: 50 % gray, black or white where nothing is painted)
+          for (int y = 0; y < img.height(); y++) { QRgb* q = reinterpret_cast<QRgb*>(img.scanLine(y));
+            for (int x = 0; x < img.width(); x++) { const int a = qAlpha(q[x]), l = (qRed(q[x]) * 299 + qGreen(q[x]) * 587 + qBlue(q[x]) * 114) / 1000, v = (l * a + gr * (255 - a)) / 255; q[x] = qRgb(v, v, v); } } }
+      }
+      M[size_t(s)] = {img, img.isNull() ? 0 : ++T.mapsRev};
+    }
+  }
+  if (d.activeSet() != cur) d.setActiveSet(cur, cw, chh);
+  viewport_->requestUpdate();
+}
+
+// (where the head is: Head Collision's middle; else the parts over the hair; else an object named Head — its middle, a size for the axes)
+bool MainWindow::toonHeadGuess(double c[3], double& size) const {
+  auto boxOf = [&](const std::function<bool(const Item&)>& take) { Box3 b; for (const auto& [id, it] : scene_.items) if (it.poly && take(it)) b.unite(it.poly->bounds()); return b; };
+  Box3 b = boxOf([](const Item& it) { return it.headTag; });
+  if (b.empty()) { const auto& L = scene_.toonView.lib; b = boxOf([&](const Item& it) { for (const auto& s : viewport_->uvSets(it.id)) if (L.roleFor(it.id, s.name) == "over") return true; return false; }); }
+  if (b.empty()) b = boxOf([](const Item& it) { return it.type == ItemType::IMesh && it.name.compare("Head", Qt::CaseInsensitive) == 0; });
+  if (b.empty()) return false;
+  const Vec3 m = b.center(); c[0] = m.x; c[1] = m.y; c[2] = m.z; size = std::max(1.0, b.size().length() * 0.3); return true;
+}
+
+// the shader written out for the engines (Release V2\Shader Plan, stage 6): every UV set's toon maps as PNG, hh_toon.json — the materials,
+// the instances, who wears which with its packed parameters (the same 32 float4 the viewport's shader reads), the roles, the head
+// locator — the shading core (one text: GLSL here and on the website, HLSL in Unreal and Unity) and the import scripts (resources/toon)
+QString MainWindow::toonExport(const QString& dir) {
+  QDir D(dir); if (!D.exists() && !D.mkpath(".")) return "!" + tr("The folder can't be made: %1").arg(dir);
+  auto& T = scene_.toonView; if (T.lib.mats.empty()) toonLoadLib();
+  toonMapsRefresh();                                            // (every set's maps from the Paint room's layers, as now)
+  D.mkpath("maps"); int nMaps = 0;
+  // (a set with nothing painted — the Paint room not opened, or no Base colour layers — gets the model's own textures as its Base colour)
+  auto maps = T.maps;
+  for (const QString& name : viewport_->uvSetNamesAll()) { auto& M = maps[name]; if (!M[toon::SBase].first.isNull()) continue;
+    const auto pr = viewport_->uvSetProps(name); const int w = pr.w > 0 ? pr.w : 2048, h = pr.h > 0 ? pr.h : 2048;
+    const QImage pic = modelTexturePicture(name, w, h); if (!pic.isNull()) M[toon::SBase] = {pic.convertToFormat(QImage::Format_ARGB32), 1}; }
+  QJsonObject setsJ;
+  for (const auto& [set, M] : maps) {
+    QJsonObject mj; const QString safe = QString(set).replace(QRegularExpression("[^A-Za-z0-9_.-]"), "_");
+    for (int s = 0; s < toon::SlotCount; s++) { if (M[size_t(s)].first.isNull()) continue;
+      const QString f = QString("maps/%1_%2.png").arg(safe, toon::slotName(s)); if (M[size_t(s)].first.save(D.filePath(f))) { mj[toon::slotName(s)] = f; nMaps++; } }
+    setsJ[set] = QJsonObject{{"maps", mj}}; }
+  QJsonObject files;                                            // (the face SDF pictures copied beside the maps)
+  for (const auto& [path, img] : T.files) if (!img.isNull()) { const QString f = "maps/sdf_" + QFileInfo(path).completeBaseName() + ".png"; if (img.save(D.filePath(f))) files[path] = f; }
+  // (each object's UV set: its instance, its role, its parameters packed with which maps its set has)
+  QJsonArray parts;
+  for (const auto& [id, it] : scene_.items) { if (it.type != ItemType::IMesh || !it.poly || it.headTag) continue;
+    for (const auto& s : viewport_->uvSets(id)) {
+      const QString inst = T.lib.instFor(id, s.name); std::array<bool, toon::SlotCount> has{};
+      if (auto m = maps.find(s.name); m != maps.end()) for (int k = 0; k < toon::SlotCount; k++) has[size_t(k)] = !m->second[size_t(k)].first.isNull();
+      const QJsonObject P = T.lib.paramsOf(inst); has[toon::SSdf] = files.contains(toon::str(P, "sdfPath"));
+      const auto u = toon::ubo(P, has, T.lib.head); QJsonArray pa; for (float x : u) pa.append(double(x));
+      parts.append(QJsonObject{{"object", it.name}, {"objectId", id}, {"set", s.name}, {"instance", inst}, {"role", T.lib.roleFor(id, s.name)},
+                               {"transparent", toonPartSeeThru(it, s.name)},
+                               {"sdf", files.value(toon::str(P, "sdfPath")).toString()}, {"P", pa}}); } }
+  QJsonArray insts; for (const auto& i : T.lib.insts) insts.append(QJsonObject{{"id", i.id}, {"name", i.name}, {"material", i.material}, {"over", i.over}, {"params", T.lib.paramsOf(i.id)}});
+  QJsonArray mats; for (const auto& m : T.lib.mats) mats.append(QJsonObject{{"id", m.id}, {"name", m.name}, {"params", toon::merged(m.params, {})}});
+  QJsonArray slotArr, srgb; for (int s = 0; s < toon::SlotCount; s++) { slotArr.append(toon::slotName(s)); srgb.append(toon::slotSrgb(s)); }
+  const QJsonObject J{{"app", "HairHarpy"}, {"format", 1}, {"project", QFileInfo(scene_.path).completeBaseName()}, {"core", "toon_core.glsl"},
+    {"slots", slotArr}, {"srgb", srgb}, {"sets", setsJ}, {"materials", mats}, {"instances", insts}, {"parts", parts}, {"head", T.lib.toJson().value("head")},
+    {"normalMap", "OpenGL (green up)"}, {"uv", "row 0 = the picture's top: v_image = 1 - v"}};
+  { QSaveFile f(D.filePath("hh_toon.json")); if (!f.open(QIODevice::WriteOnly)) return "!" + tr("hh_toon.json can't be written"); f.write(QJsonDocument(J).toJson()); f.commit(); }
+  // (the core and the templates: each engine's folder)
+  auto put = [&](const QString& res, const QString& to) { QFile r(res); if (!r.open(QIODevice::ReadOnly)) return false; D.mkpath(QFileInfo(D.filePath(to)).path());
+    QFile o(D.filePath(to)); if (!o.open(QIODevice::WriteOnly)) return false; o.write(r.readAll()); return true; };
+  bool ok = put(":/toon/toon_core.glsl", "toon_core.glsl") && put(":/toon/toon_core.glsl", "unity/hh_toon_core.hlsl") && put(":/toon/README.md", "README.md")
+    && put(":/toon/hh_toon_import.py", "unreal/hh_toon_import.py") && put(":/toon/hh_toon.js", "web/hh_toon.js")
+    && put(":/toon/HHToon.shader", "unity/HHToon.shader") && put(":/toon/HHToonImporter.cs", "unity/Editor/HHToonImporter.cs");
+  if (!ok) return "!" + tr("The templates could not all be written into %1").arg(dir);
+  return tr("Written into %1:\n%2 map(s) of %3 UV set(s), hh_toon.json (%4 part(s), %5 instance(s)), the shading core and the scripts for Unreal, the website and Unity — README.md says how to bring them in.")
+           .arg(dir).arg(nMaps).arg(setsJ.size()).arg(parts.size()).arg(T.lib.insts.size());
+}
+
 QImage MainWindow::paintWireImage() const {
   if (!paint_ || paint_->doc.width() <= 0) return {};
   const int W = paint_->doc.width(), H = paint_->doc.height(); viewport_->paintIslands(paint_->doc.activeSet(), W, H);

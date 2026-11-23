@@ -10,6 +10,7 @@
 #include <QLabel>
 #include <QMouseEvent>
 #include <QPushButton>
+#include <QScrollArea>
 #include <QSlider>
 #include <QVBoxLayout>
 #include <cmath>
@@ -50,7 +51,10 @@ ConvertPanel::ConvertPanel(Viewport* vp, Scene* sc, QWidget* parent) : QWidget(p
   auto* v = new QVBoxLayout(this); v->setSpacing(6);
   list_ = new QWidget; list_->setObjectName("convList"); list_->setStyleSheet("#convList{background:#1f1f1f;border-radius:4px}");
   listLay_ = new QVBoxLayout(list_); listLay_->setContentsMargins(3, 3, 3, 3); listLay_->setSpacing(0);
-  v->addWidget(list_);
+  // (the list scrolls by itself past 120 px — its rows never squeezed onto each other, the panel's height not jumping with it)
+  listScroll_ = new QScrollArea; listScroll_->setWidgetResizable(true); listScroll_->setFrameShape(QFrame::NoFrame);
+  listScroll_->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff); listScroll_->setStyleSheet("QScrollArea{background:#1f1f1f;border-radius:4px}");
+  listScroll_->setWidget(list_); v->addWidget(listScroll_);
 
   // Loop step (its lock groups'; none selected — the project's), Set reference
   { auto* h = new QHBoxLayout; h->setSpacing(6);
@@ -124,22 +128,29 @@ ConvertPanel::ConvertPanel(Viewport* vp, Scene* sc, QWidget* parent) : QWidget(p
   auto* conv = new QPushButton(tr("Convert")); conv->setProperty("primary", true);
   conv->setToolTip(tr("The selected cocoons' locks and braids → meshes in the Meshes group (their groups hidden; Ctrl+Z — all back). A braid's tubes are a mesh of their own, welded to nothing"));
   connect(conv, &QPushButton::clicked, this, [this] { vp_->convertSelected(); });
-  auto* hb = new QHBoxLayout; hb->addWidget(conv); hb->addStretch(1); v->addLayout(hb);
+  footer_ = new QWidget; auto* hb = new QHBoxLayout(footer_); hb->setContentsMargins(0, 0, 0, 0); hb->addWidget(conv); hb->addStretch(1);   // (MainWindow puts it under the panel's scrolled part: always in sight)
   sync();
 }
 
 void ConvertPanel::sync() {
   syncing_ = true;
   // the selected cocoons, as their tree (each under its nearest selected ancestor)
-  while (QLayoutItem* it = listLay_->takeAt(0)) { if (it->widget()) { it->widget()->hide(); it->widget()->deleteLater(); } delete it; }
   std::vector<int> ks; for (int id : vp_->selection().items) if (const Item* k = sc_->item(id); k && k->type == ItemType::Cocoon) ks.push_back(id);
   std::vector<int> bs; for (int id : vp_->selection().items) if (const int b = braid::braidOfItem(*sc_, id); b >= 0 && std::find(bs.begin(), bs.end(), b) == bs.end()) bs.push_back(b);
+  QString sig; for (int b : bs) sig += QString("b%1:%2;").arg(b).arg(sc_->item(b)->name);
+  for (int k : ks) sig += QString("k%1:%2:%3;").arg(k).arg(sc_->item(k)->parent).arg(sc_->item(k)->name);
+  if (sig != listSig_ || listLay_->count() == 0) { listSig_ = sig; rebuildList(ks, bs); }
+  syncRest();
+}
+
+void ConvertPanel::rebuildList(const std::vector<int>& ks, const std::vector<int>& bs) {
+  while (QLayoutItem* it = listLay_->takeAt(0)) { if (it->widget()) { it->widget()->hide(); it->widget()->deleteLater(); } delete it; }
   for (int b : bs) {   // (a braid: its tubes a mesh of their own, welded to nothing)
     auto* l = new QPushButton(QString::fromUtf8("⌇ ") + sc_->item(b)->name + tr(" — separate tubes, not welded")); l->setFlat(true);
     l->setStyleSheet("QPushButton{text-align:left;border:none;background:none;color:#dcf;padding:2px 4px}QPushButton:hover{background:#2a2a2a}");
     connect(l, &QPushButton::clicked, this, [this, b] { vp_->setSelectedItems({b}); }); listLay_->addWidget(l); }
   if (ks.empty() && bs.empty()) {
-    auto* l = new QLabel(tr("Select cocoons or braids to convert (in the outliner or in the viewport)")); l->setWordWrap(true);
+    auto* l = new QLabel(tr("Select cocoons or braids")); l->setToolTip(tr("Select cocoons or braids to convert (in the outliner or in the viewport)"));
     l->setStyleSheet("color:#777;padding:3px 4px"); listLay_->addWidget(l);
   } else {
     auto up = [&](int k) { for (const Item* p = sc_->item(sc_->item(k)->parent); p && p->type == ItemType::Cocoon; p = sc_->item(p->parent)) if (std::find(ks.begin(), ks.end(), p->id) != ks.end()) return p->id; return -1; };
@@ -153,7 +164,12 @@ void ConvertPanel::sync() {
     };
     for (int k : ks) if (up(k) < 0) walk(k, 0);
   }
-  list_->setMaximumHeight(120);
+  for (int i = 0; i < listLay_->count(); i++) if (QWidget* w = listLay_->itemAt(i)->widget()) w->show();   // (a new row is hidden until shown — the height below counts only shown ones)
+  listLay_->activate(); listScroll_->setFixedHeight(std::min(list_->sizeHint().height(), 120));
+}
+
+void ConvertPanel::syncRest() {
+  syncing_ = true;
   stepVal_->setText(fmtLen(vp_->refCube ? vp_->refCube->height : vp_->convValue("step").toDouble()));
   refBtn_->setChecked(vp_->refCube.has_value()); pickBtn_->setChecked(vp_->mergePick);
   double dv = vp_->convValue("dev").toDouble(0.3); dev_->setValue(int(std::lround(dv / 0.05))); devVal_->setText(QString("%1%").arg(int(std::lround(dv * 100))));

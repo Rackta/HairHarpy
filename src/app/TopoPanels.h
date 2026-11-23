@@ -60,6 +60,7 @@ private:
   QString optSig_;
   void buildOptions();                                  // (the Tool Options of the tool in use)
   void buildModelOptions(QVBoxLayout* L);
+  void buildScissorsOptions(QVBoxLayout* L);             // (the Scissors tool: the radius, the Split button)
   void buildSubdivOptions(QVBoxLayout* L);                // (the Subdivide tool: simple / smooth, levels, the button)
   void buildModGroupOptions(QVBoxLayout* L);              // (the Modifier groups tool: every kind of group, the selected one's Apply / Remove)
   void runAct(const QString& a);                         // (the toolbar's one-click edits)

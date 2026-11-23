@@ -1,4 +1,5 @@
 ﻿#include "scene/Cocoons.h"
+#include "scene/Edit.h"
 #include <array>
 #include <QJsonArray>
 #include <QJsonObject>
@@ -286,6 +287,10 @@ public:
       int t = k.ends[0][1]; bool all = true;
       for (auto& e : k.ends) if (e.size() < 2 || e[1] != t) all = false;
       if (all) for (const Item* c : curves) if (std::find(c->anchors.begin(), c->anchors.end(), t) != c->anchors.end()) { out.tipP.push_back(apos(t)); break; }
+      // (a cut lock: every strand ending at one cap — the tip closed by one polygon)
+      if (!all) { const auto caps = edit::capTips(sc); auto f0 = caps.find(t); bool cap = f0 != caps.end();
+        for (auto& e : k.ends) { if (!cap) break; auto f = e.size() >= 2 ? caps.find(e[1]) : caps.end(); if (f == caps.end() || f->second != f0->second) cap = false; }
+        out.capped = cap; }
     }
     return true;
   }
@@ -495,8 +500,10 @@ private:
       for (auto& p : P) push(pathAnchorIds(p));
     }
     for (const Item* c : cs) if (!segNet(*c)) { auto ids = c->anchors; if (!(apos(ids.front()).y >= apos(ids.back()).y)) std::reverse(ids.begin(), ids.end()); push(ids); }
+    // (the ends of a cap: one tip — a cut lock's strands end apart, at its cap)
+    const auto caps = edit::capTips(sc); auto tipOf = [&](int t) { auto f = caps.find(t); return f == caps.end() ? t : f->second; };
     std::vector<int> tipOrder; std::map<int, std::vector<std::vector<int>>> byTip;
-    for (auto& e : out) { if (!byTip.count(e[1])) tipOrder.push_back(e[1]); byTip[e[1]].push_back(e); }
+    for (auto& e : out) { const int t = tipOf(e[1]); if (!byTip.count(t)) tipOrder.push_back(t); byTip[t].push_back(e); }
     if (byTip.size() > 1) {
       const std::vector<std::vector<int>>* best = nullptr;
       for (int t : tipOrder) { auto& l = byTip[t]; if (!best || l.size() > best->size() || (l.size() == best->size() && l[0].size() > (*best)[0].size())) best = &l; }
@@ -635,7 +642,13 @@ private:
     std::vector<std::vector<double>> arcs; for (auto& Q : polys) arcs.push_back(turnParam(Q));
     { bool same = coil; for (auto& Q : polys) if (Q.size() != polys[0].size()) same = false;   // (edges of one converted lock: point i of each is one cross-section)
       if (same) for (auto& a : arcs) for (size_t j = 0; j < a.size(); j++) a[j] = double(j) / std::max<size_t>(a.size() - 1, 1); }   // (how far along each strand: by the turns it has made — a small turn at the tip counts as a big one at the root)
-    std::vector<std::vector<Vec3>> R; for (size_t i = 0; i < polys.size(); i++) if (lens[i] >= 0.85 * mx) R.push_back(coil ? resampleBy(polys[i], arcs[i], N) : resample(polys[i], N));
+    std::vector<std::vector<Vec3>> R; std::vector<int> rOf(polys.size(), -1);
+    for (size_t i = 0; i < polys.size(); i++) if (lens[i] >= 0.85 * mx) { rOf[i] = int(R.size()); R.push_back(coil ? resampleBy(polys[i], arcs[i], N) : resample(polys[i], N)); }
+    // (the stations near the root and the tip: the strands start / end at different heights there — a slanted root, a cut tip
+    // under a cap — and the station's plane misses some of them; fitted to the rest, the station jumped aside and the
+    // shell bent there. Such a station takes each full strand's point at its own share of the length, as the spine does)
+    const int endZone = std::max(3, N / 10);
+    auto atEnd = [&](int i) { return !coil && (i < endZone || i > N - 1 - endZone); };
     std::vector<Vec3> S(N); for (int k = 0; k < N; k++) { Vec3 s; for (auto& r : R) s += r[k]; S[k] = s / double(R.size()); }
     double rad = 0; for (auto& Q : polys) for (auto& q : Q) rad = std::max(rad, q.distanceTo(S[std::clamp(jsRound(nearestF(S, q)), 0, N - 1)]));
     double reach = 2 * rad + lv;
@@ -653,7 +666,8 @@ private:
     };
     for (int i = 0; i < N; i++) {
       Vec3 o = S[i], t = (S[std::min(i + 1, N - 1)] - S[std::max(i - 1, 0)]).normalized();
-      std::vector<Vec3> pts; for (size_t qi = 0; qi < polys.size(); qi++) { Vec3 b; if (crossAt(qi, double(i) / (N - 1), o, t, reach, b)) pts.push_back(b); }
+      std::vector<Vec3> pts; size_t fullHit = 0; for (size_t qi = 0; qi < polys.size(); qi++) { Vec3 b; if (crossAt(qi, double(i) / (N - 1), o, t, reach, b)) { pts.push_back(b); if (rOf[qi] >= 0) fullHit++; } }
+      if (atEnd(i) && fullHit < R.size() && R.size() >= 2) { pts.clear(); for (auto& r : R) pts.push_back(r[size_t(i)]); }
       Vec3 e1 = std::abs(t.y) < 0.9 ? Vec3(0, 1, 0).cross(t).normalized() : Vec3(1, 0, 0).cross(t).normalized(), e2 = t.cross(e1);
       if (pts.size() >= 4) {
         Vec3 m0; for (auto& p : pts) m0 += p; m0 = m0 / double(pts.size());
@@ -699,7 +713,10 @@ private:
       Vec3 t = (fc[std::min(i + 1, N - 1)] - fc[std::max(i - 1, 0)]).normalized(), u0 = out.u[i];
       Vec3 u = (u0 - t * u0.dot(t)).normalized(), v = t.cross(u), o = fc[i];
       double nearL = 1.6 * std::max(A[i], B[i]), a0 = INF, a1 = -INF, b0 = INF, b1 = -INF; int m = 0;
-      for (size_t qi = 0; qi < polys.size(); qi++) { Vec3 b; if (crossAt(qi, double(i) / (N - 1), o, t, std::min(reach, nearL), b)) { Vec3 d = b - o; double x = d.dot(u), y = d.dot(v); a0 = std::min(a0, x); a1 = std::max(a1, x); b0 = std::min(b0, y); b1 = std::max(b1, y); m++; } }
+      std::vector<Vec3> hit; size_t fullHit = 0;
+      for (size_t qi = 0; qi < polys.size(); qi++) { Vec3 b; if (crossAt(qi, double(i) / (N - 1), o, t, std::min(reach, nearL), b)) { hit.push_back(b); if (rOf[qi] >= 0) fullHit++; } }
+      if (atEnd(i) && fullHit < R.size() && R.size() >= 2) { hit.clear(); for (auto& r : R) hit.push_back(r[size_t(i)]); }   // (as above)
+      for (const Vec3& b : hit) { Vec3 d = b - o; double x = d.dot(u), y = d.dot(v); a0 = std::min(a0, x); a1 = std::max(a1, x); b0 = std::min(b0, y); b1 = std::max(b1, y); m++; }
       if (m >= 2) { ra[i] = std::max((a1 - a0) / 2, minR); rb[i] = std::max((b1 - b0) / 2, minR); }
     }
     std::vector<double> big; for (int i = 0; i < N; i++) big.push_back(std::max(ra[i], rb[i]));

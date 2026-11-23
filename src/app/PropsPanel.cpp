@@ -533,6 +533,13 @@ QWidget* buildPropsPanel(Viewport* vp, Scene* sc, int pinned) {
     tubeProps(v, vp, sc, iid);
   } else if (it->type == ItemType::XMod) {
     xmodProps(v, vp, sc, iid);
+  } else if (it->type == ItemType::Cap && it->raw.value("ends").isArray()) {   // ◒ a cut tip: its ends — one tip of the lock, closed by an n-gon on Convert
+    const auto ends = edit::capAnchors(*sc, *it);
+    v->addWidget(muted(QObject::tr("Ends: %1").arg(ends.size())));
+    auto* sa = button(QObject::tr("Select its ends"), QObject::tr("The cap's anchors selected"));
+    QObject::connect(sa, &QPushButton::clicked, vp, [vp, ends] { vp->setSelectedAnchors(ends); }); v->addWidget(sa, 0, Qt::AlignLeft);
+    auto* rm = button(QObject::tr("◒ Remove cap"), QObject::tr("The curve ends are separate tips again"));
+    QObject::connect(rm, &QPushButton::clicked, vp, [vp, ends] { vp->runEdit([ends](Scene& s2, Selection& sl, const CurveCache&) { return edit::removeCaps(s2, ends, sl); }, true); }); v->addWidget(rm, 0, Qt::AlignLeft);
   } else {
     v->addWidget(muted(QObject::tr("The settings of this kind come with its tool in the next parts of this rewrite.")));
   }

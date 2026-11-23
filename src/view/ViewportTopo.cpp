@@ -461,6 +461,7 @@ bool Viewport::topoPress(QMouseEvent* e) {
     td_.type = 4; drag_ = Drag::Topo; smPaint(mp); return true;
   }
   // the move brush: LMB a stroke (Shift — smooth, Shift+Ctrl — relax); Ctrl+RMB drag — its size
+  if (tool_ == "tscissors" && e->button() == Qt::RightButton && ctrl && !shift) { bd_ = {}; bd_.start = mp; bd_.r0 = ttools.scisPx; drag_ = Drag::BrushAdjust; return true; }   // (the Scissors: Ctrl+RMB drag — the spread, as Split ends)
   if (tool_ == "treveal" && e->button() == Qt::RightButton && ctrl) { bd_ = {}; bd_.start = mp; bd_.r0 = brushR; bd_.h0 = brushHard; drag_ = Drag::BrushAdjust; return true; }   // (the Reveal Brush: Ctrl+RMB drag — its size, as the brushes)
   if (tool_ == "tbrush" && e->button() == Qt::RightButton && !ctrl) {   // (RMB: the brush's own stroke, along the normals — Move: each vertex along its normal, not the screen's plane)
     if (hairBrushSel()) { startBrush(mp, shift); return true; }
@@ -472,7 +473,7 @@ bool Viewport::topoPress(QMouseEvent* e) {
   }
   if (isModelTool() && e->button() == Qt::LeftButton && topoToolPress(e)) return true;   // (the modelling tools)
   if (e->button() != Qt::LeftButton) return e->button() == Qt::RightButton && !shift;   // (RMB: nothing of the hair tools here)
-  if (tool_ != "cursor" && tool_ != "move" && tool_ != "rotate" && tool_ != "gizmo" && tool_ != "tchain" && tool_ != "tweld" && tool_ != "tshaper" && tool_ != "tslide" && tool_ != "tnormals" && tool_ != "tbridge" && tool_ != "tmirror" && tool_ != "tfixmesh" && tool_ != "toptimize" && tool_ != "tmodgroups" && tool_ != "tsubdiv") return true;
+  if (tool_ != "cursor" && tool_ != "move" && tool_ != "rotate" && tool_ != "gizmo" && tool_ != "tchain" && tool_ != "tweld" && tool_ != "tshaper" && tool_ != "tslide" && tool_ != "tnormals" && tool_ != "tbridge" && tool_ != "tmirror" && tool_ != "tfixmesh" && tool_ != "toptimize" && tool_ != "tmodgroups" && tool_ != "tsubdiv" && tool_ != "tscissors") return true;
   if ((tool_ == "move" || tool_ == "rotate" || tool_ == "gizmo") && gizmoPress(mp, ctrl && !shift)) return true;   // (the gizmo's handle takes it; Ctrl — extruded first)
   // (Scale + Ctrl, a drag anywhere off its handles: polygons inserted — the selection inset in place, then scaled evenly
   // about its middle: Ctrl+drag in — a ring of new polygons round it)
@@ -571,8 +572,9 @@ void Viewport::topoDouble(int m, const TopoPick& r, char key, int a, const std::
 bool Viewport::topoDblClick(QMouseEvent*) { return room() == "topo"; }   // (the double click is told by the press times)
 
 void Viewport::topoHover(const QPointF& mp, Qt::KeyboardModifiers mods) {
+  if (tool_ == "tscissors") { overlayRev_++; requestUpdate(); }   // (the Scissors: the spread circle follows the pointer — the selection's hover goes on below)
   if (tool_ == "tbrush") { overlayRev_++; requestUpdate(); return; }   // (the brush: its circles drawn with the overlay at the pointer)
-  const bool over = (tool_ == "cursor" || tool_ == "move" || tool_ == "rotate" || tool_ == "gizmo" || tool_ == "tchain" || tool_ == "tweld" || tool_ == "tshaper" || tool_ == "tslide" || tool_ == "tnormals" || tool_ == "tbridge" || tool_ == "tmirror" || tool_ == "tfixmesh" || tool_ == "toptimize" || tool_ == "tmodgroups" || tool_ == "tsubdiv") && !ui::Pie::current();
+  const bool over = (tool_ == "cursor" || tool_ == "move" || tool_ == "rotate" || tool_ == "gizmo" || tool_ == "tchain" || tool_ == "tweld" || tool_ == "tshaper" || tool_ == "tslide" || tool_ == "tnormals" || tool_ == "tbridge" || tool_ == "tmirror" || tool_ == "tfixmesh" || tool_ == "toptimize" || tool_ == "tmodgroups" || tool_ == "tsubdiv" || tool_ == "tscissors") && !ui::Pie::current();
   // Object mode, Ctrl+Shift over the selected mesh: its polygroup under the cursor lights up
   if (over && topoMode == "object" && (mods & Qt::ControlModifier) && (mods & Qt::ShiftModifier)) {
     int am = topoMesh(); auto r = am >= 0 ? tPick(mp, {am}) : std::nullopt;

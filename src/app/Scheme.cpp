@@ -319,6 +319,7 @@ SchemeView::SchemeView(Viewport* vp, Scene* sc, int gid, int width, QWidget* par
   for (int id : g->children) if (const Item* x = sc->item(id)) {
     if (x->type == ItemType::Surface) ws_.push_back(id);
     else if (x->type == ItemType::Curve && (x->hasPath() || x->junc) && x->ring < 0) ecs_.push_back(id);
+    else if (x->type == ItemType::Cap) caps_.push_back(id);
   }
   layoutAll();
 }
@@ -417,6 +418,7 @@ void SchemeView::layoutAll() {
   };
   row(tr("Surfaces"), ws_, true);
   row(tr("Service curves"), ecs_, false);
+  row(tr("Caps"), caps_, false);
   y += 5; listBtn_ = QRectF(x0, y, fm.horizontalAdvance(tr("≡ List")) + 18, 20);
   resetBtn_ = sp_.empty() ? QRectF() : QRectF(listBtn_.right() + 6, y, fm.horizontalAdvance(tr("↺ Layout")) + 18, 20);
   h_ = y + 20 + 6;

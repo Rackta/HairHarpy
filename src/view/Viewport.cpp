@@ -26,6 +26,7 @@
 #include <unordered_set>
 #include <cstring>
 #include <QJsonDocument>
+#include "paint/StrokeTrace.h"
 
 namespace hm {
 
@@ -213,6 +214,13 @@ std::vector<Viewport::Overlay> Viewport::overlays() const {
     for (int i = 0; i < 64; i++) { double t = 2 * M_PI * i / 64; P.push_back({c.x() + ribR * std::cos(t), c.y() + ribR * std::sin(t)}); }
     out.push_back({P, QColor(0xc0, 0x80, 0xe0), true});
   }
+  if (tool_ == "tscissors" && room() == "topo") {                    // (the Topology Scissors: the spread circle, both branches as they would be)
+    if (inViewport_ || drag_ == Drag::BrushAdjust) { QPointF c = drag_ == Drag::BrushAdjust ? bd_.start : mouse_; std::vector<std::pair<double, double>> P;
+      for (int i = 0; i < 64; i++) { double t = 2 * M_PI * i / 64; P.push_back({c.x() + ttools.scisPx * std::cos(t), c.y() + ttools.scisPx * std::sin(t)}); }
+      out.push_back({P, QColor(0xff, 0xbe, 0x5a), true}); }
+    Projector P = projector();
+    for (auto& [a, b] : scisViz_) { ScreenPt s = P.toScreen(a), t = P.toScreen(b); if (s.z < 1 && t.z < 1) out.push_back({{{s.x, s.y}, {t.x, t.y}}, QColor(0xff, 0x8a, 0x3d), false}); }
+  }
   if (tool_ == "cut" && cutMode == "ends" && (inViewport_ || drag_ == Drag::BrushAdjust)) {   // (Split ends: the spread circle)
     QPointF c = drag_ == Drag::BrushAdjust ? bd_.start : mouse_; std::vector<std::pair<double, double>> P;
     for (int i = 0; i < 64; i++) { double t = 2 * M_PI * i / 64; P.push_back({c.x() + splitR * std::cos(t), c.y() + splitR * std::sin(t)}); }
@@ -397,6 +405,7 @@ bool Viewport::meshWeightsShown(int mesh) const {
 
 void Viewport::beforeFrame() {
   ProfScope prof_("beforeFrame");
+  scisPreview();                                           // (the Topology Scissors: its preview kept up to date)
   syncPaneCams();                                          // (the Paint room: the windows whose cameras follow the main view's)
   meshmods::paintVis = room() == "paint";
   if (!meshmods::refresh(*scene_, meshSig_, [this](int m) { return meshWeightsShown(m); }).empty()) staticRev_++;   // (imported meshes: their modifiers)
@@ -408,6 +417,7 @@ void Viewport::beforeFrame() {
   if (pendingCurves_.empty()) { syncTubes(); syncCrowns(); syncRibs(); syncKinks(); return; }
   bool draft = drag_ == Drag::Anchor || drag_ == Drag::Gizmo || drag_ == Drag::Brush || drag_ == Drag::BrushSmooth || drag_ == Drag::Inflate;
   for (int id : pendingCurves_) if (const Item* c = scene_->item(id); c && c->ring >= 0) { ringsDirty_ = true; break; }   // (a disc's rings: its surface)
+  if (const auto caps = edit::capTips(*scene_); !caps.empty()) for (int id : pendingCurves_) if (const Item* c = scene_->item(id); c && !c->anchors.empty() && (caps.count(c->anchors.front()) || caps.count(c->anchors.back()))) { ringsDirty_ = true; break; }   // (◒ a cap's end moved: its polygon)
   HairChanges ch = hair_.apply(*scene_, pendingCurves_, draft);
   pendingCurves_.clear();
   dirtyWalls_.insert(ch.walls.begin(), ch.walls.end());
@@ -1186,6 +1196,8 @@ QMouseEvent localEvent(QMouseEvent* e, const QPointF& origin) { return QMouseEve
 }  // namespace
 
 void Viewport::mousePressEvent(QMouseEvent* ev) {
+  if (room() == "paint" && strace::on()) { const QPointF g = ev->globalPosition();   // (the stroke trace: the mouse events the brush follows over the model — made by Qt from the pen too)
+    strace::line("mouse", {{"k", 0}, {"x", g.x()}, {"y", g.y()}, {"ts", double(ev->timestamp())}, {"btn", double(int(ev->buttons()))}, {"synth", ev->source() != Qt::MouseEventNotSynthesized ? 1 : 0}, {"pen", paintPenNow() ? 1 : 0}, {"p", paintPressureNow()}}, "\"w\":\"view\""); }
   // (another button already held: its drag goes on — this press starts nothing, and its release is let pass too)
   if (ev->buttons() & ~Qt::MouseButtons(ev->button())) { ignoreUp_ |= ev->button(); return; }
   ignoreUp_ = Qt::NoButton;                                    // (no other button held: nothing left to let pass)
@@ -1231,6 +1243,8 @@ void Viewport::mousePressEvent(QMouseEvent* ev) {
   }
   if (room() == "topo") {                                    // (the Topology room: its own Cursor — none of the hair tools)
     if (topoToolRmb(e)) return;                              // (a topology tool's own RMB menus)
+    if (tool_ == "tscissors" && e->button() == Qt::RightButton && !ctrl && !shift && !alt) { tScissors(); return; }   // (the Scissors: a plain RMB cuts — as the orange lines show)
+    if (tool_ == "tscissors" && e->button() == Qt::RightButton && ctrl && !shift) { bd_ = {}; bd_.start = m; bd_.r0 = ttools.scisPx; drag_ = Drag::BrushAdjust; return; }   // (the Scissors: Ctrl+RMB drag — the spread, not the edits' pie)
     if ((ui::Keymap::get().pieMouse("main", mb, mm) || (mb == 3 && !mm)) && tool_ != "treveal" && !(tool_ == "tbrush" && mb == 3 && !mm)) { emit pieRequested(toGlobal(m)); return; }   // (a plain RMB too, where no tool took it; the Reveal Brush: no pies — its RMB is its size; the brush: its RMB is its stroke along the normals)
     if (ui::Keymap::get().pieMouse("ops", mb, mm) && tool_ != "tbrush" && tool_ != "tmask" && tool_ != "treveal") { emit opsPieRequested(toGlobal(m)); return; }   // (Ctrl+RMB: the edits)
     topoPress(e); return;
@@ -1306,6 +1320,8 @@ void Viewport::mousePressEvent(QMouseEvent* ev) {
 }
 
 void Viewport::mouseMoveEvent(QMouseEvent* ev) {
+  if (room() == "paint" && strace::on()) { const QPointF g = ev->globalPosition();   // (the stroke trace: the mouse events the brush follows over the model — made by Qt from the pen too)
+    strace::line("mouse", {{"k", 1}, {"x", g.x()}, {"y", g.y()}, {"ts", double(ev->timestamp())}, {"btn", double(int(ev->buttons()))}, {"synth", ev->source() != Qt::MouseEventNotSynthesized ? 1 : 0}, {"pen", paintPenNow() ? 1 : 0}, {"p", paintPressureNow()}}, "\"w\":\"view\""); }
   if (drag_ == Drag::None && !ev->buttons()) { choosePane(ev->position()); syncCursor(); }
   QMouseEvent le = localEvent(ev, paneOrigin()); QMouseEvent* e = &le;
   QPointF m = e->position(), d = m - last_;
@@ -1393,6 +1409,8 @@ void Viewport::mouseMoveEvent(QMouseEvent* ev) {
 }
 
 void Viewport::mouseReleaseEvent(QMouseEvent* ev) {
+  if (room() == "paint" && strace::on()) { const QPointF g = ev->globalPosition();   // (the stroke trace: the mouse events the brush follows over the model — made by Qt from the pen too)
+    strace::line("mouse", {{"k", 2}, {"x", g.x()}, {"y", g.y()}, {"ts", double(ev->timestamp())}, {"btn", double(int(ev->buttons()))}, {"synth", ev->source() != Qt::MouseEventNotSynthesized ? 1 : 0}, {"pen", paintPenNow() ? 1 : 0}, {"p", paintPressureNow()}}, "\"w\":\"view\""); }
   if (ignoreUp_.testFlag(ev->button())) { ignoreUp_ &= ~Qt::MouseButtons(ev->button()); return; }   // (a button pressed during another's drag: its release ends nothing)
   QMouseEvent le = localEvent(ev, paneOrigin()); QMouseEvent* e = &le;
   QPointF m = e->position(); Drag d = drag_;

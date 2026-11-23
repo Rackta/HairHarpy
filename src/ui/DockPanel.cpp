@@ -57,13 +57,23 @@ DockPanel::DockPanel(const QString& title, DockColumn* column, bool collapsible,
 
 void DockPanel::setBody(QWidget* w) {
   const int keepY = scroll_->verticalScrollBar()->value();      // (the panel made anew — a list switched, a setting changed: it stays where it was scrolled)
-  QWidget* old = scroll_->takeWidget(); if (old) { old->hide(); old->deleteLater(); }
+  QWidget* old = scroll_->takeWidget(); if (old) { old->removeEventFilter(this); old->hide(); old->deleteLater(); }
+  w->installEventFilter(this);   // (its content grew or shrank: the panel's height follows — the bottom buttons never pushed out of sight)
   w->setObjectName("dbody"); { QPalette pl = w->palette(); pl.setColor(QPalette::Window, QColor(0x26, 0x26, 0x26)); w->setPalette(pl); w->setAutoFillBackground(true); }   // (its background — a palette, not a style sheet: that would polish every child again)
   if (w->layout()) { w->layout()->setContentsMargins(8, 8, 8, 8); w->layout()->setSizeConstraint(QLayout::SetMinimumSize); }   // (too tall: it scrolls, never squeezed)
   scroll_->setWidget(w); body_ = w;
   if (keepY > 0) { scroll_->verticalScrollBar()->setValue(keepY); QTimer::singleShot(0, scroll_, [s = QPointer<QScrollArea>(scroll_), keepY] { if (s) s->verticalScrollBar()->setValue(keepY); }); }
   foldHelp();
   QTimer::singleShot(0, column_, [c = QPointer<DockColumn>(column_)] { if (c) c->relayout(); });   // (the help paragraphs folded: the panel's height made anew — not left as it was)
+}
+
+void DockPanel::setFooter(QWidget* w) {
+  if (footer_) { footer_->hide(); footer_->deleteLater(); }
+  footer_ = w; if (!w) return;
+  w->setObjectName("dfoot"); { QPalette pl = w->palette(); pl.setColor(QPalette::Window, QColor(0x26, 0x26, 0x26)); w->setPalette(pl); w->setAutoFillBackground(true); }
+  if (w->layout()) w->layout()->setContentsMargins(8, 4, 8, 8);
+  static_cast<QVBoxLayout*>(layout())->insertWidget(layout()->indexOf(scroll_) + 1, w);
+  w->setVisible(!collapsed_); updateGeometry();
 }
 
 // the grey paragraphs of 90+ characters (no colour of their own, no children) leave the window — under the ?
@@ -96,7 +106,14 @@ void DockPanel::setTitle(const QString& t) { title_->setText(t); setProperty("dp
 // (docked, not growing: as tall as its content, up to 30 % of the column — the rest scrolls)
 QSize DockPanel::sizeHint() const {
   int h = head_->height() + 2;
-  if (!collapsed_ && body_) h += std::min(body_->sizeHint().height(), int(column_->height() * 0.5));
+  if (!collapsed_ && body_) {
+    // (wrapped text: its height at the width it really has — the plain size hint is for one long line, and the panel came out
+    //  too short: the last button below the edge, a scroll bar → narrower → taller → no scroll bar → … the panel jumping)
+    int bh = body_->sizeHint().height();
+    if (const int w = scroll_->viewport()->width(); w > 50 && body_->hasHeightForWidth()) bh = std::max(bh, body_->heightForWidth(w - scroll_->verticalScrollBar()->sizeHint().width()));
+    const int fh = footer_ ? footer_->sizeHint().height() : 0;
+    h += fh + std::min(bh, std::max(60, int(column_->height() * 0.5) - fh));
+  }
   return QSize(QFrame::sizeHint().width(), h);
 }
 
@@ -107,7 +124,7 @@ void DockPanel::setWanted(bool on) {
 }
 
 void DockPanel::setCollapsed(bool on) {
-  collapsed_ = on; scroll_->setVisible(!on);
+  collapsed_ = on; scroll_->setVisible(!on); if (footer_) footer_->setVisible(!on);
   if (colBtn_) colBtn_->setText(on ? "▸" : "▾");
   if (floating_) adjustSize();
   column_->relayout();
@@ -131,6 +148,7 @@ void DockPanel::setFloating(bool on, const QPoint& global) {
 }
 
 bool DockPanel::eventFilter(QObject* o, QEvent* e) {
+  if (o == body_ && e->type() == QEvent::LayoutRequest && !floating_) { if (sizeHint().height() != height()) updateGeometry(); return false; }
   if (o == helpBtn_) { if (e->type() == QEvent::Enter) showHelp(true); else if (e->type() == QEvent::Leave && !helpBtn_->isChecked()) showHelp(false); return false; }
   if (o != head_ && o != title_) return QFrame::eventFilter(o, e);
   if (e->type() == QEvent::MouseButtonPress) {

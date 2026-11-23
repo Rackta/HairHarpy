@@ -48,6 +48,7 @@ const std::vector<MapInfo>& maps() {
     {Channel::MatId, "matid", "Material ID", "ID", Storage::Colour, false, qRgba(0, 0, 0, 0), "Flat colours that tell the surfaces apart (skin / cloth / metal / hair): the shader picks a shadow ramp or a material by them (the light map's alpha in Genshin), other programs select by them."},
     {Channel::Height, "height", "Normal (painted as a bump)", "Normal", Storage::Relief, true, qRgb(128, 128, 128), "The relief painted as a bump — raise and lower, 50% gray is flat — and turned into the normal map (with the baked normals where the Bake mask lets them through). Folds, seams, stitches."},
     {Channel::BakeMask, "bakemask", "Bake mask", "BakeMask", Storage::Colour, true, qRgb(0, 0, 0), "Where the normals come from the high-poly: paint white over the folds of the cloth and only they are baked and used — the rest of the model keeps its own smooth normals."},
+    {Channel::OverHair, "overhair", "Over hair", "OverHair", Storage::Colour, true, qRgb(255, 255, 255), "Where a part whose role is Over the hair (brows, lashes, the eyes) shows through the hair in the shader mode, and how much: white — fully, black — the hair hides it as always. Not painted — the whole part shows through."},
     {Channel::Flow, "flow", "Flow (hair highlight)", "Flow", Storage::Direction, false, qRgba(128, 128, 128, 0), "The direction the anisotropic highlight runs across — the stroke's own direction is written. The hair's band of light, satin."},
   };
   return M;

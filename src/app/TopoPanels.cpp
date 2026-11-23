@@ -1,10 +1,13 @@
 ﻿#include "ui/Keymap.h"
 #include "app/TopoPanels.h"
+#include "app/ToonUi.h"
 #include "app/SymPanel.h"
 #include "app/Outliner.h"
 #include "scene/Primitives.h"
 #include "app/ImportWindow.h"
 #include <QPainter>
+#include <QPainterPath>
+#include <QButtonGroup>
 #include <QScrollArea>
 #include <QToolButton>
 #include <QWidgetAction>
@@ -471,6 +474,8 @@ TopoModes::TopoModes(Viewport* vp, QWidget* parent) : QFrame(parent), vp_(vp) {
     if (w->isVisible()) { w->hide(); mt->setChecked(false); return; }
     w->refresh(); w->move(mt->mapToGlobal(QPoint(mt->width() + 8, 0))); w->show(); mt->setChecked(true); });
   v->addWidget(mkGap(), 0, Qt::AlignHCenter); v->addWidget(mt);
+  // (the shader mode under UV Mats: a click — on / off, a double click — Materials & Shader)
+  v->addWidget(mkGap(), 0, Qt::AlignHCenter); v->addWidget(new ToonButton(32));
   connect(vp, &Viewport::topoState, this, &TopoModes::sync);
   connect(vp, &Viewport::toolChanged, this, &TopoModes::sync);
   connect(vp, &Viewport::selectionChanged, this, &TopoModes::sync);
@@ -492,17 +497,17 @@ void TopoModes::sync() {
 // ---------- the UV mode's window ----------
 namespace {
 // a picture from a glyph (a function with no icon of its own yet)
-// The pictures of the UV tools that had no icon: the same look as the others — a dark rounded square, light round-capped lines, dashed grey frames, the orange shell
+// The pictures of the UV tools that had no icon: the same look as the others — a dark rounded square, light round-capped lines, dashed grey frames, the UV tools' dark orange (as Send to Rizom)
 QIcon drawnToolIcon(const QString& key) {
   static const QStringList known{"＋", "⇲", "⊘", "◐", "✕", "✂", "~", "Rizom", "Overlap", "⤢", "⇹", "⇳", "▦", "⟋", "∟", "⇡", "⧉", "⧈", "⇆", "≈", "📍", "✋", "∠", "🖼"};
   if (!known.contains(key)) return {};
   const int S = 128; QPixmap pm(S, S); pm.fill(Qt::transparent); QPainter p(&pm); p.setRenderHint(QPainter::Antialiasing);
-  const QColor bg(0x21, 0x21, 0x21), lt(0xd0, 0xd0, 0xd0), dm(0x78, 0x78, 0x78), og(0xf0, 0x70, 0x1c);
+  const QColor bg(0x21, 0x21, 0x21), lt(0xd0, 0xd0, 0xd0), dm(0x78, 0x78, 0x78), og(0xe8, 0x40, 0x00);
   p.setPen(Qt::NoPen); p.setBrush(bg); p.drawRoundedRect(QRectF(0, 0, S, S), 26, 26);
   auto L = [&](double a, double b, double c, double d, QColor col = QColor(0xd0, 0xd0, 0xd0), double w = 7) { QPen pen(col, w); pen.setCapStyle(Qt::RoundCap); p.setPen(pen); p.drawLine(QPointF(a, b), QPointF(c, d)); };
   auto arrow = [&](double a, double b, double c, double d) { L(a, b, c, d); const double dx = c - a, dy = d - b, n = std::hypot(dx, dy); if (n < 1e-6) return; const double ux = dx / n, uy = dy / n;
     L(c, d, c - ux * 12 - uy * 8, d - uy * 12 + ux * 8); L(c, d, c - ux * 12 + uy * 8, d - uy * 12 - ux * 8); };
-  auto sq = [&](double x, double y, double w, double h, QColor f = QColor(0xf0, 0x70, 0x1c)) { p.setPen(Qt::NoPen); p.setBrush(f); p.drawRoundedRect(QRectF(x, y, w, h), 4, 4); };
+  auto sq = [&](double x, double y, double w, double h, QColor f = QColor(0xe8, 0x40, 0x00)) { p.setPen(Qt::NoPen); p.setBrush(f); p.drawRoundedRect(QRectF(x, y, w, h), 4, 4); };
   auto frame = [&](double x, double y, double w, double h, QColor c, bool dash = false) { QPen pen(c, 5); pen.setCapStyle(Qt::RoundCap); if (dash) pen.setStyle(Qt::DashLine); p.setPen(pen); p.setBrush(Qt::NoBrush); p.drawRoundedRect(QRectF(x, y, w, h), 4, 4); };
   auto circ = [&](double x, double y, double r, QColor c, double w = 6, bool fill = false) { p.setPen(QPen(c, w)); p.setBrush(fill ? c : Qt::NoBrush); p.drawEllipse(QPointF(x, y), r, r); };
   if (key == "＋") { frame(26, 26, 76, 76, dm, true); sq(50, 50, 28, 28); L(64, 36, 64, 92, lt, 6); L(36, 64, 92, 64, lt, 6); sq(54, 54, 20, 20); }
@@ -513,7 +518,7 @@ QIcon drawnToolIcon(const QString& key) {
   else if (key == "✂") { circ(40, 92, 14, lt, 6); circ(88, 92, 14, lt, 6); L(46, 80, 92, 30, lt, 6); L(82, 80, 36, 30, lt, 6); sq(54, 18, 20, 12); }
   else if (key == "~") { QPainterPath w; w.moveTo(22, 64); for (int i = 0; i <= 84; i++) w.lineTo(22 + i, 64 - 18 * std::sin(i / 84.0 * 6.2832)); p.setPen(QPen(lt, 7, Qt::SolidLine, Qt::RoundCap)); p.setBrush(Qt::NoBrush); p.drawPath(w); circ(22, 64, 7, og, 2, true); circ(106, 64, 7, og, 2, true); }
   else if (key == "Rizom") { sq(24, 24, 80, 80); QFont f("Segoe UI"); f.setPixelSize(64); f.setBold(true); p.setFont(f); p.setPen(bg); p.drawText(QRect(0, 0, S, S), Qt::AlignCenter, "R"); }
-  else if (key == "Overlap") { frame(22, 22, 58, 58, lt); sq(48, 48, 58, 58, QColor(0xf0, 0x70, 0x1c, 200)); }
+  else if (key == "Overlap") { frame(22, 22, 58, 58, lt); sq(48, 48, 58, 58, QColor(0xe8, 0x40, 0x00, 200)); }
   else if (key == "⤢") { frame(18, 18, 92, 92, dm, true); sq(46, 46, 36, 36); arrow(40, 64, 22, 64); arrow(88, 64, 106, 64); arrow(64, 40, 64, 22); arrow(64, 88, 64, 106); }
   else if (key == "⇹") { sq(14, 46, 22, 36); sq(53, 46, 22, 36); sq(92, 46, 22, 36); arrow(40, 30, 50, 30); L(40, 30, 50, 30); arrow(80, 30, 90, 30); L(40, 100, 90, 100, dm, 5); }
   else if (key == "⇳") { sq(46, 14, 36, 22); sq(46, 53, 36, 22); sq(46, 92, 36, 22); L(100, 40, 100, 90, dm, 5); arrow(100, 40, 100, 30); arrow(100, 90, 100, 100); }
@@ -1107,6 +1112,7 @@ TopoTools::TopoTools(QWidget* window, Viewport* vp, std::function<void(const QSt
     {"tmirror", "tt_mirror", "Mirror — the Mirror button in its options: a copy by the axis (the side found by itself, the seam welded), or round it — radial, kaleidoscope, half a flower; the axis and kind in the options", 8, 0},
     {"tmodgroups", "tt_modgroups", "Modifier groups — the options list every kind: Symmetry (copies shown by an axis / round it, in any place) and Subdivision (smoothed, more polygons); the selected meshes go into a new group of the kind picked, its settings are in the Properties, Apply makes it real", 8, 2},
     {"tsubdiv", "tt_subdivide", "Subdivide — selects as the Select Cursor; the Subdivide button in its options: the selected polygons (none — the whole mesh) split into quads for good — simple (new points on the edges and in the polygons) or smooth (Catmull–Clark's places); how many times in the options", 5, 0},
+    {"tscissors", "tt_scissors", "Scissors — selects as the Select Cursor; select the cut line along the lock (vertices / edges from where the split starts to the tip, or a stretch in the middle) — or a chain of loops — and press RMB (or Split in its options): it parts lengthwise into two branches as the orange lines show; Ctrl+RMB drag — the spread", 8, 3},
     {"act:identical", "tt_identical", "Apply To Identical — the selected retopology polygons (none — the whole mesh) of one part of a high-poly copied onto every topologically identical part of it (and onto copies of that mesh); UVs, seams, creases, hard edges carried", 8, 1}};
   for (const T& t : ts) {
     auto* b = toolBtn(t.icon, tr(t.tip)); b->setFixedSize(44, 44); b->setIconSize(QSize(38, 38)); QString id = t.id;
@@ -1297,6 +1303,7 @@ void TopoTools::buildOptions() {
     L->addWidget(muted(tr("RMB — every selection kind and the edits.")));
   } else if (tool == "tmodgroups") buildModGroupOptions(L);
   else if (tool == "tsubdiv") buildSubdivOptions(L);
+  else if (tool == "tscissors") buildScissorsOptions(L);
   else if (vp->isModelTool()) buildModelOptions(L);
   else L->addWidget(muted(tr("No options.")));
   L->addStretch(1);
@@ -1654,6 +1661,48 @@ void TopoTools::runAct(const QString& a) {
 }
 
 // the Subdivide tool's options: simple / smooth, how many times, the button (the selected polygons, none — the whole mesh)
+void TopoTools::buildScissorsOptions(QVBoxLayout* L) {
+  Viewport* vp = vp_; auto& T = vp->ttools;
+  auto* h = new QLabel(tr("Scissors")); h->setProperty("h4", true); h->setStyleSheet("margin-top:4px"); L->addWidget(h);
+  auto* r = new SliderRow(tr("Spread"), 2, 300, 1, T.scisPx, [](double x) { return QString("%1px").arg(int(std::lround(x))); });
+  r->setTip(tr("How far each branch moves where they part the most (the tip), in screen pixels — the circle at the cursor; the orange lines show both branches as they will be. Ctrl+RMB drag in the viewport — the same"));
+  connect(r, &SliderRow::changed, this, [vp](double x) { vp->ttools.scisPx = x; vp->requestUpdate(); }); connect(r, &SliderRow::released, this, [vp](double) { vp->saveModelPrefs(); }); L->addWidget(r);
+  { // how the cut opens: the branches move apart, or the wedge between them is cut out (the outline kept) — drawn buttons
+    auto* row = new QHBoxLayout; row->setSpacing(3); row->setContentsMargins(0, 0, 0, 0); auto* grp = new QButtonGroup(row);
+    for (const QString k : {QString("part"), QString("carve")}) {
+      QPixmap pm(44, 44); pm.fill(Qt::transparent); { QPainter p(&pm); p.setRenderHint(QPainter::Antialiasing);
+        const QColor lock(0x9a, 0x6c, 0xd0), cut(0xff, 0x8a, 0x3d); QPainterPath a, b;
+        if (k == "part") { a.moveTo(15, 4); a.lineTo(29, 4); a.lineTo(22, 16); a.lineTo(14, 40); a.lineTo(3, 40); a.closeSubpath();
+                           b.moveTo(22, 16); b.lineTo(29, 4); b.lineTo(30, 4); b.lineTo(41, 40); b.lineTo(30, 40); b.closeSubpath(); }
+        else { a.moveTo(15, 4); a.lineTo(22, 4); a.lineTo(22, 16); a.lineTo(18, 40); a.lineTo(9, 40); a.closeSubpath();
+               b.moveTo(22, 4); b.lineTo(29, 4); b.lineTo(35, 40); b.lineTo(26, 40); b.lineTo(22, 16); b.closeSubpath(); }
+        p.setPen(Qt::NoPen); p.setBrush(lock); p.drawPath(a); p.drawPath(b);
+        if (k == "carve") { p.setPen(QPen(cut, 1.5, Qt::DashLine)); p.setBrush(Qt::NoBrush); p.drawLine(QPointF(9, 40), QPointF(15, 4)); p.drawLine(QPointF(35, 40), QPointF(29, 4)); } }
+      auto* b = new QToolButton; b->setCheckable(true); b->setAutoRaise(true); b->setIcon(QIcon(pm)); b->setIconSize(QSize(22, 22)); b->setFixedSize(28, 28); b->setFocusPolicy(Qt::NoFocus);
+      b->setToolTip(k == "part" ? tr("Apart: the two branches move away from each other") : tr("Cut out: the wedge between the branches is cut away, the lock's outline stays — the tips get thinner"));
+      b->setChecked(T.scisMode == k); grp->addButton(b); row->addWidget(b);
+      connect(b, &QToolButton::clicked, this, [vp, k] { vp->ttools.scisMode = k; vp->saveModelPrefs(); vp->requestUpdate(); });
+    }
+    row->addStretch(1); L->addLayout(row); }
+  { // the profile of the parting: drawn buttons, one picked
+    auto* row = new QHBoxLayout; row->setSpacing(3); row->setContentsMargins(0, 0, 0, 0);
+    const std::vector<std::pair<QString, QString>> PF = {{"s", tr("S curve: the branches leave the lock smoothly and run level at the tip")}, {"line", tr("Straight: the branches part evenly — a V")},
+      {"arcout", tr("Arc out: the branches part fast, then run level")}, {"arcin", tr("Arc in: the branches part slowly, then fast toward the tip")}};
+    auto* grp = new QButtonGroup(row);
+    for (auto& [k, tip] : PF) {
+      QPixmap pm(44, 44); pm.fill(Qt::transparent); { QPainter p(&pm); p.setRenderHint(QPainter::Antialiasing); p.setPen(QPen(QColor(0xff, 0x8a, 0x3d), 3, Qt::SolidLine, Qt::RoundCap)); QPainterPath a, b;
+        for (int i = 0; i <= 20; i++) { const double u = i / 20.0, f = k == "line" ? u : k == "arcout" ? std::sin(u * 1.5707963267948966) : k == "arcin" ? 1 - std::cos(u * 1.5707963267948966) : u * u * (3 - 2 * u);
+          const double y = 6 + 32 * u, dx = 3 + 14 * f; if (!i) { a.moveTo(22 - dx, y); b.moveTo(22 + dx, y); } else { a.lineTo(22 - dx, y); b.lineTo(22 + dx, y); } }
+        p.drawPath(a); p.drawPath(b); }
+      auto* b = new QToolButton; b->setCheckable(true); b->setAutoRaise(true); b->setIcon(QIcon(pm)); b->setIconSize(QSize(22, 22)); b->setFixedSize(28, 28); b->setToolTip(tip); b->setFocusPolicy(Qt::NoFocus);
+      b->setChecked(T.scisProfile == k); grp->addButton(b); row->addWidget(b);
+      connect(b, &QToolButton::clicked, this, [vp, k = k] { vp->ttools.scisProfile = k; vp->saveModelPrefs(); vp->requestUpdate(); });
+    }
+    row->addStretch(1); L->addLayout(row); }
+  auto* go = btn(tr("Split"), tr("RMB in the viewport — the same. The selected cut line (or chain of loops) cut lengthwise into two branches: the seams' vertices doubled, a tube's halves closed by walls, the halves pushed apart (Ctrl+Z — back)")); go->setProperty("primary", true);
+  connect(go, &QPushButton::clicked, this, [vp] { vp->tScissors(); }); L->addWidget(go);
+}
+
 void TopoTools::buildSubdivOptions(QVBoxLayout* L) {
   Viewport* vp = vp_; auto& T = vp->ttools;
   auto head = [&](const QString& t) { auto* l = new QLabel(t); l->setProperty("h4", true); l->setStyleSheet("margin-top:4px"); L->addWidget(l); };

@@ -19,6 +19,7 @@
 #include <QVBoxLayout>
 #include <QWheelEvent>
 #include <cmath>
+#include "paint/StrokeTrace.h"
 
 namespace hm {
 
@@ -414,11 +415,23 @@ void PaintCanvas::enterEvent(QEnterEvent*) {
   if (!qobject_cast<QLineEdit*>(f) && !qobject_cast<QAbstractSpinBox*>(f)) setFocus();
 }
 
-void PaintCanvas::mousePressEvent(QMouseEvent* e) { penStroke_ = false; pressAt(e->position(), e->button(), e->modifiers(), 1.f, e->modifiers() & Qt::ControlModifier); }
-void PaintCanvas::mouseMoveEvent(QMouseEvent* e) { moveAt(e->position(), e->modifiers(), 1.f); }
-void PaintCanvas::mouseReleaseEvent(QMouseEvent* e) { releaseAt(e->position(), e->modifiers()); }
+void PaintCanvas::mousePressEvent(QMouseEvent* e) {
+  if (strace::on()) { const QPointF g = e->globalPosition();   // (the stroke trace: the texture window's mouse)
+    strace::line("mouse", {{"k", 0}, {"x", g.x()}, {"y", g.y()}, {"ts", double(e->timestamp())}, {"btn", double(int(e->buttons()))}, {"synth", e->source() != Qt::MouseEventNotSynthesized ? 1 : 0}}, "\"w\":\"tex\""); }
+  penStroke_ = false; pressAt(e->position(), e->button(), e->modifiers(), 1.f, e->modifiers() & Qt::ControlModifier); }
+void PaintCanvas::mouseMoveEvent(QMouseEvent* e) {
+  if (strace::on()) { const QPointF g = e->globalPosition();   // (the stroke trace: the texture window's mouse)
+    strace::line("mouse", {{"k", 1}, {"x", g.x()}, {"y", g.y()}, {"ts", double(e->timestamp())}, {"btn", double(int(e->buttons()))}, {"synth", e->source() != Qt::MouseEventNotSynthesized ? 1 : 0}}, "\"w\":\"tex\""); }
+  moveAt(e->position(), e->modifiers(), 1.f); }
+void PaintCanvas::mouseReleaseEvent(QMouseEvent* e) {
+  if (strace::on()) { const QPointF g = e->globalPosition();   // (the stroke trace: the texture window's mouse)
+    strace::line("mouse", {{"k", 2}, {"x", g.x()}, {"y", g.y()}, {"ts", double(e->timestamp())}, {"btn", double(int(e->buttons()))}, {"synth", e->source() != Qt::MouseEventNotSynthesized ? 1 : 0}}, "\"w\":\"tex\""); }
+  releaseAt(e->position(), e->modifiers()); }
 
 void PaintCanvas::tabletEvent(QTabletEvent* e) {   // (the pen: pressure into the brush; mouse events from it are not made when this accepts)
+  if (strace::on()) { const QPointF g = e->globalPosition();   // (the stroke trace: every pen event the texture window got)
+    strace::line("pen", {{"k", e->type() == QEvent::TabletPress ? 0 : e->type() == QEvent::TabletRelease ? 2 : 1}, {"x", g.x()}, {"y", g.y()}, {"p", e->pressure()}, {"tx", e->xTilt()}, {"ty", e->yTilt()},
+                         {"rot", e->rotation()}, {"ts", double(e->timestamp())}, {"btn", double(int(e->buttons()))}, {"eraser", e->pointerType() == QPointingDevice::PointerType::Eraser ? 1 : 0}}, "\"w\":\"tex\""); }
   const QPointF w = e->position();
   eraserTip_ = e->pointerType() == QPointingDevice::PointerType::Eraser;   // (the pen turned over: it erases)
   paint::g_penTilt = e->type() == QEvent::TabletRelease ? 1.f : std::clamp(float(std::hypot(e->xTilt(), e->yTilt()) / 60.0), 0.f, 1.f);   // (the tilt: what a pen parameter may follow)

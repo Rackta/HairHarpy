@@ -27,7 +27,7 @@ double sceneScale(const Scene& sc);                            // S.scale: the h
 struct LockMesh {
   std::vector<Vec3> pos;
   std::vector<std::vector<int>> faces;
-  int dropped = 0, flips = 0, welded = 0, rows = 0;
+  int dropped = 0, flips = 0, welded = 0, rows = 0, capFaces = 0;   // (capFaces: ◒ the n-gons closing a cut tip)
   struct Fold { int a, b; };                                   // two rings (indices into ringList) the lock folds between
   std::vector<Fold> folds;
   std::vector<CocoonRing> ringList;

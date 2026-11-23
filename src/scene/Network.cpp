@@ -133,7 +133,7 @@ void Network::deleteItem(int id) {
     it = sc_.item(id); if (!it) return;                      // (a wall's deletion takes its service curves with it — this very curve too: it is not read after that)
   }
   if (it->type == ItemType::Braid) { std::vector<int> x; for (const QJsonValue& v : it->raw.value("conns").toArray()) if (sc_.item(v.toInt(-1))) x.push_back(v.toInt()); for (int k : x) deleteItem(k); it = sc_.item(id); if (!it) return; }   // (its end connectors go with it)
-  if (it->type == ItemType::Tube) { std::vector<int> x; for (auto& [xid, m] : sc_.items) if (m.type == ItemType::XMod && m.raw.value("tube").toInt(-1) == id) x.push_back(xid); for (int k : x) deleteItem(k); }
+  if (it->type == ItemType::Tube || it->type == ItemType::Braid) { std::vector<int> x; for (auto& [xid, m] : sc_.items) if (m.type == ItemType::XMod && m.raw.value("tube").toInt(-1) == id) x.push_back(xid); for (int k : x) deleteItem(k); }   // (a braid of segments has extras too)
   it = sc_.item(id); if (!it) return;
   ItemType type = it->type; int a = it->a, b = it->b;
   sc_.removeFromParent(id);

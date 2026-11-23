@@ -76,7 +76,7 @@ target_include_directories(hm_uvtest PRIVATE src)
 target_link_libraries(hm_uvtest PRIVATE Qt6::Core Qt6::Gui ufbx eigen)
 
 # console check of the Paint room core: hm_painttest — layers, brush, ABR, baking on synthetic data
-qt_add_executable(hm_painttest tools/painttest.cpp src/paint/PaintDoc.cpp src/paint/Brush.cpp src/paint/Abr.cpp src/paint/Bake.cpp src/paint/Region.cpp src/paint/Psd.cpp src/paint/LayerFx.cpp)
+qt_add_executable(hm_painttest tools/painttest.cpp src/paint/PaintDoc.cpp src/paint/Brush.cpp src/paint/StrokeTrace.cpp src/paint/Abr.cpp src/paint/Bake.cpp src/paint/Region.cpp src/paint/Psd.cpp src/paint/LayerFx.cpp)
 target_include_directories(hm_painttest PRIVATE src)
 target_link_libraries(hm_painttest PRIVATE Qt6::Core Qt6::Gui)
 
@@ -112,7 +112,7 @@ endforeach()
 
 # GLSL -> SPIR-V at build time, embedded as Qt resources (:/shaders/<name>.spv)
 set(SHADER_SOURCES shaders/mesh.vert shaders/mesh.frag shaders/line.vert shaders/line.frag
-                   shaders/point.vert shaders/point.frag shaders/mesh_tex.vert shaders/mesh_tex.frag)
+                   shaders/point.vert shaders/point.frag shaders/mesh_tex.vert shaders/mesh_tex.frag shaders/toon.frag shaders/toon_outline.vert shaders/toon_outline.frag)
 set(SPV_FILES)
 foreach(src ${SHADER_SOURCES})
   get_filename_component(name ${src} NAME)
@@ -120,11 +120,15 @@ foreach(src ${SHADER_SOURCES})
   add_custom_command(OUTPUT ${out}
     COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/shaders
     COMMAND ${HM_SHADER_CC} ${HM_SHADER_ARGS} ${CMAKE_CURRENT_SOURCE_DIR}/${src} ${HM_SHADER_OUT} ${out}
-    DEPENDS ${src} VERBATIM)
+    DEPENDS ${src} ${CMAKE_CURRENT_SOURCE_DIR}/shaders/toon_core.glsl VERBATIM)
   list(APPEND SPV_FILES ${out})
 endforeach()
 set_source_files_properties(${SPV_FILES} PROPERTIES GENERATED TRUE)
 qt_add_resources(HairHarpy shaders PREFIX / BASE ${CMAKE_CURRENT_BINARY_DIR} FILES ${SPV_FILES})
+# HairHarpy Toon's export: the shading core (one text for every engine) and the templates for Unreal, the website, Unity (:/toon/...)
+qt_add_resources(HairHarpy toonsrc PREFIX /toon BASE shaders FILES shaders/toon_core.glsl)
+qt_add_resources(HairHarpy toontpl PREFIX /toon BASE resources/toon FILES resources/toon/README.md resources/toon/hh_toon.js
+                 resources/toon/hh_toon_import.py resources/toon/HHToon.shader resources/toon/HHToonImporter.cs)
 # the pictures the HTML version embedded (tool icons, Mara, achievements, the puzzle): :/img/<name>.<ext>
 file(GLOB HM_IMAGES CONFIGURE_DEPENDS resources/images/*)
 qt_add_resources(HairHarpy images PREFIX /img BASE resources/images FILES ${HM_IMAGES})

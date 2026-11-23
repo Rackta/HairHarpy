@@ -453,6 +453,20 @@ QString Viewport::uvSetRename(int m, int set, const QString& name) {
   if (!r.startsWith('!')) { scene_->revision++; staticRev_++; commit(true); emit topoState(); if (others) ui::toast(tr("UV Set renamed: %1 — in %2 more mesh%3 too").arg(n).arg(others).arg(others == 1 ? "" : "es")); }
   return r;
 }
+// (the Paint room paints UV sets: a mesh with none — in its material's set, as the UV Sets bar shows it — gets that set written out, so its
+//  polygons are painted, shown in the set's texture and in the room's set list. Before, the face, the hair and a shirt sharing a set by
+//  their material's name were left out of the room: nothing painted on them, their texture missing — 2026-11-22.) The set names made
+std::vector<QString> Viewport::uvEnsureAllSets() {
+  std::vector<QString> made; const bool prev = uvRenameBatch_; uvRenameBatch_ = true;
+  std::vector<int> ids; for (const auto& [id, it] : scene_->items) if (it.type == ItemType::IMesh && !it.headTag) ids.push_back(id);
+  for (int id : ids) { const Item* it = scene_->item(id); const PolyMesh* B = it ? baseOf(*it) : nullptr;
+    if (!B || topo::hasUvSets(*B) || B->cornerUV.empty() || B->cornerUV.size() != B->faceVerts.size()) continue;
+    const QString n = topo::defaultUvSetName(*B);
+    if (!uvMatsEdit(this, scene_, id, [](PolyMesh&, std::vector<UvSetL>&, QJsonObject&) -> QString { return QString(); }).startsWith('!')) made.push_back(n); }
+  uvRenameBatch_ = prev;
+  if (!made.empty()) { scene_->revision++; staticRev_++; commit(true); emit topoState(); }
+  return made;
+}
 QString Viewport::uvSetDelete(int m, int set) {
   return uvMatsEdit(this, scene_, m, [&](PolyMesh& d, std::vector<UvSetL>& S, QJsonObject&) -> QString {
     if (S.size() < 2) return tr("!The last UV Set stays — every mat uses one"); if (size_t(set) >= S.size()) return "!";

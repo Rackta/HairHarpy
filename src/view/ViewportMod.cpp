@@ -62,7 +62,7 @@ bool Viewport::paintWeights(const QPointF& m, const QString& op, double amt) {
   }
   for (auto& [xid, x] : scene_->items) {
     if (x.type != ItemType::XMod || x.raw.value("kind").toString() != kind || !x.visible || !x.raw.value("mask").isArray() || !x.raw.value("tube").isDouble()) continue;
-    int tid = x.raw.value("tube").toInt(); const Item* t = scene_->item(tid); if (!t || !tubes_.count(tid)) continue;
+    int tid = x.raw.value("tube").toInt(); const Item* t = scene_->item(tid); if (!t || (!tubes_.count(tid) && !(t->type == ItemType::Braid && braid::segMode(*t) && scene_->isVisible(*t)))) continue;   // (a braid of segments: painted along its curve too)
     auto ci = hair_.curves.find(t->raw.value("src").toInt(-1)); if (ci == hair_.curves.end()) continue;
     if (!sel.empty() && std::find(sel.begin(), sel.end(), tid) == sel.end()) continue;   // (with modifiers selected only they are painted)
     std::vector<double> W = tube::maskOf(x.raw.value("mask")); const std::vector<double> src = W; bool ch = false;
@@ -118,10 +118,28 @@ void Viewport::syncTubes() {
     s.append(reinterpret_cast<const char*>(ci->second.p.data()), qsizetype(ci->second.p.size() * sizeof(Vec3)));
     s.append(reinterpret_cast<const char*>(&cen), sizeof cen);
     for (const QJsonValue& x : b.raw.value("conns").toArray()) { auto k = hair_.curves.find(x.toInt(-1)); if (k != hair_.curves.end()) s.append(reinterpret_cast<const char*>(k->second.p.data()), qsizetype(k->second.p.size() * sizeof(Vec3))); }   // (an end follows its connector: reshaped — rebuilt)
+    const bool seg = braid::segMode(b), tint = seg && weightBrushOn();
+    if (seg) { QJsonArray ex; for (int x : tube::extrasOf(*scene_, id)) { const Item* xi = scene_->item(x); QJsonObject o = xi->raw; o.insert("visible", xi->visible); ex.append(o); }   // (its extra modifiers: painted / set — rebuilt)
+      s.append(QJsonDocument(ex).toJson(QJsonDocument::Compact)); s.append(tint ? "T" : "-"); }
     const int key0 = -(id * 64) - 1; std::vector<int> keys; for (auto& [k, t] : tubes_) if (t.item == id) keys.push_back(k);
     auto f = tubeSig_.find(key0);
     if (f != tubeSig_.end() && f->second == s && !keys.empty()) { for (int k : keys) alive.insert(k); continue; }
     tubeSig_[key0] = s; changed = true; for (int k : keys) tubes_.erase(k);
+    if (seg) {   // (segments: each strand's lobes a surface of its own polygons, the core darker — every edge drawn over them)
+      auto SB = braid::buildSegments(*scene_, hair_.curves, b, cen); if (!SB) continue;
+      static const QColor SC[] = {QColor(0xb8, 0x8c, 0xe8), QColor(0xe8, 0x9c, 0xc4), QColor(0x8c, 0xb4, 0xe8), QColor(0xe8, 0xc4, 0x8c)};
+      const PolyMesh& M = SB->mesh; const int ng = int(M.groupNames.size());
+      for (int g = 0; g < ng; g++) {
+        auto pm = std::make_shared<PolyMesh>(); std::vector<int> map(M.pos.size(), -1); std::vector<float> tv;
+        for (int fi = 0; fi < M.faceCount(); fi++) { if (M.faceGroup[size_t(fi)] != g) continue; std::vector<int> fv;
+          for (int q = M.faceStart[size_t(fi)]; q < M.faceStart[size_t(fi) + 1]; q++) { const int v = M.faceVerts[size_t(q)]; if (map[size_t(v)] < 0) { map[size_t(v)] = int(pm->pos.size()); pm->pos.push_back(M.pos[size_t(v)]); tv.push_back(SB->t[size_t(v)]); } fv.push_back(map[size_t(v)]); }
+          pm->addFace(fv.data(), int(fv.size())); }
+        if (pm->faceCount() == 0) continue;
+        const bool core = M.groupNames[size_t(g)] == QObject::tr("Core"); const QColor col = core ? QColor(0x7a, 0x62, 0xa8) : SC[size_t(g) % 4];
+        TubeDraw& d = tubes_[key0 - g]; d = {}; d.item = id; d.guides = false; d.color = col; d.opacity = 1; d.mesh = pm;
+        if (tint) d.col = tube::weightTint(*scene_, id, tv, col);
+        alive.insert(key0 - g); }
+      continue; }
     auto B = braid::build(*scene_, hair_.curves, b, cen);
     if (!B) continue;
     static const QColor SC[] = {QColor(0xb8, 0x8c, 0xe8), QColor(0xe8, 0x9c, 0xc4), QColor(0x8c, 0xb4, 0xe8), QColor(0xe8, 0xc4, 0x8c), QColor(0x9c, 0xe0, 0xb8), QColor(0xd0, 0xa0, 0xf0)};

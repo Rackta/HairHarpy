@@ -232,6 +232,13 @@ void MainWindow::openMainPie(const QPoint& global) {
       bottom.push_back(rj);
     }
     if (as.size() == 1) if (auto sn = snapItem(a)) bottom.insert(bottom.begin(), *sn);
+    { // ◒ a cap: the selected curve ends — a lock's cut tip — one common anchor of its curves, closed by an n-gon on Convert
+      int ends = 0, inCap = 0;
+      for (int x : as) { bool e = false; for (const Item* c : sc.curves()) if (c->ring < 0 && !c->closed && c->conn.isEmpty() && c->anchors.size() >= 2 && (c->anchors.front() == x || c->anchors.back() == x)) { e = true; break; }
+        if (e) ends++; if (edit::capOfAnchor(sc, x) >= 0) inCap++; }
+      if (ends >= 2) bottom.insert(bottom.begin(), item(tr("◒ Create cap (%1 curve ends → one tip)").arg(ends), [vp, as] { vp->runEdit([as](Scene& s2, Selection& sl, const CurveCache&) { return edit::makeCap(s2, as, sl); }, true); }));
+      if (inCap) bottom.push_back(item(tr("◒ Remove cap"), [vp, as] { vp->runEdit([as](Scene& s2, Selection& sl, const CurveCache&) { return edit::removeCaps(s2, as, sl); }, true); }));
+    }
     { // an anchor on a crown connector (attached, or shared by a connector and a lock curve): the curve comes off it
       const Anchor* an = sc.anchor(a); const Item* ac = an->raw.value("at").isObject() ? sc.item(an->raw.value("at").toObject().value("c").toInt(-1)) : nullptr;
       bool onConn = false, onLock = false; for (int c : edit::curvesWith(sc, a)) { const Item* x = sc.item(c); if (!x->conn.isEmpty()) onConn = true; else if (x->ring < 0) onLock = true; }
@@ -352,6 +359,10 @@ void MainWindow::syncUnhide() { if (unhideBtn_) unhideBtn_->setVisible(scene_.ro
 // stays); Ctrl+RMB (openTopoOpsPie): the edits of the selected
 void MainWindow::openTopoPie(const QPoint& global, bool hold) {
   Viewport* vp = viewport_;
+  if (vp->tool() == "tscissors") {                             // (the Scissors: no selection kinds here — only its own Split)
+    ui::PieSpec s; s.title = tr("Scissors");
+    ui::PieItem it; it.label = tr("✂ Split"); it.tip = tr("The selected chain of loops cut lengthwise into two branches, as the orange lines show"); it.act = [vp] { vp->tScissors(); };
+    s.bottom.push_back(it); ui::Pie::open(this, global, s, hold); return; }
   auto build = [vp]() -> ui::PieSpec {
     ui::PieSpec s; s.bare = true;
     auto kind = [vp](const QString& k, const QString& label, const QString& tip) {

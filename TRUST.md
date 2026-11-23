@@ -129,9 +129,18 @@ Your build is a program you made yourself from code you can read. You don't have
     - your notes (**✎ Note** / F9): your text, the tags you tick and a picture of the program's window with your drawing
       over it;
     - **pictures of the program's window every few seconds — only if that settings file asks for them**
-      (`"frames": true`).
+      (`"frames": true`);
+    - when the Topology room's Scissors refuse a cut: the active mesh's vertex positions and polygons (meshes of up to
+      20 000 vertices) with the selection and the reason, once per selection — so the very case can be run again.
 
-    No mesh data and no other files go into it; the recording reads nothing outside the program's own windows;
+    No other mesh data and no other files go into it; the recording reads nothing outside the program's own windows;
+  - **only while the separate Stroke Recorder is running on the same computer** (the author's own development tool
+    `stroke_rec.exe`; it is not part of the program and not installed or shipped with it — someone starts it by hand; it signals
+    that it runs by the file `Documents\HairHarpy Sessions\stroke_rec.json`): the file `hairharpy_trace.jsonl` in the
+    recorder's session folder, which that file names — every pen and mouse event the Paint room's views got (its place
+    on the screen, pressure, tilt, buttons, time), each stroke's brush settings and colour, the points the stroke went
+    through and every dab the brush laid (its place on the texture, size, angle, pressure, flow, opacity, colour). The
+    program checks for that file about once a second and writes nothing when it is missing or older than a few seconds;
   - **if the program crashes**: a crash dump `crash_<time>.dmp` into `Documents\HairHarpy Sessions` (into the session's
     folder while recording). It is a snapshot of the program's memory at that moment, so it can hold parts of the open
     project.

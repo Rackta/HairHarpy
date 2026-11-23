@@ -1,4 +1,5 @@
 #include "app/PaintLeft.h"
+#include "app/ToonUi.h"
 #include <QAction>
 #include "app/ColorPicker.h"
 #include "app/PaintCanvas.h"
@@ -358,13 +359,19 @@ PaintLeft::PaintLeft(PaintSession* s, Viewport* vp, Scene* sc, QWidget* parent) 
   fullBtn_ = flat(QString::fromUtf8("⛶"), QObject::tr("Open the texture over the whole viewport — to paint in 2D; again — back into this panel")); fullBtn_->setCheckable(true);
   // (the islands over the texture; the texture in a window of its own — a second screen)
   auto* ovB = flat(QString::fromUtf8("◫"), QObject::tr("The UV islands over the texture: the dark ground outside them, their outlines, the polygons' wire"));
-  { auto* menu = new QMenu(ovB); auto add = [&](const QString& t, bool PaintSession::*m, const char* key) { auto* a = menu->addAction(t); a->setCheckable(true); a->setChecked(s_->*m);
-      QObject::connect(a, &QAction::toggled, this, [this, m, key](bool on) { s_->*m = on; QSettings().setValue(key, on); canvas_->update(); }); };
-    add(QObject::tr("Dark ground outside the islands"), &PaintSession::ovDark, "paint/ovDark"); add(QObject::tr("Island outlines"), &PaintSession::ovEdge, "paint/ovEdge"); add(QObject::tr("Polygon wire"), &PaintSession::ovWire, "paint/ovWire");
+  // (the model's wire over the texture: a button of its own — one click on, one off — 2026-11-22, the user's request)
+  auto* wireB = flat(QString(), QObject::tr("The model's wire over the texture: its polygons as they lie in the UV")); wireB->setIcon(ui::icon("disp_wire")); wireB->setIconSize(QSize(18, 18));
+  wireB->setCheckable(true); wireB->setChecked(s_->ovWire);
+  { auto* menu = new QMenu(ovB); QAction* wireA = nullptr;
+    auto add = [&](const QString& t, bool PaintSession::*m, const char* key) { auto* a = menu->addAction(t); a->setCheckable(true); a->setChecked(s_->*m);
+      QObject::connect(a, &QAction::toggled, this, [this, m, key](bool on) { s_->*m = on; QSettings().setValue(key, on); canvas_->update(); }); return a; };
+    add(QObject::tr("Dark ground outside the islands"), &PaintSession::ovDark, "paint/ovDark"); add(QObject::tr("Island outlines"), &PaintSession::ovEdge, "paint/ovEdge"); wireA = add(QObject::tr("Polygon wire"), &PaintSession::ovWire, "paint/ovWire");
+    QObject::connect(wireA, &QAction::toggled, wireB, [wireB](bool on) { QSignalBlocker b(wireB); wireB->setChecked(on); });
+    QObject::connect(wireB, &QPushButton::toggled, wireA, [wireA](bool on) { wireA->setChecked(on); });
     QObject::connect(ovB, &QPushButton::clicked, this, [ovB, menu] { menu->popup(ovB->mapToGlobal(QPoint(0, ovB->height()))); }); }
   auto* winB = flat(QString::fromUtf8("⧉"), QObject::tr("The texture in a window of its own — move it to a second screen; it paints the same layers"));
   QObject::connect(winB, &QPushButton::clicked, this, [this] { auto* w = makePaintCanvasWindow(s_, window(), canvas_); w->setAttribute(Qt::WA_DeleteOnClose); w->show(); w->raise(); });
-  bar->addWidget(setLabel_, 1); bar->addWidget(ovB); bar->addWidget(fit); bar->addWidget(winB); bar->addWidget(fullBtn_); hostLay_->addLayout(bar);
+  bar->addWidget(setLabel_, 1); bar->addWidget(wireB); bar->addWidget(ovB); bar->addWidget(fit); bar->addWidget(winB); bar->addWidget(fullBtn_); hostLay_->addLayout(bar);
   canvas_ = new PaintCanvas(s, canvasHost_); canvas_->setMinimumSize(120, 120); hostLay_->addWidget(canvas_, 1);
   s->strokeGoing = [c = QPointer<PaintCanvas>(canvas_)] { return c && c->painting(); };   // (files back from the editor wait for the stroke's end)
   QObject::connect(fit, &QPushButton::clicked, canvas_, &PaintCanvas::fit);
@@ -387,6 +394,8 @@ PaintLeft::PaintLeft(PaintSession* s, Viewport* vp, Scene* sc, QWidget* parent) 
   auto* tools = new QWidget; auto* th = new QHBoxLayout(tools); th->setContentsMargins(4, 4, 0, 0); th->setSpacing(4);
   auto* tcw = new QVBoxLayout; auto* tc = new QGridLayout; tc->setSpacing(3); tcw->addLayout(tc); tcw->addStretch(1); int tn = 0;
   auto place = [&](QPushButton* b) { tc->addWidget(b, tn, 0); tn++; };   // (one column — the author, 17.11)
+  // (the shader mode under the tools, apart from them — the column's empty height: a click — on / off, a double click — Materials & Shader)
+  tcw->insertSpacing(1, 18); tcw->insertWidget(2, new ToonButton(30), 0, Qt::AlignLeft);
   auto mk = [&](const QString& icon, const QString& glyph, const QString& tip) {
     auto* b = new QPushButton; b->setProperty("tool", true); b->setFixedSize(36, 36); b->setFocusPolicy(Qt::NoFocus); b->setToolTip(tip);
     if (!icon.isEmpty()) { b->setIcon(ui::icon(icon)); b->setIconSize(QSize(30, 30)); } else { b->setText(glyph); b->setStyleSheet("font-size:17px"); }

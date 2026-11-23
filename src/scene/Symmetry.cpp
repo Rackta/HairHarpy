@@ -336,6 +336,8 @@ QString duplicateSelection(Scene& sc, Selection& sel) {
       p.insert("only", on); r.insert("p", p);
     }
   }
+  for (auto& [o, nId] : imap) if (Item* x = sc.item(nId); x && x->type == ItemType::Cap && x->raw.value("ends").isArray()) {   // (◒ a cap: the copy's ends)
+    QJsonArray e; for (const QJsonValue& v : x->raw.value("ends").toArray()) e.append(mapId(amap, v.toInt())); x->raw.insert("ends", e); }
   for (int a : newAnchors) {
     Anchor& A = *sc.anchor(a);
     if (A.raw.value("at").isObject()) { QJsonObject t = A.raw.value("at").toObject(); remapKey(t, "c", imap); A.raw.insert("at", t); }

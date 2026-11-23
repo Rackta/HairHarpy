@@ -35,7 +35,7 @@ private:
   struct GpuLines { Buf vb; uint32_t count = 0; float width = 1, bias = 0; bool noPdo = false; float xray = 0; };   // (xray: drawn over everything too, this faint)
   // textures (an imported mesh's look): an image with its mip levels; a part — the triangles of one texture set
   struct GpuTex { VkImage img = VK_NULL_HANDLE; VkDeviceMemory mem = VK_NULL_HANDLE; VkImageView view = VK_NULL_HANDLE; };
-  struct TexPart { uint32_t first = 0, count = 0; VkDescriptorSet ds = VK_NULL_HANDLE; float color[4]; int flags = 0; bool transparent = false; int other = -1; };   // (other: the Paint room — a UV set not shown now, its number in paintOtherNames_: drawn with that set's picture of this frame)
+  struct TexPart { uint32_t first = 0, count = 0; VkDescriptorSet ds = VK_NULL_HANDLE; float color[4]; int flags = 0; bool transparent = false; int other = -1; QString uvSet; };   // (uvSet: the shader mode's — the UV set whose toon maps and material the part wears)   // (other: the Paint room — a UV set not shown now, its number in paintOtherNames_: drawn with that set's picture of this frame)
   struct GpuTexMesh { int itemId = 0; Buf vb, ib; std::vector<TexPart> parts; bool flat = false, cached = false, unlit = false; float mat = 0; };
   static float matCode(const Item& it, bool topoRoom);   // the Topology room's material settings packed for the shaders (0 — none)
   // an imported mesh's GPU copies kept while its geometry (the same PolyMesh) and how it is drawn stay: a mode switch, a
@@ -63,7 +63,8 @@ private:
   VkShaderModule loadShader(const QString& name);
   VkPipeline makePipeline(VkPipelineLayout layout, const QString& vs, const QString& fs, VkPrimitiveTopology topo,
                           const VkVertexInputBindingDescription& bind, const VkVertexInputAttributeDescription* attrs, int nAttrs,
-                          bool depthTest, bool depthWrite, bool blend, bool depthBias, bool lineWidthDynamic, bool colorWrite = true);
+                          bool depthTest, bool depthWrite, bool blend, bool depthBias, bool lineWidthDynamic, bool colorWrite = true,
+                          int stencil = 0, VkCullModeFlags cull = VK_CULL_MODE_NONE);   // (stencil: 0 — none, 1 — writes 1, 2 — writes 0, 3 — drawn where it is 3, 4 — sets bit 2)
   GpuMesh uploadMesh(int itemId, const MeshDraw& d, const float color[4], const std::vector<LineVertex>* wire);
   void uploadLines(GpuLines& g, const LineBatch& b);
   void syncStatic();
@@ -118,6 +119,19 @@ private:
   VkDescriptorSetLayout texSetLayout_ = VK_NULL_HANDLE; VkDescriptorPool texPool_ = VK_NULL_HANDLE; VkSampler sampler_ = VK_NULL_HANDLE;
   VkPipelineLayout texLayout_ = VK_NULL_HANDLE; VkPipeline texPipe_ = VK_NULL_HANDLE, texBlendPipe_ = VK_NULL_HANDLE;
   VkPipeline rpBehindPipe_ = VK_NULL_HANDLE, rpOverPipe_ = VK_NULL_HANDLE;   // (reference planes: behind the model / over it)
+  // the shader mode (HairHarpy Toon, shaders/toon.frag): set 1 — the UV set's toon maps and the instance's parameters (a uniform
+  // buffer); one descriptor per UV set and instance, made again when the parameters or a map change
+  VkDescriptorSetLayout toonSetLayout_ = VK_NULL_HANDLE; VkDescriptorPool toonPool_ = VK_NULL_HANDLE;
+  VkPipelineLayout toonLayout_ = VK_NULL_HANDLE; VkPipeline toonPipe_ = VK_NULL_HANDLE, toonBlendPipe_ = VK_NULL_HANDLE;
+  // (the roles: over the hair — writes the stencil's 1 where seen; hair — leaves it; the rest — clears it where nearer; then the over
+  //  parts again over everything where it is 1. The outline: the inverted hull, front faces culled)
+  VkPipeline toonOverPipe_ = VK_NULL_HANDLE, toonOverBlendPipe_ = VK_NULL_HANDLE, toonHairPipe_ = VK_NULL_HANDLE, toonHairBlendPipe_ = VK_NULL_HANDLE,
+             toonOverDrawPipe_ = VK_NULL_HANDLE, toonOutlinePipe_ = VK_NULL_HANDLE;
+  struct ToonDs { VkDescriptorSet ds = VK_NULL_HANDLE; Buf ubo; QByteArray sig; };
+  std::map<QString, ToonDs> toonDs_; std::map<QString, std::pair<qint64, QString>> toonTex_;   // (toonTex_: "set:slot" → the revision uploaded, its texCache_ key)
+  struct DeadToon { VkDescriptorSet ds; Buf ubo; int frames; }; std::vector<DeadToon> deadToon_;
+  VkDescriptorSet toonDescriptor(int itemId, const QString& set);
+  void toonDropAll();
   Buf rpVb_;
   looks::MapSrc refImage(const RefPlane& rp) const;
   QString sketchTexture(int planeId);                    // (a plane's ✏ drawing: uploaded again when its rev changes, the old one freed)

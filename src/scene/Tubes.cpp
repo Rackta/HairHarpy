@@ -1,4 +1,5 @@
 ﻿#include "scene/Tubes.h"
+#include "scene/Braid.h"
 #include "scene/Edit.h"
 #include <QColor>
 #include <QJsonDocument>
@@ -440,6 +441,32 @@ std::optional<TubeMesh> buildTube(const Scene& sc, const CurveCache& cc, const I
   return m;
 }
 
+std::vector<Vec3> extrasPath(const Scene& sc, int owner, const std::vector<Vec3>& pts, const Vec3& center, std::vector<double>& twist, std::vector<double>& thick) {
+  twist.assign(pts.size(), 0.0); thick.assign(pts.size(), 1.0);
+  auto ex = activeExtras(sc, owner); if (ex.empty() || pts.size() < 2) return pts;
+  std::vector<Frame> F = framesAlong(pts, center);
+  applyExtras(QJsonObject(), ex, F, twist, thick, center);
+  std::vector<Vec3> out; out.reserve(F.size()); for (const Frame& f : F) out.push_back(f.p);
+  return out;
+}
+
+std::vector<std::array<float, 3>> weightTint(const Scene& sc, int owner, const std::vector<float>& t, const QColor& baseC) {
+  std::vector<std::pair<QString, std::vector<double>>> masks;
+  for (int id : extrasOf(sc, owner)) { const Item* x = sc.item(id); QString k = x->raw.value("kind").toString(); if (x->visible && painted(k) && x->raw.value("mask").isArray()) masks.push_back({k, maskOf(x->raw.value("mask"))}); }
+  std::vector<std::array<float, 3>> out; if (masks.empty()) return out;
+  auto lin = [](double v) { return v <= 0.04045 ? v / 12.92 : std::pow((v + 0.055) / 1.055, 2.4); };
+  const Vec3 base(lin(baseC.redF()), lin(baseC.greenF()), lin(baseC.blueF())), fat(1, 0.55, 0.15), thin(0.2, 0.62, 1), cw(0.3, 0.9, 0.45), ccw(1, 0.35, 0.75);
+  out.reserve(t.size());
+  for (float tt : t) {
+    double mv = 0, w = 0, wt = 0;
+    for (auto& [k, M] : masks) { double v = maskAt(M, tt); if (k == "mask") mv = std::max(mv, v); else if (k == "thick") w += v; else wt += v; }
+    w = clamp(w, -1, 1); wt = clamp(wt, -1, 1);
+    Vec3 c = base.lerp(w >= 0 ? fat : thin, std::min(1.0, std::abs(w) * 1.5)).lerp(wt >= 0 ? cw : ccw, std::min(1.0, std::abs(wt) * 1.5)) * (1 - mv * 0.92);
+    out.push_back({float(c.x), float(c.y), float(c.z)});
+  }
+  return out;
+}
+
 // ---------- apply / paste / convert ----------
 std::vector<int> modTargets(const Scene& sc, const Selection& sel, const CurveCache& cc) {
   std::vector<int> out;
@@ -458,6 +485,8 @@ std::vector<int> modTubes(const Scene& sc, const Selection& sel) {
     if (it->type == ItemType::Tube) t = id;
     else if (it->type == ItemType::XMod && it->raw.value("tube").isDouble() && sc.item(it->raw.value("tube").toInt())) t = it->raw.value("tube").toInt();
     else if (it->type == ItemType::Curve) t = tubeOfCurve(sc, id);
+    // (a braid of segments takes extras too: the braid, its folder, its curve or connector, an extra of it)
+    if (t < 0) { const int b = braid::braidOfItem(sc, it->type == ItemType::XMod ? it->raw.value("tube").toInt(-1) : id); if (const Item* bi = b >= 0 ? sc.item(b) : nullptr; bi && braid::segMode(*bi)) t = b; }
     if (t >= 0 && std::find(out.begin(), out.end(), t) == out.end()) out.push_back(t);
   }
   return out;
@@ -618,7 +647,7 @@ int newExtra(Scene& sc, const CurveCache& cc, int tubeId, const QString& kind) {
 
 QString addExtra(Scene& sc, const CurveCache& cc, Selection& sel, const QString& kind) {
   auto ts = modTubes(sc, sel);
-  if (ts.empty()) return QObject::tr("!Select a profile modifier (or its curve) — apply a profile in the Profile tab first");
+  if (ts.empty()) return QObject::tr("!Select a profile modifier (or its curve), or a braid of segments — apply a profile in the Profile tab first");
   std::vector<int> made; for (int t : ts) made.push_back(newExtra(sc, cc, t, kind));
   sel.anchors.clear(); sel.items = made;
   if (kind == "mask") return QObject::tr("Mask added — paint it with the mask brush (Ctrl — erase, Shift — smooth)");

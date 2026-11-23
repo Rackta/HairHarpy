@@ -871,6 +871,11 @@ QWidget* makePaintBrushPanel(PaintSession* s, QWidget** listOut) {
   for (BrushMode m : {BrushMode::Paint, BrushMode::Erase, BrushMode::Raise, BrushMode::Lower, BrushMode::Flatten, BrushMode::Flow, BrushMode::MaskReveal, BrushMode::MaskHide}) mode->addItem(brushModeName(m), int(m));
   mode->setToolTip(QObject::tr("Paint / Erase — colour; Raise / Lower / Flatten — the bump (Height layers); Flow direction — the anisotropy's direction along your stroke (Flow layers); Mask — a layer's mask. On a Height or Flow layer a plain Paint brush does that layer's own thing"));
   QObject::connect(mode, &QComboBox::currentIndexChanged, w, [s, mode](int) { s->brush.mode = BrushMode(mode->currentData().toInt()); });
+  // (Through — the same switch as the top bar's icon and Y: asked for among the brush's own settings, 2026-11-22 recording)
+  { auto* thr = new QCheckBox(QObject::tr("Through (Y)")); thr->setIcon(ui::icon("pt_through")); thr->setIconSize(QSize(18, 18)); thr->setFocusPolicy(Qt::NoFocus);
+    thr->setToolTip(QObject::tr("Off — the brush paints only what the camera sees. On — the walls behind too, as far back as the brush's radius (both sides of a thin lock). Y taps it, held — only while the key is down; the top bar's icon is the same switch"));
+    QObject::connect(thr, &QCheckBox::toggled, w, [s](bool on) { if (s->drawThrough != on) s->setThrough(on); });
+    auto sync = [s, thr] { QSignalBlocker b(thr); thr->setChecked(s->drawThrough); }; QObject::connect(s, &PaintSession::throughChanged, thr, sync); sync(); vb->addWidget(thr); }
   auto* size = slider(vb, QObject::tr("Size"), 1, 512, 1, s->brush.size, [](double x) { return QString::number(int(x)) + " px"; }, QObject::tr("[ ] · RMB drag (any direction left or right — nothing else changes)"));
   auto* opac = slider(vb, QObject::tr("Opacity"), 0, 1, 0.01, s->brush.opacity, pct, QObject::tr("The most a stroke can lay down · the digit keys 1…0 over the texture"));
   auto* flow = slider(vb, QObject::tr("Flow"), 0.01, 1, 0.01, s->brush.flow, pct, QObject::tr("What one dab adds: low flow builds up"));

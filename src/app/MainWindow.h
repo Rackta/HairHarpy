@@ -119,6 +119,14 @@ private:
   void paintOtherChanged(const QString& set, const QRect& r);
   void paintImportAll();
   qint64 paintOtherRev_ = 0;
+  // the shader mode (HairHarpy Toon): on / off, its library read from / written to the project, the toon maps of the UV sets made
+  // from the Paint room's layers (all of them, or one set's after a stroke)
+  void toonSetOn(bool on); void toonLoadLib(); void toonLibWrite(); void toonMapsRefresh(const QString& onlySet = {});
+  bool toonHeadGuess(double c[3], double& size) const;
+  QString toonExport(const QString& dir);
+  QImage modelTexturePicture(const QString& set, int W, int H, QImage* seeThruOut = nullptr) const;
+  bool toonPartSeeThru(const Item& it, const QString& set) const;   // (an object's UV set wears a see-through texture set: drawn blended, else solid)   // (the meshes' own colour maps of a UV set in one picture)   // (the shader for Unreal, the website, Unity: maps, hh_toon.json, the core, the import scripts)
+  QTimer* toonTimer_ = nullptr;
   void paintOthersRefresh();                 // (the Paint room: the other UV sets' paint composed for the model — every set's paint is seen at once)
   QImage paintWireImage() const;             // (the UV polygons of the set painted — the layered PSD's Wireframe layer)
   int changeTotal() const;                    // (every change that makes the project unsaved: the scene's commits and the Paint room's edits)

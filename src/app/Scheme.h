@@ -74,7 +74,7 @@ private:
   std::vector<Track> tracks_;
   std::vector<std::pair<int, QPainterPath>> zones_;    // (drawn big first)
   std::vector<Chip> chips_;
-  std::vector<int> ws_, ecs_;
+  std::vector<int> ws_, ecs_, caps_;   // (caps_: ◒ the lock's caps)
   QRectF listBtn_, resetBtn_;
   double chipsY_ = 0, h_ = 0;
   std::set<int> hov_; int band_ = -1, hovChip_ = -1;

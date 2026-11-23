@@ -56,6 +56,12 @@ std::optional<TubeMesh> buildTube(const Scene& sc, const CurveCache& cc, const I
 std::vector<std::vector<Vec3>> tubeRings(const Scene& sc, const Item& t, const std::vector<Vec3>& curvePts, int NR, const Vec3& center,
                                          const QJsonObject* pOverride = nullptr);
 
+// an owner's extra modifiers (a Tube modifier's, a segments braid's) applied to a path (pts, evenly along its length):
+// the path moved (Noise, Curls), the turn round it (radians, Twist) and the thickness × at each point
+std::vector<Vec3> extrasPath(const Scene& sc, int owner, const std::vector<Vec3>& pts, const Vec3& center, std::vector<double>& twist, std::vector<double>& thick);
+// the painted weights' colours (as on a Tube modifier) at the places t 0…1 along it; empty — nothing painted
+std::vector<std::array<float, 3>> weightTint(const Scene& sc, int owner, const std::vector<float>& t, const QColor& base);
+
 // the curves Apply works on: selected curves, the source curves of selected modifiers
 std::vector<int> modTargets(const Scene& sc, const Selection& sel, const CurveCache& cc);
 // the modifiers Extra works on: selected modifiers, modifiers of selected curves, of selected extras

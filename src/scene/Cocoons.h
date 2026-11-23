@@ -54,6 +54,7 @@ struct LockInput {
   struct Wall { int id, a, b; };                // cocoonLockWalls: the surface and its two curves
   std::vector<Wall> walls;
   std::vector<Vec3> tipP;
+  bool capped = false;                          // (its strands end at one cap — ◒, a cut tip: closed by one polygon)
 };
 
 // every cocoon (live ones reshaped first); walls: buildWalls(…, includeHidden = true) — the rings cut every wall

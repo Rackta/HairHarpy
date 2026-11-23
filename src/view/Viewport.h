@@ -622,6 +622,9 @@ public:
     QString optMode = "safe";                            // (Optimize: safe — no weld that makes edges of three polygons; merge — every weld, the inner walls it makes taken out)
     QString chainAnchor = "free";                        // (Smooth EdgeChain: how a dragged anchor moves — free: in the view's plane; surface: laid on the mesh under the pointer)
     int subdLevels = 1; bool subdSmooth = false;         // (the Subdivide tool: how many times, simple (false) or smooth (Catmull–Clark's places))
+    QString scisMode = "part";                          // (Scissors: part — the branches move apart; carve — the wedge between them cut out, the outline kept)
+    QString scisProfile = "s";                          // (Scissors: how the branches part along the cut — s: an S curve, line: straight, arcout / arcin: an arc bulging out / in)
+    double scisPx = 30;                                  // (Scissors: how far each branch moves at its widest — screen px, as the Hair room's Split ends)
     int mirAxis = 0, mirCount = 6; QString mirType = "mirror"; bool mirReplace = false, mirNormals = true, mirLocal = false;   // (mirReplace: the copy in place of the other side's region; mirNormals: the corners' own normals mirrored onto the copy)
     // (Mirror / the virtual symmetry: axis X Y Z, mirror / radial / radialMirror / radialHalf, copies)
     double normLen = 1;                                  // (the Normals tool: the shown normals' length, × a 20th of the mesh's size)
@@ -702,7 +705,7 @@ public:
   void loadModelPrefs();
   void saveModelPrefs() const;
   bool isModelTool() const;
-  bool selectsAsCursor() const { return tool_ == "cursor" || tool_ == "tbridge" || tool_ == "tchain" || tool_ == "tweld" || tool_ == "tshaper" || tool_ == "tslide" || tool_ == "tnormals" || tool_ == "toptimize" || tool_ == "tmirror" || tool_ == "tfixmesh" || tool_ == "tmodgroups" || tool_ == "tsubdiv"; }   // (the tools that select as the Select Cursor — its selection kind, its Ctrl)
+  bool selectsAsCursor() const { return tool_ == "cursor" || tool_ == "tbridge" || tool_ == "tchain" || tool_ == "tweld" || tool_ == "tshaper" || tool_ == "tslide" || tool_ == "tnormals" || tool_ == "toptimize" || tool_ == "tmirror" || tool_ == "tfixmesh" || tool_ == "tmodgroups" || tool_ == "tsubdiv" || tool_ == "tscissors"; }   // (the tools that select as the Select Cursor — its selection kind, its Ctrl)
   bool topoToolPress(QMouseEvent* e);
   bool topoToolMove(const QPointF& mp, Qt::KeyboardModifiers mods);
   void modifiersChanged();                               // (Shift / Ctrl pressed or let go: the tool's preview at the pointer made anew — no move needed)
@@ -750,6 +753,8 @@ public:
   QString tMirrorMesh();                                 // a copy by the axis / round it (the side found by itself), the seam welded
   QString vsymCreate(const QString& type);               // the selected meshes into a group with a virtual symmetry (a preview)
   QString vsymApply(int group);                          // the group's symmetry made real geometry
+  QString tScissors(bool preview = false);   // (preview: nothing changed — scisViz_ made)
+  void scisPreview();                                   // the Scissors tool: the selected chain of loops split lengthwise into two branches (split ends)
   QString tSubdivide();                                  // the Subdivide tool: the selected polygons (none — the whole mesh) split into quads for good
   QString subdivCreate();                              // the selected meshes into a new Subdivision group (the modifier groups tool)
   QString subdivApply(int group);                        // the group's subdivision made real geometry of its meshes (the group stays, empty of the modifier)
@@ -1115,6 +1120,7 @@ public:
   QString uvSetNew(int m, const std::vector<int>& faces = {}, const QString& name = {});   // a new set; the selected polygons (or these) go into it, under that name (none — "UV Set n")
   QString uvSetApply(int m, int set);                    // the selected polygons' mats into the set (a part of a mat: a new mat)
   QString uvSetRename(int m, int set, const QString& name); bool uvRenameBatch_ = false;
+  std::vector<QString> uvEnsureAllSets();                    // (meshes with no UV sets: their material's set written out — the names)
   QString uvSetDelete(int m, int set);                   // its mats to the first other set
   QString uvMatNew(int m);                               // a new mat in the picked set (else the first); the selected polygons get it
   QString uvMatApply(int m, int mat);                    // the selected polygons get the mat
@@ -1231,7 +1237,9 @@ public:
   void fixDecide(int i, bool accept);
   void fixAll(bool accept);
   void endFixReview();                                   // (the report closed / checked again: kept as shown)
-  int changeCount() const { return changes_; }          // (proj.change: every commit, undo, redo)
+  int changeCount() const { return changes_; }
+  void bumpChanges() { changes_++; }
+  void overlayTouch() { overlayRev_++; requestUpdate(); }  // (an overlay drawn from data outside the viewport changed: the shader mode's head locator)                     // (a project change outside the history: the shader library)          // (proj.change: every commit, undo, redo)
   QJsonObject cameraJson() const;                        // the project's camera record { view, pos, quat, zoom, pivot }
 
   // for the renderer, read and cleared once per frame
@@ -1824,6 +1832,7 @@ private:
   struct SplitPlan;
   std::optional<SplitPlan> splitPlan(const PickedCurve& ch, const QPointF& m, QString* err) const;
   void splitEnds(const PickedCurve& ch, const QPointF& m);
+  std::vector<std::pair<Vec3, Vec3>> scisViz_; std::vector<int> scisKeyF_; int scisKeyM_ = -2, scisKeyRev_ = -1; double scisKeyPx_ = -1, scisKeyW_ = -1; QString scisKeyProf_;   // (the Topology Scissors' preview: its edges, what it was made for)
   std::vector<std::pair<double, double>> splitViz_;     // (the preview: pairs of screen points)
   bool soloOff();                                        // (Ctrl+H … while Solo is on: Solo off, nothing else)
   bool soloFollow();                                     // → the isolation changed

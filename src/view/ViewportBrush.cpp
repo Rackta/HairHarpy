@@ -176,6 +176,10 @@ void Viewport::brushMove(const QPointF& m) {
         ribR = clamp(bd_.r0 + (m.x() - bd_.start.x()), 3, 400);
         ui::hud(tr("Flat lock: width %1 px").arg(int(std::lround(ribR * 2)))); panelsLater(); break;
       }
+      if (tool_ == "tscissors") {                                     // (the Topology Scissors: the spread)
+        ttools.scisPx = clamp(bd_.r0 + (m.x() - bd_.start.x()), 2, 300); saveModelPrefs();
+        ui::hud(tr("Scissors: spread %1 px").arg(int(std::lround(ttools.scisPx)))); panelsLater(); overlayRev_++; break;
+      }
       if (tool_ == "cut") {                                           // (Split ends: the spread)
         splitR = clamp(bd_.r0 + (m.x() - bd_.start.x()), 2, 300);
         ui::hud(tr("Split ends: spread %1 px").arg(int(std::lround(splitR)))); panelsLater(); break;

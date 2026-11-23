@@ -8,6 +8,8 @@
 #include <QScrollArea>
 #include <QSizeGrip>
 #include <QSplitter>
+#include <QToolTip>
+#include <QTextDocument>
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QMouseEvent>
@@ -144,7 +146,11 @@ HairToolWin::HairToolWin(QWidget* window, QWidget* rows) : QFrame(window, Qt::To
   split_->addWidget(left);
   // ---- the options of the tool in use (scrolled when the window is short) ----
   auto* right = new QWidget; auto* rv = new QVBoxLayout(right); rv->setContentsMargins(6, 4, 4, 4); rv->setSpacing(2);
-  rv->addWidget(head(tr("TOOL OPTIONS")));
+  { auto* hr = new QHBoxLayout; hr->setContentsMargins(0, 0, 0, 0); hr->addWidget(head(tr("TOOL OPTIONS"))); hr->addStretch(1);
+    help_ = new QPushButton("?"); help_->setFixedSize(16, 16); help_->setCursor(Qt::PointingHandCursor); help_->setFocusPolicy(Qt::NoFocus);
+    help_->setStyleSheet("QPushButton{border:1px solid #666;border-radius:8px;padding:0;font-size:9px;color:#aaa;background:none}QPushButton:hover{color:#fff;border-color:#aaa}");
+    connect(help_, &QPushButton::clicked, this, [this] { QToolTip::showText(help_->mapToGlobal(QPoint(0, help_->height())), help_->toolTip(), help_); });
+    help_->hide(); hr->addWidget(help_); rv->addLayout(hr); }
   sa_ = new QScrollArea; sa_->setWidgetResizable(true); sa_->setFrameShape(QFrame::NoFrame); sa_->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
   sa_->setStyleSheet("QScrollArea{background:transparent} QScrollArea > QWidget > QWidget{background:transparent}");
   rv->addWidget(sa_, 1); right->setMinimumWidth(200);
@@ -161,6 +167,9 @@ HairToolWin::HairToolWin(QWidget* window, QWidget* rows) : QFrame(window, Qt::To
 void HairToolWin::setOptions(QWidget* w) {
   if (!w) { w = new QLabel(tr("This tool has no options")); w->setStyleSheet("color:#8a8f96;font-size:11px;margin:4px 2px"); static_cast<QLabel*>(w)->setAlignment(Qt::AlignLeft | Qt::AlignTop); }
   QWidget* old = sa_->takeWidget(); sa_->setWidget(w); w->show(); if (old) old->deleteLater();
+  // (the grey paragraphs of 90+ characters leave the window — under the ? on its title, as in the docked panels)
+  helpText_.clear(); for (QLabel* l : w->findChildren<QLabel*>()) { if (!l->property("mut").toBool() || !l->findChildren<QWidget*>().isEmpty()) continue; const QString s = l->text().trimmed(); if (s.size() < 90 || Qt::mightBeRichText(s)) continue; helpText_ << s; l->hide(); }
+  if (help_) { help_->setVisible(!helpText_.isEmpty()); help_->setToolTip("<p style='white-space:pre-wrap'>" + helpText_.join(QStringLiteral("\n\n")).toHtmlEscaped() + "</p>"); }
 }
 void HairToolWin::resizeEvent(QResizeEvent* e) { QFrame::resizeEvent(e); if (isVisible()) save(); }   // (its size kept)
 void HairToolWin::save() const {

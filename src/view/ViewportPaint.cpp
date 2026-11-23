@@ -16,6 +16,7 @@
 #include <QMouseEvent>
 #include <QPainter>
 #include <QTabletEvent>
+#include "paint/StrokeTrace.h"
 #include <algorithm>
 #include <QPolygonF>
 #include <QGuiApplication>
@@ -138,6 +139,9 @@ bool Viewport::paintPress(QMouseEvent* e) {
 // the pen over the viewport: its pressure and tip noted for the brush (paintPressureNow), the event left unaccepted — Qt then makes the
 // mouse event of it, and everything the mouse does (the camera, the tools, the brush) goes on as before
 void Viewport::tabletEvent(QTabletEvent* e) {
+  if (room() == "paint" && strace::on()) { const QPointF g = e->globalPosition();   // (the stroke trace: every pen event the view got)
+    strace::line("pen", {{"k", e->type() == QEvent::TabletPress ? 0 : e->type() == QEvent::TabletRelease ? 2 : 1}, {"x", g.x()}, {"y", g.y()}, {"p", e->pressure()}, {"tx", e->xTilt()}, {"ty", e->yTilt()},
+                         {"rot", e->rotation()}, {"ts", double(e->timestamp())}, {"btn", double(int(e->buttons()))}, {"eraser", e->pointerType() == QPointingDevice::PointerType::Eraser ? 1 : 0}}, "\"w\":\"view\""); }
   penT_ = QDateTime::currentMSecsSinceEpoch(); penEraser_ = e->pointerType() == QPointingDevice::PointerType::Eraser;
   if (e->type() == QEvent::TabletPress) penDown_ = true; else if (e->type() == QEvent::TabletRelease) penDown_ = false;
   if (e->type() != QEvent::TabletRelease) penP_ = std::clamp(float(e->pressure()), 0.f, 1.f);
@@ -1089,10 +1093,17 @@ const Viewport::PvView& Viewport::pvView() const {
   const Vec3 eye = cam_.pos, dir = cam_.dir(); double sizeAll = 0;
   auto setIdx = [&](const QString& n) { for (size_t i = 0; i < V.sets.size(); i++) if (V.sets[i] == n) return int(i); V.sets.push_back(n); return int(V.sets.size()) - 1; };
   // (a triangle into the depth picture: the nearest wins; which — the polygon's number, or −2 for what can't be painted)
-  auto raster = [&](const QPointF& a, const QPointF& b, const QPointF& c, float za, float zb, float zc, int which) {
+  // (the triangles gathered first, then rastered by bands of rows on every core — each band its own rows, the triangles in the same
+  //  order: the picture as one pass made it. One pass took 0.2 s on a 38k-polygon model each time the camera came to rest — 84 stalls in
+  //  the recording of 2026-11-22)
+  struct RT { QPointF a, b, c; float za, zb, zc; int which; };
+  std::vector<RT> rts; rts.reserve(1 << 16);
+  auto raster = [&](const QPointF& a, const QPointF& b, const QPointF& c, float za, float zb, float zc, int which) { rts.push_back({a, b, c, za, zb, zc, which}); };
+  auto rasterBand = [](const RT& t, int by0, int by1) {
+    const QPointF &a = t.a, &b = t.b, &c = t.c; const float za = t.za, zb = t.zb, zc = t.zc; const int which = t.which;
     const double den = (b.y() - c.y()) * (a.x() - c.x()) + (c.x() - b.x()) * (a.y() - c.y()); if (std::abs(den) < 1e-9) return;
     const int x0 = std::max(0, int(std::floor(std::min({a.x(), b.x(), c.x()})))), x1 = std::min(V.W - 1, int(std::ceil(std::max({a.x(), b.x(), c.x()}))));
-    const int y0 = std::max(0, int(std::floor(std::min({a.y(), b.y(), c.y()})))), y1 = std::min(V.H - 1, int(std::ceil(std::max({a.y(), b.y(), c.y()}))));
+    const int y0 = std::max(by0, int(std::floor(std::min({a.y(), b.y(), c.y()})))), y1 = std::min(by1 - 1, int(std::ceil(std::max({a.y(), b.y(), c.y()}))));
     for (int y = y0; y <= y1; y++) { const double py = y + 0.5;
       for (int x = x0; x <= x1; x++) { const double px = x + 0.5;
         const double w0 = ((b.y() - c.y()) * (px - c.x()) + (c.x() - b.x()) * (py - c.y())) / den, w1 = ((c.y() - a.y()) * (px - c.x()) + (a.x() - c.x()) * (py - c.y())) / den, w2 = 1 - w0 - w1;
@@ -1133,6 +1144,10 @@ const Viewport::PvView& Viewport::pvView() const {
         V.faces.push_back(std::move(F));
       } }
   }
+  { static const int ntEnv = qEnvironmentVariableIntValue("HM_PVTHREADS"); const int nt = std::clamp(ntEnv > 0 ? ntEnv : int(std::thread::hardware_concurrency()), 1, 16), band = (V.H + nt - 1) / nt; std::vector<std::thread> th;
+    auto run = [&](int y0) { const int y1 = std::min(V.H, y0 + band); for (const RT& t : rts) rasterBand(t, y0, y1); };
+    for (int k = 1; k < nt && k * band < V.H; k++) th.emplace_back(run, k * band);
+    run(0); for (auto& t : th) t.join(); }
   V.eps = float(std::max(1e-6, sizeAll * 4e-4)); V.ms = int(pvT.elapsed());
   return V;
 }

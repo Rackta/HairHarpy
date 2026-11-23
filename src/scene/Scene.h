@@ -3,6 +3,7 @@
 // (`raw`), so fields this version doesn't handle yet go back into a saved project unchanged.
 #pragma once
 #include "scene/Refs.h"
+#include "scene/Toon.h"
 #include "core/Math.h"
 #include <QJsonObject>
 #include <QImage>
@@ -208,6 +209,11 @@ public:
   // full: the picture is new as a whole — the renderer uploads all of it; else dirty: the part changed since the renderer last took it)
   struct PaintView { QImage flat; qint64 rev = 0; QString set; bool on = false; bool full = true; TileMask dirty; std::map<QString, std::pair<QImage, qint64>> others;
     std::map<QString, TileMask> othersDirty; std::set<QString> othersFull; } paintView;   // (the other sets: the tiles changed since the renderer took them; full — the picture anew)
+  // the shader mode (HairHarpy Toon): on / off (the button in Topology and Paint — not in the file), the library (fileRaw "toon",
+  // read into lib on a change: rev), the toon's maps of each UV set made from the Paint room's layers (slot → the picture and its
+  // revision; a null picture — the set has none of that map)
+  struct ToonView { bool on = false; qint64 rev = 0; toon::Lib lib; std::map<QString, std::array<std::pair<QImage, qint64>, toon::SlotCount>> maps; qint64 mapsRev = 0;
+                     std::map<QString, QImage> files; } toonView;   // (files: the pictures the materials name — the face SDF — read by path)
   std::map<int, RefSketch> refSketches; int nextCanvasId = 1;   // (the canvases, by their ids — RefPlane::canvas: not in the undo history)
   std::vector<RefMarker> refMarkers; int nextMarkerId = 1; bool refMarkersShown = true; qint64 refMarkRev = 0;
   Item& addItem(ItemType type, int parent, const QString& name);   // (appended to the parent's children)

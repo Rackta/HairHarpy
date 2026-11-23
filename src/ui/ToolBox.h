@@ -6,6 +6,7 @@
 #include <QHash>
 #include <QPoint>
 #include <QString>
+#include <QStringList>
 
 class QPushButton; class QSplitter; class QScrollArea;
 
@@ -55,6 +56,7 @@ private:
   void save() const;
   QWidget* bar_ = nullptr; QPoint grab_; bool drag_ = false;
   QSplitter* split_ = nullptr; QScrollArea* sa_ = nullptr;
+  QPushButton* help_ = nullptr; QStringList helpText_;   // (the options' long notes: under this ?, not in the window)
 };
 
 }  // namespace hm::ui

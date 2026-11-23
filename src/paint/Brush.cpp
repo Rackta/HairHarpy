@@ -11,6 +11,8 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include "paint/StrokeTrace.h"
+#include <QJsonDocument>
 
 namespace hm::paint {
 
@@ -99,7 +101,7 @@ Brush Brush::fromJson(const QJsonObject& o) {
 QImage Brush::preview(const QSize& s, const QColor& ink, bool pen) const {
   QImage img(s, QImage::Format_ARGB32); img.fill(QColor(36, 36, 36));
   Brush b = *this; b.mode = BrushMode::Paint; b.size = std::min<float>(size, s.height() * 0.8f); if (!pen) b.pressureSize = false;
-  Stroke st(img, b, ink); if (!st.valid()) return img;
+  strace::Mute mute; Stroke st(img, b, ink); if (!st.valid()) return img;
   const float tilt0 = g_penTilt; const int n = 60; const double pad = s.height() * 0.45;
   for (int i = 0; i <= n; i++) { const double t = double(i) / n; const QPointF p(pad + t * (s.width() - 2 * pad), s.height() * (0.5 + 0.2 * std::sin(t * 6.2831853)));
     const float pr = pen ? float(0.05 + 0.95 * std::sin(t * 3.14159265)) : 1.f; g_penTilt = pr;   // (pressed — and tilted — harder to the stroke's middle)
@@ -109,7 +111,7 @@ QImage Brush::preview(const QSize& s, const QColor& ink, bool pen) const {
 QImage Brush::preview(const QSize& s) const {
   QImage img(s, QImage::Format_ARGB32); img.fill(QColor(36, 36, 36));
   Brush b = *this; b.mode = BrushMode::Paint; b.size = std::min<float>(size, s.height() * 0.7f); b.pressureSize = false; b.opacity = 1;
-  Stroke st(img, b, QColor(230, 230, 230)); if (!st.valid()) return img;
+  strace::Mute mute; Stroke st(img, b, QColor(230, 230, 230)); if (!st.valid()) return img;
   const int n = 40; const double pad = s.height() * 0.45;
   for (int i = 0; i <= n; i++) { const double t = double(i) / n; const QPointF p(pad + t * (s.width() - 2 * pad), s.height() * (0.5 + 0.22 * std::sin(t * 6.2831853)));
     if (!i) st.begin(p); else st.move(p); }
@@ -147,7 +149,11 @@ std::vector<Stroke::Tile> Stroke::takeBefore() const {
 }
 
 void Stroke::begin(const QPointF& p, float pressure) {
-  if (!ok_) return; last_ = p; lastP_ = pressure; started_ = true; carry_ = 0; trail_ = p; dirKnown_ = false;
+  if (!ok_) return;
+  if (strace::on()) { QJsonObject bj = b_.toJson(); bj.remove("tip"); bj.remove("tipPng");   // (the stroke trace: the brush as it was for this stroke)
+    strace::line("stroke", {{"x", p.x()}, {"y", p.y()}, {"p", pressure}, {"texW", t_->width()}, {"texH", t_->height()}, {"sizeScale", sizeScale}, {"tipW", b_.tip.width()}, {"tipH", b_.tip.height()}},
+                 "\"color\":\"" + color_.name(QColor::HexArgb).toUtf8() + "\",\"brush\":" + QJsonDocument(bj).toJson(QJsonDocument::Compact)); }
+  last_ = p; lastP_ = pressure; started_ = true; carry_ = 0; trail_ = p; dirKnown_ = false;
   if (!b_.colourPerDab && (b_.hueJ > 0 || b_.satJ > 0 || b_.briJ > 0)) {   // (the colour's jitter once for the whole stroke)
     float h, s, v, a; color_.getHsvF(&h, &s, &v, &a); if (h < 0) h = 0;
     h = std::fmod(h + (rnd() - 0.5f) * b_.hueJ + 1.f, 1.f); s = clamp01(s + (rnd() - 0.5f) * b_.satJ); v = clamp01(v + (rnd() - 0.5f) * b_.briJ);
@@ -157,6 +163,7 @@ void Stroke::begin(const QPointF& p, float pressure) {
 
 void Stroke::move(const QPointF& p, float pressure) {
   if (!ok_) return; if (!started_) { begin(p, pressure); return; }
+  if (strace::on()) strace::line("pt", {{"x", p.x()}, {"y", p.y()}, {"p", pressure}});   // (the stroke trace: the point the stroke went on to)
   const QPointF d = p - last_; const double len = std::hypot(d.x(), d.y()); if (len < 1e-6) return;
   const QPointF u = d / len;
   // (the stroke's direction — for an alpha turned along it: taken from a point a rope's length behind (a third of the brush), dragged along
@@ -210,6 +217,7 @@ void Stroke::dabAt(const QPointF& at, float size, float ang, float pressure, con
   const float hx = size * 0.5f * (tip ? tw / tm : 1.f), hy = size * 0.5f * (tip ? th / tm : 1.f), R = std::hypot(hx, hy);
   const float flow = b_.flow * (b_.pressureFlow ? b_.pFlowMin + (1 - b_.pFlowMin) * b_.pFlowCurve.at(b_.pFlowSrc == 1 ? g_penTilt : pressure) : 1.f);
   const float opaP = b_.pressureOpacity ? b_.pOpacityMin + (1 - b_.pOpacityMin) * b_.pOpacityCurve.at(b_.pOpacitySrc == 1 ? g_penTilt : pressure) : 1.f;   // (the pen's pressure on the opacity: this dab's own ceiling)
+  if (strace::on()) strace::line("dab", {{"x", at.x()}, {"y", at.y()}, {"size", size}, {"ang", ang}, {"p", pressure}, {"tilt", g_penTilt}, {"flow", flow}, {"opa", b_.opacity * opaP}}, "\"c\":\"" + col.name().toUtf8() + "\"");   // (the stroke trace: every dab laid)
   const int x0 = std::max(0, int(std::floor(at.x() - R))), x1 = std::min(t_->width() - 1, int(std::ceil(at.x() + R)));
   const int y0 = std::max(0, int(std::floor(at.y() - R))), y1 = std::min(t_->height() - 1, int(std::ceil(at.y() + R)));
   if (x0 > x1 || y0 > y1) return;

@@ -34,7 +34,7 @@ struct IslandMap {
 // the maps a set of layers is painted for. The first three are kept as they were (their numbers are in saved projects); the rest are
 // the maps of the anime / toon pipelines (Guilty Gear Xrd's ILM, Genshin's light map, MToon, Unity Toon Shader, lilToon): each is a
 // mode of the Paint room with its own layers. Height is what the Normal mode paints — a relief, read as a normal map afterwards
-enum class Channel { Color, Height, Flow, Shade, ShadowMask, Specular, Rim, Outline, Emission, Opacity, MatId, BakeMask, Count };
+enum class Channel { Color, Height, Flow, Shade, ShadowMask, Specular, Rim, Outline, Emission, Opacity, MatId, BakeMask, OverHair, Count };
 // how a map's layers are kept: colour (ARGB32), a relief (Grayscale16 deltas), a direction (RGBA8888) — a gray map is kept as colour
 // and painted with grays (its layers blend as any colour's), written out as one channel
 enum class Storage { Colour, Relief, Direction };

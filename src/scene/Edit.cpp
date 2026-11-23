@@ -387,6 +387,64 @@ int averageCurve(Scene& sc, const CurveCache& cc, int id1, int id2) {
   return c.id;
 }
 
+// ======================= ◒ caps =======================
+std::vector<int> capAnchors(const Scene& sc, const Item& cap) {
+  std::vector<int> A; if (cap.type != ItemType::Cap) return A;
+  for (const QJsonValue& v : cap.raw.value("ends").toArray()) { const int a = v.toInt(-1); if (sc.anchor(a) && std::find(A.begin(), A.end(), a) == A.end()) A.push_back(a); }
+  return A;
+}
+
+std::map<int, int> capTips(const Scene& sc) {
+  std::map<int, int> out;
+  for (auto& [id, it] : sc.items) { if (it.type != ItemType::Cap) continue; const auto A = capAnchors(sc, it); if (A.size() < 2) continue; for (int a : A) out.emplace(a, A.front()); }
+  return out;
+}
+
+int capOfAnchor(const Scene& sc, int a) {
+  for (auto& [id, it] : sc.items) if (it.type == ItemType::Cap) { const auto A = capAnchors(sc, it); if (A.size() >= 2 && std::find(A.begin(), A.end(), a) != A.end()) return id; }
+  return -1;
+}
+
+namespace {
+// the anchors taken out of every cap (a cap left with fewer than two goes) → the caps changed or gone
+int dropFromCaps(Scene& sc, const std::set<int>& A) {
+  std::vector<int> gone; int n = 0;
+  for (auto& [id, it] : sc.items) {
+    if (it.type != ItemType::Cap || !it.raw.contains("ends")) continue;
+    const QJsonArray E = it.raw.value("ends").toArray(); QJsonArray keep; for (const QJsonValue& v : E) if (!A.count(v.toInt(-1))) keep.append(v);
+    if (keep.size() == E.size()) continue;
+    n++; if (keep.size() < 2) gone.push_back(id); else it.raw.insert("ends", keep);
+  }
+  for (int g : gone) { sc.removeFromParent(g); sc.items.erase(g); }
+  return n;
+}
+}  // namespace
+
+QString makeCap(Scene& sc, const std::vector<int>& anchors, Selection& sel) {
+  std::vector<int> A; int parent = -1;
+  for (int a : anchors) {
+    if (!sc.anchor(a) || std::find(A.begin(), A.end(), a) != A.end()) continue;
+    bool end = false;
+    for (const Item* c : sc.curves()) if (c->ring < 0 && !c->closed && c->conn.isEmpty() && c->anchors.size() >= 2 && (c->anchors.front() == a || c->anchors.back() == a)) { end = true; if (parent < 0) parent = c->parent; }
+    if (end) A.push_back(a);
+  }
+  if (A.size() < 2) return "!" + QObject::tr("◒ A cap needs two or more curve ends — select the anchors of the lock's cut tip");
+  dropFromCaps(sc, std::set<int>(A.begin(), A.end()));
+  QStringList has; for (auto& [id, it] : sc.items) if (it.type == ItemType::Cap) has << it.name;
+  QString nm; for (int n = 1; nm.isEmpty() || has.contains(nm); n++) nm = QString("Cap %1").arg(n);
+  Item& k = sc.addItem(ItemType::Cap, parent, nm);
+  QJsonArray E; for (int a : A) E.append(a); k.raw.insert("ends", E);
+  sel.anchors.clear(); sel.items = {k.id};
+  return QObject::tr("◒ %1: %2 curve ends are one tip of the lock now — the cocoon takes them as one, Convert closes them with one polygon").arg(nm).arg(A.size());
+}
+
+QString removeCaps(Scene& sc, const std::vector<int>& anchors, Selection& sel) {
+  std::set<int> caps; for (int a : anchors) { const int c = capOfAnchor(sc, a); if (c >= 0) caps.insert(c); }
+  if (caps.empty()) return "!" + QObject::tr("◒ None of these anchors is in a cap");
+  for (int c : caps) { sc.removeFromParent(c); sc.items.erase(c); sel.items.erase(std::remove(sel.items.begin(), sel.items.end(), c), sel.items.end()); }
+  return QObject::tr("◒ %1 cap%2 removed — the curve ends are separate tips again").arg(caps.size()).arg(caps.size() == 1 ? "" : "s");
+}
+
 // ======================= cocoons =======================
 std::vector<int> lockCurves(const Scene& sc, const Selection& sel) {
   std::vector<int> out; std::set<int> seen;
@@ -430,9 +488,11 @@ std::vector<std::vector<int>> lockEnds(Scene& sc, const CurveCache& cc, const st
     push(ids);
   }
   if (all) *all = out;
-  // a lock splitting into branches: its main branch only — the tip most strands go to (a tie: more anchors)
+  // a lock splitting into branches: its main branch only — the tip most strands go to (a tie: more anchors). The ends of a
+  // cap are one tip (a cut lock: its strands end apart, at its cap)
+  const auto caps = capTips(sc); auto tipOf = [&](int t) { auto f = caps.find(t); return f == caps.end() ? t : f->second; };
   std::vector<int> tipOrder; std::map<int, std::vector<size_t>> byTip;
-  for (size_t i = 0; i < out.size(); i++) { if (!byTip.count(out[i][1])) tipOrder.push_back(out[i][1]); byTip[out[i][1]].push_back(i); }
+  for (size_t i = 0; i < out.size(); i++) { const int t = tipOf(out[i][1]); if (!byTip.count(t)) tipOrder.push_back(t); byTip[t].push_back(i); }
   if (byTip.size() > 1) {
     int bt = -1; for (int t : tipOrder) { auto& l = byTip[t]; if (bt < 0 || l.size() > byTip[bt].size() || (l.size() == byTip[bt].size() && out[l[0]].size() > out[byTip[bt][0]].size())) bt = t; }
     std::vector<std::vector<int>> best; for (size_t i : byTip[bt]) best.push_back(out[i]);
@@ -518,6 +578,8 @@ QString splitLockBranches(Scene& sc, const CurveCache& cc, int item, Selection& 
   Selection gs; gs.items = {gid};
   const auto lock = lockCurves(sc, gs);
   std::vector<std::vector<int>> strands; lockEnds(sc, cc, lock, nullptr, &strands);
+  const auto caps = capTips(sc);                               // (a cap's ends: one tip)
+  for (auto& s : strands) if (auto f = caps.find(s[1]); f != caps.end() && f->second != s[1]) { s.push_back(s[1]); s[1] = f->second; }   // (its own tip kept among its anchors)
   std::vector<int> tipOrder; std::map<int, std::vector<size_t>> byTip;
   for (size_t i = 0; i < strands.size(); i++) { const int t = strands[i][1]; if (!byTip.count(t)) tipOrder.push_back(t); byTip[t].push_back(i); }
   if (byTip.size() < 2) return "!" + QObject::tr("%1 has no branches: all its strands end at one tip").arg(gname);

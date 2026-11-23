@@ -22,6 +22,7 @@ public:
   DockPanel(const QString& title, DockColumn* column, bool collapsible = false, bool pin = false, bool grow = false);
   QWidget* body() const { return body_; }
   void setBody(QWidget* w);                       // (replaces the content; the old one is deleted)
+  void setFooter(QWidget* w);                     // (under the scrolled content, always in sight: the panel's main button)
   void setTitle(const QString& t);
   bool floating() const { return floating_; }
   bool collapsed() const { return collapsed_; }
@@ -46,6 +47,7 @@ private:
   QPushButton *dockBtn_ = nullptr, *colBtn_ = nullptr, *pinBtn_ = nullptr;
   QScrollArea* scroll_ = nullptr;
   QWidget* body_ = nullptr;
+  QWidget* footer_ = nullptr;
   bool floating_ = false, collapsed_ = false, pinned_ = false, grow_ = false, dragging_ = false, wanted_ = true;
   QPoint pressAt_, grabOff_;
 };

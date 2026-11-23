@@ -222,7 +222,7 @@ static LockMesh ringMeshOfX(const LockInput& in, const std::map<int, WallMesh>& 
   { std::vector<Vec3> ends; for (auto& c : cols) if (c.key[0] == 'c' && !c.P.empty()) ends.push_back(c.P.back());
     Vec3 tipPt; int best = 0;
     for (const Vec3& e : ends) { int k = 0; for (const Vec3& f : ends) if (e.distanceTo(f) < 1e-3 * h) k++; if (k > best) { best = k; tipPt = e; } }
-    if (best >= 2) for (auto& c : cols) {
+    if (best >= 2 && !in.capped) for (auto& c : cols) {   // (a capped lock: its curves end apart on purpose — none carried on)
       if (c.P.empty()) continue; const double dd = c.P.back().distanceTo(tipPt);
       if (dd < 1e-3 * h || dd > 0.6 * h) continue;
       // (only a curve ending alone — no other curve's end there (a few ending together: a fork of the tip, left as it is)
@@ -629,6 +629,10 @@ static LockMesh ringMeshOfX(const LockInput& in, const std::map<int, WallMesh>& 
     for (size_t s = 0; s + 1 < ringSecs.size(); s++) open = link(open, ringSecs[s + 1].pieces, ringSecs[s].pieces);
     const auto& lastP = ringSecs.back().pieces;
     for (Sec* p : open) { if (lidEnd && std::find(lastP.begin(), lastP.end(), p) != lastP.end()) lid(p); else zip(p, cap(p, ROW_E)); }   // the tip
+    // ◒ a capped lock (a cut tip): the contour of its columns' ends closed by one polygon — an n-gon
+    if (in.capped) for (Sec* p : open) if (p->closed && p->keys.size() >= 3) {
+      zCur = -1; std::vector<int> f; for (int k : p->keys) f.push_back(V(k, ROW_E));
+      res.capFaces++; pushF(std::move(f)); }
   }
   // FOLDS — a thin lock running between two loops far apart while a column comes or goes there: its quads twist and fold
   // over. A quad of such a zip bent more than 30° across its diagonal and the gap longer than 1.5 × the lock's width
@@ -742,6 +746,26 @@ QJsonArray writeMarks(const std::vector<OkMark>& ms) {
 }
 void addU(std::vector<int>& v, int x) { if (std::find(v.begin(), v.end(), x) == v.end()) v.push_back(x); }
 bool has(const std::vector<int>& v, int x) { return std::find(v.begin(), v.end(), x) != v.end(); }
+// the open edges of a face list chained into loops (each in the faces' own direction); an open chain (it runs into a
+// vertex of more than one open edge) is left out
+std::vector<std::vector<int>> boundaryLoops(const std::vector<std::vector<int>>& faces) {
+  std::map<std::pair<int, int>, int> ec; for (auto& f : faces) for (size_t q = 0; q < f.size(); q++) { const int a = f[q], b = f[(q + 1) % f.size()]; ec[{std::min(a, b), std::max(a, b)}]++; }
+  std::map<int, std::vector<int>> next;
+  for (auto& f : faces) for (size_t q = 0; q < f.size(); q++) { const int a = f[q], b = f[(q + 1) % f.size()]; if (ec[{std::min(a, b), std::max(a, b)}] == 1) next[a].push_back(b); }
+  std::vector<std::vector<int>> out; std::set<int> seen;
+  for (auto& [v0, nx] : next) { if (seen.count(v0) || nx.size() != 1) continue;
+    std::vector<int> L; int v = v0; bool ok = false;
+    while (true) { if (seen.count(v)) { ok = v == v0; break; } auto it = next.find(v); if (it == next.end() || it->second.size() != 1) break; seen.insert(v); L.push_back(v); v = it->second[0]; }
+    if (ok && L.size() >= 3) out.push_back(L); }
+  return out;
+}
+// a point's distance to a closed polyline
+double distToLoop(const std::vector<Vec3>& P, const Vec3& q) {
+  double best = 1e300; const size_t n = P.size();
+  for (size_t i = 0; i < n; i++) { const Vec3& a = P[i]; const Vec3& b = P[(i + 1) % n]; const Vec3 ab = b - a; const double L = ab.lengthSq();
+    const double t = L > 1e-24 ? std::clamp((q - a).dot(ab) / L, 0.0, 1.0) : 0; best = std::min(best, (a + ab * t).distanceTo(q)); }
+  return best;
+}
 
 LockWeldResult weldLocksRun(const std::vector<LockInfo>& list, WeldCtx& W);
 
@@ -1334,7 +1358,7 @@ ConvertResult convertCocoons(Scene& sc, HairState& hs, const std::vector<int>& s
   struct Made { int m, top; std::vector<int> fam; };
   std::vector<Made> made;
   // Weld locks: the converted locks that touch — one mesh (weldLocks); off — each its own
-  struct Grp { std::vector<int> fam; const std::vector<Vec3>* pos; const std::vector<std::vector<int>>* faces; int crown = -1; const std::vector<int>* faceLock = nullptr; };   // (faceLock: each face's cocoon (a crown's own: the crown) — none: all fam[0]'s)
+  struct Grp { std::vector<int> fam; const std::vector<Vec3>* pos; const std::vector<std::vector<int>>* faces; int crown = -1; const std::vector<int>* faceLock = nullptr; std::vector<int> braids; };   // (braids: the braids of segments stitched into it)   // (faceLock: each face's cocoon (a crown's own: the crown) — none: all fam[0]'s)
   std::vector<std::unique_ptr<std::vector<int>>> ownedFl;
   std::vector<Grp> groups;
   std::vector<std::unique_ptr<std::pair<std::vector<Vec3>, std::vector<std::vector<int>>>>> owned;
@@ -1377,6 +1401,66 @@ ConvertResult convertCocoons(Scene& sc, HairState& hs, const std::vector<int>& s
     }
     groups.push_back(cg); owned.push_back(std::move(own)); ownedFl.push_back(std::move(fl));
   }
+  // ⌇ the braids of segments: a converted lock attached to a connector end (an end of one of its curves on the
+  // connector's ring) is stitched there — one end loop of it round the braid's axis: those points are the core's last
+  // ring (all quads); several locks: their points on the connector, in order round it, are that ring; the braid and the
+  // locks become one mesh. (A selected lock takes its braid along, as a crown's lower connector does.)
+  std::set<int> brDone; int stitched = 0;
+  for (int bid : braid::braids(sc)) {
+    const Item* B = sc.item(bid); if (!B || !braid::segMode(*B) || (!has(brs, bid) && !sc.isVisible(*B)) || !cs) continue;
+    const auto ends = braid::segEnds(sc, hs.curves, *B, center);
+    std::vector<int> att[2];
+    for (int e = 0; e < 2; e++) { const Item* K = ends[size_t(e)].on ? sc.item(ends[size_t(e)].conn) : nullptr; if (!K) continue;
+      for (size_t gi = 0; gi < groups.size(); gi++) { bool on = false;
+        for (int x : groups[gi].fam) { LockInput in; if (!cs->lockInput(x, in)) continue;
+          for (auto& w : in.walls) for (int c : {w.a, w.b}) if (const Item* ci = sc.item(c); ci && !ci->anchors.empty()) for (int a : {ci->anchors.front(), ci->anchors.back()}) if (crown::onConnector(sc, a, *K)) on = true; }
+        if (on) att[e].push_back(int(gi)); } }
+    if (att[0].empty() && att[1].empty()) continue;
+    std::vector<Vec3> loop[2]; std::vector<std::vector<std::pair<int, int>>> slot[2];   // (each ring point: the locks' points welded onto it — group, vertex)
+    for (int e = 0; e < 2; e++) {
+      if (att[e].empty()) continue; const auto& E = ends[size_t(e)]; auto ki = hs.curves.find(E.conn); if (ki == hs.curves.end() || ki->second.p.size() < 3) continue;
+      const std::vector<Vec3>& KP = ki->second.p; const double tol = std::max(0.2 * E.width, 1e-9);
+      struct Cand { int g; std::vector<int> v; std::vector<char> near; };
+      std::vector<Cand> cand;
+      for (int gi : att[e]) for (auto& lp : boundaryLoops(*groups[size_t(gi)].faces)) {
+        Cand c{gi, lp, {}}; int nn = 0; for (int v : lp) { const bool nr = distToLoop(KP, (*groups[size_t(gi)].pos)[size_t(v)]) < tol; c.near.push_back(nr); nn += nr; }
+        if (nn * 2 >= int(lp.size())) cand.push_back(std::move(c)); }
+      if (cand.empty()) continue;
+      auto angOf = [&](const Vec3& q) { const Vec3 d = q - E.p; return std::atan2(d.dot(E.N), d.dot(E.B)); };
+      auto winds = [&](const Cand& c) { double sum = 0; for (size_t k = 0; k < c.v.size(); k++) { double d = angOf((*groups[size_t(c.g)].pos)[size_t(c.v[(k + 1) % c.v.size()])]) - angOf((*groups[size_t(c.g)].pos)[size_t(c.v[k])]);
+        while (d > 3.14159265358979) d -= 2 * 3.14159265358979; while (d < -3.14159265358979) d += 2 * 3.14159265358979; sum += d; } return std::abs(sum) > 3.14159265358979; };
+      if (cand.size() == 1 && winds(cand[0])) { for (int v : cand[0].v) { loop[e].push_back((*groups[size_t(cand[0].g)].pos)[size_t(v)]); slot[e].push_back({{cand[0].g, v}}); } }
+      else {
+        std::vector<std::pair<double, std::pair<int, int>>> pts;
+        for (auto& c : cand) for (size_t k = 0; k < c.v.size(); k++) if (c.near[k]) pts.push_back({angOf((*groups[size_t(c.g)].pos)[size_t(c.v[k])]), {c.g, c.v[k]}});
+        std::sort(pts.begin(), pts.end());
+        for (auto& [a, gv] : pts) { const Vec3 q = (*groups[size_t(gv.first)].pos)[size_t(gv.second)];
+          if (!loop[e].empty() && loop[e].back().distanceTo(q) < E.width * 1e-4) { slot[e].back().push_back(gv); continue; }   // (two locks' points at one place: one ring point)
+          loop[e].push_back(q); slot[e].push_back({gv}); }
+        if (loop[e].size() >= 2 && loop[e].front().distanceTo(loop[e].back()) < E.width * 1e-4) { for (auto& gv : slot[e].back()) slot[e].front().push_back(gv); loop[e].pop_back(); slot[e].pop_back(); }
+      }
+      if (loop[e].size() < 3) { loop[e].clear(); slot[e].clear(); }
+    }
+    if (loop[0].empty() && loop[1].empty()) continue;
+    auto SB = braid::buildSegments(sc, hs.curves, *B, center, loop[0].empty() ? nullptr : &loop[0], loop[1].empty() ? nullptr : &loop[1]);
+    if (!SB || SB->mesh.faceCount() <= 0) continue;
+    auto own = std::make_unique<std::pair<std::vector<Vec3>, std::vector<std::vector<int>>>>();
+    own->first = SB->mesh.pos; for (int f = 0; f < SB->mesh.faceCount(); f++) own->second.push_back(std::vector<int>(SB->mesh.faceVerts.begin() + SB->mesh.faceStart[size_t(f)], SB->mesh.faceVerts.begin() + SB->mesh.faceStart[size_t(f) + 1]));
+    auto fl = std::make_unique<std::vector<int>>(own->second.size(), bid);
+    Grp mg{{}, &own->first, &own->second, -1, fl.get(), {bid}};
+    std::vector<int> take; for (int e = 0; e < 2; e++) if (!loop[e].empty()) for (auto& sl : slot[e]) for (auto& gv : sl) addU(take, gv.first);
+    for (int gi : take) {
+      const Grp& g = groups[size_t(gi)]; std::vector<int> map(g.pos->size(), -1);
+      for (int e = 0; e < 2; e++) if (!loop[e].empty() && SB->endRing[e].size() == loop[e].size()) for (size_t k = 0; k < slot[e].size(); k++) for (auto& gv : slot[e][k]) if (gv.first == gi && SB->endRing[e][k] >= 0) { map[size_t(gv.second)] = SB->endRing[e][k]; out.welded++; }
+      for (size_t v = 0; v < map.size(); v++) if (map[v] < 0) { map[v] = int(own->first.size()); own->first.push_back((*g.pos)[v]); }
+      for (size_t fi = 0; fi < g.faces->size(); fi++) { const auto& f = (*g.faces)[fi]; std::vector<int> nf; for (int v : f) { const int x = map[size_t(v)]; if (nf.empty() || nf.back() != x) nf.push_back(x); }
+        if (nf.size() > 1 && nf.front() == nf.back()) nf.pop_back(); if (nf.size() >= 3) { own->second.push_back(nf); fl->push_back(g.faceLock && fi < g.faceLock->size() ? (*g.faceLock)[fi] : g.fam.empty() ? g.crown : g.fam[0]); } }
+      mg.fam.insert(mg.fam.end(), g.fam.begin(), g.fam.end()); if (mg.crown < 0) mg.crown = g.crown; for (int x : g.braids) addU(mg.braids, x);
+    }
+    std::vector<Grp> rest; for (size_t gi = 0; gi < groups.size(); gi++) if (!has(take, int(gi))) rest.push_back(groups[gi]);
+    groups = rest; groups.push_back(mg); owned.push_back(std::move(own)); ownedFl.push_back(std::move(fl));
+    brDone.insert(bid); stitched++;
+  }
   for (auto& grp : groups) {
     if (grp.fam.empty() && grp.crown >= 0) {                 // (a crown alone)
       const Item* K = sc.item(grp.crown); int gid = K->parent; const Item* g = gid >= 0 ? sc.item(gid) : nullptr;
@@ -1394,7 +1478,9 @@ ConvertResult convertCocoons(Scene& sc, HairState& hs, const std::vector<int>& s
     QString gname = g ? g->name : QString(), kname = sc.item(k)->name;
     std::vector<LockInput::Wall> walls; for (int x : grp.fam) { LockInput in; cs->lockInput(x, in); walls.insert(walls.end(), in.walls.begin(), in.walls.end()); }
     nextNumber(sc, ItemType::Mesh, "Mesh", "mesh");
-    Item& m = sc.addItem(ItemType::Mesh, gid, (g ? gname : kname) + " mesh");
+    QString mname = (g ? gname : kname) + " mesh";
+    if (!grp.braids.empty()) { const Item* B = sc.item(grp.braids[0]); const Item* BG = B && B->parent >= 0 ? sc.item(B->parent) : nullptr; mname = (BG && BG->raw.value("braidGroup").toBool() ? BG->name : B ? B->name : mname) + " mesh"; }
+    Item& m = sc.addItem(ItemType::Mesh, gid, mname);
     auto poly = std::make_shared<PolyMesh>(); poly->pos = *grp.pos; for (auto& f : *grp.faces) poly->addFace(f.data(), int(f.size()));
     lockGroups(sc, cs, *poly, grp.faceLock, grp.fam.empty() ? grp.crown : k);   // (each lock a polygroup of its own)
     m.poly = poly;
@@ -1404,6 +1490,9 @@ ConvertResult convertCocoons(Scene& sc, HairState& hs, const std::vector<int>& s
     m.raw = QJsonObject{{"data", groupsJson(*poly, QJsonObject{{"pos", P}, {"faces", F}})}, {"srcSurfs", S}, {"srcCrowns", grp.crown >= 0 ? QJsonArray{grp.crown} : QJsonArray()}, {"symBaked", false}, {"fromCocoon", k}};
     made.push_back({m.id, k, grp.fam});
     if (grp.crown >= 0) { const Item* K = sc.item(grp.crown); if (K->parent >= 0) sc.item(K->parent)->visible = false; }   // (the crown's group hidden too)
+    for (int bid : grp.braids) { const Item* B = sc.item(bid); const Item* BG = B && B->parent >= 0 ? sc.item(B->parent) : nullptr;   // (a braid stitched in: hidden as when converted alone)
+      if (BG && BG->raw.value("braidGroup").toBool()) sc.item(BG->id)->visible = false; else if (B) sc.item(bid)->visible = false;
+      m.raw.insert("fromBraid", bid); }
     // (the locks' groups hidden — their curves and walls stay as they are; a wall outside any lock group — its own
     // group, else it alone)
     std::vector<int> hide; for (int x : grp.fam) { int lg = cs->lockGroup(x); if (lg >= 0) addU(hide, lg); }
@@ -1416,7 +1505,11 @@ ConvertResult convertCocoons(Scene& sc, HairState& hs, const std::vector<int>& s
   }
   // the braids: each its separate tubes, a mesh of its own — welded to nothing (not to the locks, not to each other)
   for (int bid : brs) {
-    const Item* B = sc.item(bid); PolyMesh pm = braid::tubesMesh(sc, hs.curves, *B, center); if (pm.faceCount() <= 0) { out.bad << B->name; continue; }
+    if (brDone.count(bid)) continue;                         // (stitched to its locks above)
+    const Item* B = sc.item(bid); PolyMesh pm;
+    if (braid::segMode(*B)) { if (auto SB = braid::buildSegments(sc, hs.curves, *B, center)) pm = std::move(SB->mesh); }
+    else pm = braid::tubesMesh(sc, hs.curves, *B, center);
+    if (pm.faceCount() <= 0) { out.bad << B->name; continue; }
     const int gid = B->parent; const Item* g = gid >= 0 ? sc.item(gid) : nullptr; const QString name = (g && g->raw.value("braidGroup").toBool() ? g->name : B->name) + " mesh";
     nextNumber(sc, ItemType::Mesh, "Mesh", "mesh");
     Item& m = sc.addItem(ItemType::Mesh, gid, name); m.poly = std::make_shared<PolyMesh>(std::move(pm));
@@ -1450,6 +1543,7 @@ ConvertResult convertCocoons(Scene& sc, HairState& hs, const std::vector<int>& s
   if (out.folds) out.message += QString(" · %1 loop%2 added where the lock folded (%3)").arg(out.folds).arg(out.folds == 1 ? "" : "s").arg(out.folded.join(", "));
   if (out.lockWeld) { auto& lw = *out.lockWeld; out.message += QString(" · locks welded: %1 points joined, %2 faces of double walls and %3 inside other locks removed, %4 faces closing holes").arg(lw.merged).arg(lw.doubled).arg(lw.inside).arg(lw.filled);
     if (lw.keptApart) out.message += QString(" · %1 crossing%2 marked correct left unwelded, inner walls stay there (Ctrl+Z, Check connections, right-click the green pin → Weld again)").arg(lw.keptApart).arg(lw.keptApart == 1 ? "" : "s"); }
+  if (stitched) out.message += QString(" · %1 braid%2 stitched to %3").arg(stitched).arg(stitched == 1 ? "" : "s").arg(stitched == 1 ? "its locks" : "their locks");
   if (out.dropped) out.message += QString(" · %1 ring%2 left out (no wall of the lock crosses it near it, in order)").arg(out.dropped).arg(out.dropped == 1 ? "" : "s");
   if (!out.bad.isEmpty()) out.message += " · not converted: " + out.bad.join(", ");
   return out;

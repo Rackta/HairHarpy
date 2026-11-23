@@ -1,5 +1,6 @@
 #include "view/Renderer.h"
 #include "scene/Cocoons.h"
+#include "scene/Edit.h"
 #include "scene/Looks.h"
 #include "scene/Refs.h"
 #include "scene/Symmetry.h"
@@ -102,6 +103,13 @@ void Renderer::collectGarbage(bool all) {
       deadTex_[i] = deadTex_.back(); deadTex_.pop_back();
     } else i++;
   }
+  for (size_t i = 0; i < deadToon_.size();) {
+    if (all || --deadToon_[i].frames <= 0) {
+      if (deadToon_[i].ds && toonPool_) df_->vkFreeDescriptorSets(dev, toonPool_, 1, &deadToon_[i].ds);
+      if (deadToon_[i].ubo.buf) { df_->vkDestroyBuffer(dev, deadToon_[i].ubo.buf, nullptr); df_->vkFreeMemory(dev, deadToon_[i].ubo.mem, nullptr); }
+      deadToon_[i] = deadToon_.back(); deadToon_.pop_back();
+    } else i++;
+  }
 }
 
 VkShaderModule Renderer::loadShader(const QString& name) {
@@ -117,7 +125,7 @@ VkShaderModule Renderer::loadShader(const QString& name) {
 
 VkPipeline Renderer::makePipeline(VkPipelineLayout layout, const QString& vs, const QString& fs, VkPrimitiveTopology topo,
                                   const VkVertexInputBindingDescription& bind, const VkVertexInputAttributeDescription* attrs, int nAttrs,
-                                  bool depthTest, bool depthWrite, bool blend, bool depthBias, bool lineWidthDynamic, bool colorWrite) {
+                                  bool depthTest, bool depthWrite, bool blend, bool depthBias, bool lineWidthDynamic, bool colorWrite, int stencil, VkCullModeFlags cull) {
   VkShaderModule v = loadShader(vs), f = loadShader(fs);
   VkPipelineShaderStageCreateInfo st[2]{{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}, {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
   st[0].stage = VK_SHADER_STAGE_VERTEX_BIT; st[0].module = v; st[0].pName = "main";
@@ -131,7 +139,7 @@ VkPipeline Renderer::makePipeline(VkPipelineLayout layout, const QString& vs, co
   VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
   vp.viewportCount = 1; vp.scissorCount = 1;
   VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
-  rs.polygonMode = VK_POLYGON_MODE_FILL; rs.cullMode = VK_CULL_MODE_NONE;
+  rs.polygonMode = VK_POLYGON_MODE_FILL; rs.cullMode = cull;
   rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;     // (the clip correction flips Y: GL's counter-clockwise front faces)
   rs.lineWidth = 1.0f;
   if (depthBias) { rs.depthBiasEnable = VK_TRUE; rs.depthBiasConstantFactor = 1.0f; rs.depthBiasSlopeFactor = 1.0f; }
@@ -139,6 +147,13 @@ VkPipeline Renderer::makePipeline(VkPipelineLayout layout, const QString& vs, co
   ms.rasterizationSamples = w_->sampleCountFlagBits();
   VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
   ds.depthTestEnable = depthTest; ds.depthWriteEnable = depthWrite; ds.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+  if (stencil) {   // (the shader mode's over-the-hair parts: see Renderer.h)
+    VkStencilOpState so{}; so.compareMask = 0xff; so.failOp = VK_STENCIL_OP_KEEP; so.depthFailOp = VK_STENCIL_OP_KEEP;
+    // (bit 0 — an over-the-hair part seen; bit 1 — hair in front of it: the over pass draws where both are, nowhere else)
+    if (stencil == 3) { so.compareOp = VK_COMPARE_OP_EQUAL; so.passOp = VK_STENCIL_OP_KEEP; so.writeMask = 0; so.compareMask = 3; so.reference = 3; }
+    else if (stencil == 4) { so.compareOp = VK_COMPARE_OP_ALWAYS; so.passOp = VK_STENCIL_OP_REPLACE; so.writeMask = 2; so.reference = 2; }
+    else { so.compareOp = VK_COMPARE_OP_ALWAYS; so.passOp = VK_STENCIL_OP_REPLACE; so.writeMask = 0xff; so.reference = stencil == 1 ? 1 : 0; }
+    ds.stencilTestEnable = VK_TRUE; ds.front = so; ds.back = so; }
   VkPipelineColorBlendAttachmentState ba{};
   ba.colorWriteMask = colorWrite ? 0xF : 0;
   if (blend) {
@@ -234,6 +249,66 @@ void Renderer::initResources() {
   rpBehindPipe_ = makePipeline(texLayout_, "mesh_tex.vert", "mesh_tex.frag", VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, tvb, tva, 3, true, false, true, false, false);
   rpOverPipe_ = makePipeline(texLayout_, "mesh_tex.vert", "mesh_tex.frag", VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, tvb, tva, 3, false, false, true, false, false);
   QImage w(1, 1, QImage::Format_RGBA8888); w.fill(Qt::white); white_ = uploadImage(w, false);
+  // the shader mode: set 1 — the toon's maps (toon::Slot) and the parameters' uniform buffer — read by the outline's vertex shader too
+  {
+    constexpr uint32_t NB = toon::SlotCount + 1;
+    VkDescriptorSetLayoutBinding b[NB]{};
+    for (uint32_t i = 0; i < NB; i++) { b[i].binding = i; b[i].descriptorType = i < uint32_t(toon::SlotCount) ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; b[i].descriptorCount = 1; b[i].stageFlags = VF; }
+    VkDescriptorSetLayoutCreateInfo l{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO}; l.bindingCount = NB; l.pBindings = b;
+    df_->vkCreateDescriptorSetLayout(dev, &l, nullptr, &toonSetLayout_);
+    VkDescriptorPoolSize ps2[2] = {{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 256 * uint32_t(toon::SlotCount)}, {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 256}};
+    VkDescriptorPoolCreateInfo p{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO}; p.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT; p.maxSets = 256; p.poolSizeCount = 2; p.pPoolSizes = ps2;
+    df_->vkCreateDescriptorPool(dev, &p, nullptr, &toonPool_);
+    VkPushConstantRange r{VF, 0, sizeof(MeshPC)}; VkDescriptorSetLayout sl[2] = {texSetLayout_, toonSetLayout_};
+    VkPipelineLayoutCreateInfo li{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO}; li.setLayoutCount = 2; li.pSetLayouts = sl; li.pushConstantRangeCount = 1; li.pPushConstantRanges = &r;
+    df_->vkCreatePipelineLayout(dev, &li, nullptr, &toonLayout_);
+    auto tp = [&](bool blend, int st) { return makePipeline(toonLayout_, "mesh_tex.vert", "toon.frag", VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, tvb, tva, 3, true, true, blend, true, false, true, st); };
+    toonPipe_ = tp(false, 2); toonBlendPipe_ = tp(true, 2); toonOverPipe_ = tp(false, 1); toonOverBlendPipe_ = tp(true, 1); toonHairPipe_ = tp(false, 4); toonHairBlendPipe_ = tp(true, 4);
+    toonOverDrawPipe_ = makePipeline(toonLayout_, "mesh_tex.vert", "toon.frag", VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, tvb, tva, 3, false, false, true, false, false, true, 3);
+    toonOutlinePipe_ = makePipeline(toonLayout_, "toon_outline.vert", "toon_outline.frag", VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, tvb, tva, 3, true, true, false, false, false, true, 2, VK_CULL_MODE_FRONT_BIT);
+  }
+}
+
+// the shader mode's set 1 for a UV set: its toon maps (uploaded when their revision changes) and the parameters of the instance the
+// object's set wears; the same descriptor while neither changes
+VkDescriptorSet Renderer::toonDescriptor(int itemId, const QString& set) {
+  const auto& TV = w_->scene()->toonView; if (!toonPool_ || !toonSetLayout_) return VK_NULL_HANDLE;
+  const QString inst = TV.lib.instFor(itemId, set);
+  std::array<QString, toon::SlotCount> keys; std::array<bool, toon::SlotCount> has{};
+  const auto mit = TV.maps.find(set);
+  for (int s = 0; s < toon::SlotCount; s++) {
+    if (mit == TV.maps.end() || mit->second[size_t(s)].first.isNull()) continue;
+    const auto& [img, rev] = mit->second[size_t(s)]; auto& tt = toonTex_[set + ":" + QString::number(s)];
+    if (tt.first != rev || tt.second.isEmpty() || !texCache_.count(tt.second)) {
+      dropTex(tt.second); tt.second = QString("toon:%1:%2:%3").arg(set).arg(s).arg(rev);
+      const bool srgb = s == toon::SBase || s == toon::SShade || s == toon::SEmission;
+      texCache_[tt.second] = uploadImage(img, srgb); tt.first = rev; }
+    if (texCache_[tt.second].view) { keys[size_t(s)] = tt.second; has[size_t(s)] = true; } }
+  { const QString path = toon::str(TV.lib.paramsOf(inst), "sdfPath"); const auto f = path.isEmpty() ? TV.files.end() : TV.files.find(path);   // (the face SDF: the material's picture, not a painted map)
+    if (f != TV.files.end() && !f->second.isNull()) { const QString key = "toonfile:" + path; if (!texCache_.count(key)) texCache_[key] = uploadImage(f->second, false); toonTex_["file:" + path] = {0, key};
+      if (texCache_[key].view) { keys[toon::SSdf] = key; has[toon::SSdf] = true; } } }
+  QByteArray sig = QByteArray::number(TV.rev) + "|" + inst.toUtf8(); for (const QString& k : keys) sig += "|" + k.toUtf8();
+  ToonDs& D = toonDs_[set + "|" + inst];
+  if (D.ds && D.sig == sig) return D.ds;
+  if (D.ds) deadToon_.push_back({D.ds, D.ubo, w_->concurrentFrameCount() + 1});
+  D = ToonDs{}; D.sig = sig;
+  VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO}; ai.descriptorPool = toonPool_; ai.descriptorSetCount = 1; ai.pSetLayouts = &toonSetLayout_;
+  if (df_->vkAllocateDescriptorSets(w_->device(), &ai, &D.ds) != VK_SUCCESS) { D.ds = VK_NULL_HANDLE; return VK_NULL_HANDLE; }
+  const auto u = toon::ubo(TV.lib.paramsOf(inst), has, TV.lib.head);
+  D.ubo = makeBuffer(u.data(), sizeof(float) * u.size(), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+  VkDescriptorImageInfo ii[toon::SlotCount]; VkWriteDescriptorSet wr[toon::SlotCount + 1]{};
+  for (int s = 0; s < toon::SlotCount; s++) {
+    ii[s].sampler = sampler_; ii[s].imageView = has[size_t(s)] ? texCache_[keys[size_t(s)]].view : white_.view; ii[s].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    wr[s].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; wr[s].dstSet = D.ds; wr[s].dstBinding = uint32_t(s); wr[s].descriptorCount = 1; wr[s].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; wr[s].pImageInfo = &ii[s]; }
+  VkDescriptorBufferInfo bi{D.ubo.buf, 0, VkDeviceSize(sizeof(float) * u.size())};
+  wr[toon::SlotCount].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; wr[toon::SlotCount].dstSet = D.ds; wr[toon::SlotCount].dstBinding = uint32_t(toon::SlotCount); wr[toon::SlotCount].descriptorCount = 1;
+  wr[toon::SlotCount].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; wr[toon::SlotCount].pBufferInfo = &bi;
+  df_->vkUpdateDescriptorSets(w_->device(), toon::SlotCount + 1, wr, 0, nullptr);
+  return D.ds;
+}
+void Renderer::toonDropAll() {
+  for (auto& [k, D] : toonDs_) if (D.ds) deadToon_.push_back({D.ds, D.ubo, w_->concurrentFrameCount() + 1});
+  toonDs_.clear(); for (auto& [k, t] : toonTex_) dropTex(t.second); toonTex_.clear();
 }
 
 // a reference plane's picture (a data: URL kept in the project): known by its length and its ends
@@ -443,6 +518,7 @@ void Renderer::syncTextured(const Item& it, std::set<QString>& usedTex, std::set
     if (!mk.isEmpty()) usedTex.insert(mk);
     if (!ak.isEmpty()) usedTex.insert(ak);
     p.ds = descriptorFor(mk, ak); usedSets.insert(mk + "|" + ak);
+    p.uvSet = int(i) < LS.size() ? LS[int(i)].toObject().value("name").toString() : QString();
     g.parts.push_back(p);
   }
   g.vb = makeBuffer(d.verts.data(), d.verts.size() * sizeof(TexVertex), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
@@ -522,13 +598,21 @@ void Renderer::syncPaintView(const Item& it, std::set<QString>& usedTex, std::se
   if (keepTexVerts_) *keepTexVerts_ = d.verts;
   GpuTexMesh g; g.itemId = it.id; std::vector<uint32_t> idx;
   const VkDescriptorSet plain = descriptorFor(QString(), QString()); usedSets.insert("|");
-  { TexPart p; p.first = 0; for (const auto& T : d.bySet) for (size_t t = 0; t + 2 < T.size(); t += 3) if (size_t(T[t]) < cornerFace.size() && inFace[size_t(cornerFace[size_t(T[t])])]) { idx.push_back(T[t]); idx.push_back(T[t + 1]); idx.push_back(T[t + 2]); }
-    p.count = uint32_t(idx.size()); p.flags = 1 | 32; toLinear(Qt::white, p.color); p.ds = plain; if (p.count) g.parts.push_back(p); }
-  for (size_t oi = 0; oi < otherKey.size(); oi++) {              // (a part per other UV set that has paint)
+  // (a texture set worn see-through in the other rooms — an eye's shadow, a glare: its polygons painted here keep the picture's alpha,
+  //  drawn after the solid ones. Before, they came out solid gray over the eyes — 2026-11-22)
+  std::vector<char> lookTr(d.bySet.size(), 0);
+  for (size_t i = 0; i < d.bySet.size() && i < sets.size(); i++) { const bool on = int(i) < LS.size() ? LS[int(i)].toObject().value("on").toBool(true) : false; if (!on) continue;
+    lookTr[i] = !textureFor(looks::resolve(it, int(i), 1), false).isEmpty() || (!textureFor(looks::resolve(it, int(i), 0), true).isEmpty() && looks::setAlpha(it, int(i))); }
+  auto paintPart = [&](bool tr, const std::function<bool(int)>& in, int other) {
     TexPart p; p.first = uint32_t(idx.size());
-    for (const auto& T : d.bySet) for (size_t t = 0; t + 2 < T.size(); t += 3) if (size_t(T[t]) < cornerFace.size() && faceOther[size_t(cornerFace[size_t(T[t])])] == int(oi)) { idx.push_back(T[t]); idx.push_back(T[t + 1]); idx.push_back(T[t + 2]); }
-    p.count = uint32_t(idx.size()) - p.first; if (!p.count) continue;
-    p.flags = 1; toLinear(Qt::white, p.color); p.ds = plain; p.other = otherKey[oi].toInt(); g.parts.push_back(p); }
+    for (size_t i = 0; i < d.bySet.size(); i++) { if (bool(lookTr[i]) != tr) continue; const auto& T = d.bySet[i];
+      for (size_t t = 0; t + 2 < T.size(); t += 3) if (size_t(T[t]) < cornerFace.size() && in(cornerFace[size_t(T[t])])) { idx.push_back(T[t]); idx.push_back(T[t + 1]); idx.push_back(T[t + 2]); } }
+    p.count = uint32_t(idx.size()) - p.first; if (!p.count) return;
+    p.flags = (other < 0 ? 1 | 32 : 1) | (tr ? 4 | 8 : 0); p.transparent = tr; toLinear(Qt::white, p.color); p.ds = plain; p.other = other;
+    p.uvSet = other < 0 ? set : (size_t(other) < paintOtherNames_.size() ? paintOtherNames_[size_t(other)] : QString()); g.parts.push_back(p); };
+  for (bool tr : {false, true}) paintPart(tr, [&](int f) { return bool(inFace[size_t(f)]); }, -1);
+  for (size_t oi = 0; oi < otherKey.size(); oi++)                // (a part per other UV set that has paint)
+    for (bool tr : {false, true}) paintPart(tr, [&](int f) { return faceOther[size_t(f)] == int(oi); }, otherKey[oi].toInt());
   for (size_t i = 0; i < d.bySet.size(); i++) {                  // (the rest: a part per texture set of the mesh)
     TexPart p; p.first = uint32_t(idx.size()); const auto& T = d.bySet[i];
     for (size_t t = 0; t + 2 < T.size(); t += 3) if (size_t(T[t]) < cornerFace.size() && !inFace[size_t(cornerFace[size_t(T[t])])] && faceOther[size_t(cornerFace[size_t(T[t])])] < 0) { idx.push_back(T[t]); idx.push_back(T[t + 1]); idx.push_back(T[t + 2]); }
@@ -540,7 +624,7 @@ void Renderer::syncPaintView(const Item& it, std::set<QString>& usedTex, std::se
       toLinear(QColor(looks::setColor(it, int(i), hasMap)), p.color); }
     else toLinear(QColor(QRgb(looks::HEAD_GREY)), p.color);
     if (!mk.isEmpty()) usedTex.insert(mk); if (!ak.isEmpty()) usedTex.insert(ak);
-    p.ds = descriptorFor(mk, ak); usedSets.insert(mk + "|" + ak); g.parts.push_back(p);
+    p.ds = descriptorFor(mk, ak); usedSets.insert(mk + "|" + ak); p.uvSet = int(i) < LS.size() ? LS[int(i)].toObject().value("name").toString() : QString(); g.parts.push_back(p);
   }
   g.vb = makeBuffer(d.verts.data(), d.verts.size() * sizeof(TexVertex), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
   g.ib = makeBuffer(idx.data(), idx.size() * sizeof(uint32_t), VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
@@ -688,9 +772,12 @@ void Renderer::releaseResources() {
   retire(pins_); retire(markVb_); markCount_ = 0; for (auto& [k, g] : paneMarks_) retire(g.vb); paneMarks_.clear();
   for (VkPipeline* p : {&meshPipe_, &meshBlendPipe_, &meshDepthPipe_, &linePipe_, &lineTopPipe_, &pointPipe_, &meshBlendWritePipe_, &pointDepthPipe_}) if (*p) { df_->vkDestroyPipeline(dev, *p, nullptr); *p = VK_NULL_HANDLE; }
   retire(rpVb_);
+  for (auto& [k, D] : toonDs_) if (D.ds) deadToon_.push_back({D.ds, D.ubo, 0}); toonDs_.clear(); toonTex_.clear();
   collectGarbage(true);                 // (after the last retire: what was retired after it stayed queued, and was destroyed on the next device)
-  for (VkPipeline* p : {&texPipe_, &texBlendPipe_, &rpBehindPipe_, &rpOverPipe_}) if (*p) { df_->vkDestroyPipeline(dev, *p, nullptr); *p = VK_NULL_HANDLE; }
-  for (VkPipelineLayout* l : {&meshLayout_, &lineLayout_, &pointLayout_, &texLayout_}) if (*l) { df_->vkDestroyPipelineLayout(dev, *l, nullptr); *l = VK_NULL_HANDLE; }
+  for (VkPipeline* p : {&texPipe_, &texBlendPipe_, &rpBehindPipe_, &rpOverPipe_, &toonPipe_, &toonBlendPipe_, &toonOverPipe_, &toonOverBlendPipe_, &toonHairPipe_, &toonHairBlendPipe_, &toonOverDrawPipe_, &toonOutlinePipe_}) if (*p) { df_->vkDestroyPipeline(dev, *p, nullptr); *p = VK_NULL_HANDLE; }
+  for (VkPipelineLayout* l : {&meshLayout_, &lineLayout_, &pointLayout_, &texLayout_, &toonLayout_}) if (*l) { df_->vkDestroyPipelineLayout(dev, *l, nullptr); *l = VK_NULL_HANDLE; }
+  if (toonPool_) { df_->vkDestroyDescriptorPool(dev, toonPool_, nullptr); toonPool_ = VK_NULL_HANDLE; }
+  if (toonSetLayout_) { df_->vkDestroyDescriptorSetLayout(dev, toonSetLayout_, nullptr); toonSetLayout_ = VK_NULL_HANDLE; }
   if (sampler_) { df_->vkDestroySampler(dev, sampler_, nullptr); sampler_ = VK_NULL_HANDLE; }
   if (texPool_) { df_->vkDestroyDescriptorPool(dev, texPool_, nullptr); texPool_ = VK_NULL_HANDLE; }
   if (texSetLayout_) { df_->vkDestroyDescriptorSetLayout(dev, texSetLayout_, nullptr); texSetLayout_ = VK_NULL_HANDLE; }
@@ -1043,7 +1130,8 @@ void Renderer::syncStatic() {
   // (the reference planes' images stay too)
   for (const RefPlane& rp : sc.refPlanes) { QString mk = textureFor(refImage(rp), true); if (!mk.isEmpty()) usedTex.insert(mk); usedSets.insert(mk + "|"); }
   for (auto& [id, k] : sketchKey_) { usedTex.insert(k); usedSets.insert(k + "|"); }
-  for (auto& [n, k] : paintOtherKey_) { usedTex.insert(k); usedSets.insert(k + "|"); }   // (the Paint room's other UV sets: freed where they are uploaded)   // (the ✏ drawings: freed by sketchTexture itself)
+  for (auto& [n, k] : paintOtherKey_) { usedTex.insert(k); usedSets.insert(k + "|"); }   // (the Paint room's other UV sets: freed where they are uploaded)
+  for (auto& [n, t] : toonTex_) usedTex.insert(t.second);       // (the shader mode's maps: freed where they are uploaded)   // (the ✏ drawings: freed by sketchTexture itself)
   // textures and their descriptor sets no mesh uses any more: freed once the frames in flight are done with them
   for (auto it = texSets_.begin(); it != texSets_.end();) { if (usedSets.count(it->first)) { ++it; continue; } deadTex_.push_back({GpuTex{}, it->second, w_->concurrentFrameCount() + 1}); it = texSets_.erase(it); }
   // (a file's map no mesh shows now — the Paint room draws its own pictures: kept three minutes more, so that coming back to the
@@ -1133,6 +1221,26 @@ void Renderer::syncRings() { ProfScope prof_("syncRings");
     GpuMesh g = uploadMesh(id, buildMeshDraw(pm, false), color, nullptr); g.transparent = true;
     shells_.push_back(g);
   }
+  // ◒ the caps: the cut tip's polygon — its ends in order round their middle, an amber outline and a see-through fill
+  if (w_->display().showSurfaces) for (auto& [id, it] : sc.items) {
+    if (it.type != ItemType::Cap || !sc.isVisible(it)) continue;
+    const auto A = edit::capAnchors(sc, it); if (A.size() < 2) continue;
+    std::vector<Vec3> P; Vec3 c; for (int a : A) { P.push_back(sc.anchor(a)->pos); c += P.back(); } c = c / double(P.size());
+    if (P.size() >= 3) {                                            // (the order round the middle, in the plane they lie in most)
+      Vec3 n; for (size_t i = 0; i < P.size(); i++) for (size_t j = i + 1; j < P.size(); j++) { Vec3 x = (P[i] - c).cross(P[j] - c); if (n.dot(x) < 0) x = x * -1.0; n += x; }
+      if (n.lengthSq() > 1e-24) { n = n.normalized(); Vec3 e1 = (P[0] - c) - n * (P[0] - c).dot(n); if (e1.lengthSq() > 1e-24) { e1 = e1.normalized(); const Vec3 e2 = n.cross(e1);
+        std::stable_sort(P.begin(), P.end(), [&](const Vec3& a, const Vec3& b) { return std::atan2((a - c).dot(e2), (a - c).dot(e1)) < std::atan2((b - c).dot(e2), (b - c).dot(e1)); }); } }
+    }
+    const bool sel = w_->isItemSelected(id); float lc[4]; toLinear(QColor(0xe8, 0xa2, 0x3a), lc, sel ? 1.0f : 0.85f);
+    for (size_t i = 0; i < P.size(); i++) { if (P.size() == 2 && i == 1) break; const Vec3 &a = P[i], &b = P[(i + 1) % P.size()];
+      for (const Vec3* p : {&a, &b}) { rl.verts.push_back({{float(p->x), float(p->y), float(p->z)}, {lc[0], lc[1], lc[2], lc[3]}}); rb.verts.push_back({{float(p->x), float(p->y), float(p->z)}, {lc[0], lc[1], lc[2], 0.25f}}); } }
+    if (P.size() >= 3) {
+      PolyMesh pm; pm.pos = P; pm.pos.push_back(c); const int m = int(P.size());
+      for (int i = 0; i < m; i++) { int q[3] = {i, (i + 1) % m, m}; pm.addFace(q, 3); }
+      float color[4]; toLinear(QColor(0xe8, 0xa2, 0x3a), color, float((sel ? 0.45 : 0.28) * (1 - 0.6 * viewOpts().xray)));
+      GpuMesh g = uploadMesh(id, buildMeshDraw(pm, false), color, nullptr); g.transparent = true; shells_.push_back(g);
+    }
+  }
   uploadLines(rings_, rl);
   uploadLines(ringsBack_, rb);
   // the NURBS discs: a see-through annulus between their two rings (green)
@@ -1220,7 +1328,8 @@ void Renderer::syncTubes() { ProfScope prof_("syncTubes");
     PolyMesh pm; if (t.mesh) pm = *t.mesh; else { pm.pos = t.pos;
       for (int i = 0; i + 1 < NR; i++) for (int j = 0; j < n; j++) { int j1 = (j + 1) % n, q[4] = {i * n + j, i * n + j1, (i + 1) * n + j1, (i + 1) * n + j}; pm.addFace(q, 4); } }
     if (t.mesh) {   // (a surface of its own polygons: drawn solid, every edge of it over it)
-      MeshDraw dm = buildMeshDraw(pm, false); float c4[4]; toLinear(t.color.isValid() ? t.color : QColor(0x8f, 0x78, 0xe0), c4, 1.f);
+      if (t.col.size() == pm.pos.size()) pm.col = t.col;   // (a braid of segments: its painted weights shown)
+      MeshDraw dm = buildMeshDraw(pm, false); float c4[4]; toLinear(t.color.isValid() ? t.color : QColor(0x8f, 0x78, 0xe0), c4, 1.f); if (!pm.col.empty()) c4[0] = c4[1] = c4[2] = 1;
       GpuMesh gm = uploadMesh(t.item >= 0 ? t.item : id, dm, c4, nullptr); gm.transparent = false; gm.hl = true; tubes_.push_back(gm);
       float wc[4]; toLinear(QColor(0x30, 0x24, 0x48), wc, 0.45f);
       for (int f = 0; f < pm.faceCount(); f++) { const int s = pm.faceStart[size_t(f)], e = pm.faceStart[size_t(f) + 1]; for (int k = s; k < e; k++) for (int v : {pm.faceVerts[size_t(k)], pm.faceVerts[size_t(k + 1 < e ? k + 1 : s)]}) { const Vec3& p = pm.pos[size_t(v)]; wl.verts.push_back({{float(p.x), float(p.y), float(p.z)}, {wc[0], wc[1], wc[2], wc[3]}}); } }
@@ -1373,6 +1482,12 @@ void Renderer::syncOverlays() {
     auto zc = [&](double w, float* o) { for (int k = 0; k < 3; k++) o[k] = float(zn[k] + (zf[k] - zn[k]) * w); o[3] = 1; };
     for (auto& z : w_->zoneLines()) { float a[4], b[4]; zc(z.wa, a); zc(z.wb, b);
       gl.verts.push_back({{float(z.a.x), float(z.a.y), float(z.a.z)}, {a[0], a[1], a[2], 1}}); gl.verts.push_back({{float(z.b.x), float(z.b.y), float(z.b.z)}, {b[0], b[1], b[2], 1}}); } }
+  // (the shader mode's head locator: its axes — forward blue, up green, its right red — over everything while the mode is on)
+  if (const auto& TV = w_->scene()->toonView; TV.on && TV.lib.head.on) { const auto& H = TV.lib.head; double F[3], U[3], Rr[3]; H.axes(F, U, Rr);
+    const Vec3 o(H.pos[0], H.pos[1], H.pos[2]); const double sz = H.size;
+    for (auto [d, c] : {std::pair<const double*, QColor>{F, QColor(80, 160, 255)}, {U, QColor(110, 230, 120)}, {Rr, QColor(255, 90, 90)}}) { float lc[4]; toLinear(c, lc);
+      const Vec3 e = o + Vec3(d[0], d[1], d[2]) * (d == F ? sz * 1.6 : sz);
+      gl.verts.push_back({{float(o.x), float(o.y), float(o.z)}, {lc[0], lc[1], lc[2], 1}}); gl.verts.push_back({{float(e.x), float(e.y), float(e.z)}, {lc[0], lc[1], lc[2], 1}}); } }
   { float oc[4]; toLinear(QColor(0xff, 0xb0, 0x40), oc);       // (a collision capsule being placed: its rings, orange)
     for (auto& L : w_->capsuleRings()) for (size_t i = 0; i + 1 < L.size(); i++) for (const Vec3* q : {&L[i], &L[i + 1]}) gl.verts.push_back({{float(q->x), float(q->y), float(q->z)}, {oc[0], oc[1], oc[2], 1}}); }
   uploadLines(zone_, gl);
@@ -1684,32 +1799,64 @@ void Renderer::startNextFrame() {
     for (const GpuMesh& m : crowns_) if (!m.transparent) drawMesh(m);
     for (const GpuMesh& m : tubes_) if (!m.transparent) drawMesh(m);   // (the braids: solid — the strands one over another clean)
     // textured meshes: the opaque sets, then the see-through ones (blended)
-    auto drawTex = [&](bool transparent) {
-      bool bound = false;
+    // (the shader mode: the parts that know their UV set drawn by toon.frag — the set's toon maps and the instance its object's set wears)
+    const bool toonMode = w_->scene()->toonView.on && toonPipe_ && toonBlendPipe_ && (topoRoom || w_->room() == "paint");
+    if (!toonMode && !toonDs_.empty()) toonDropAll();              // (switched off: its maps and buffers freed after the frames in flight)
+    // (role: 0 — an ordinary part, 1 — over the hair, 2 — hair; pass: 0 — drawn, 1 — the over parts again where the stencil says they
+    //  were seen, 2 — the outline)
+    const toon::Lib& TL = w_->scene()->toonView.lib;
+    auto roleOf = [&](const GpuTexMesh& m, const TexPart& p) { if (!toonMode || p.uvSet.isEmpty()) return 0; const QString r = TL.roleFor(m.itemId, p.uvSet); return r == "over" ? 1 : r == "hair" ? 2 : 0; };
+    bool anyOver = false;
+    if (toonMode) for (const GpuTexMesh& m : TM) for (const TexPart& p : m.parts) if (p.count && roleOf(m, p) == 1) anyOver = true;
+    auto drawTex = [&](bool transparent, int role, int pass) {
+      VkPipeline bound = VK_NULL_HANDLE;
       for (const GpuTexMesh& m : TM) {
         if (!m.vb.buf || !m.ib.buf || offHere(m.itemId) || opOf(m.itemId) < 0.01 || (topoRoom && w_->topoTwoTone(m.itemId))) continue;
         for (const TexPart& p : m.parts) {
           if (p.transparent != transparent || !p.count || !p.ds) continue;
-          if (!bound) { df_->vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, transparent ? texBlendPipe_ : texPipe_); bound = true; }
+          if (role >= 0 && roleOf(m, p) != role) continue;
+          const VkDescriptorSet tds = toonMode && !p.uvSet.isEmpty() ? toonDescriptor(m.itemId, p.uvSet) : VK_NULL_HANDLE;
+          if (pass > 0 && !tds) continue;
+          const int rl = roleOf(m, p);
+          VkPipeline want = transparent ? texBlendPipe_ : texPipe_;
+          if (tds) {
+            if (pass == 1) want = toonOverDrawPipe_; else if (pass == 2) want = toonOutlinePipe_;
+            else if (rl == 1) want = transparent ? toonOverBlendPipe_ : toonOverPipe_; else if (rl == 2) want = transparent ? toonHairBlendPipe_ : toonHairPipe_;
+            else want = transparent ? toonBlendPipe_ : toonPipe_; }
+          const VkPipelineLayout lay = tds ? toonLayout_ : texLayout_;
+          if (!want) continue;
+          if (bound != want) { df_->vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, want); bound = want; }
           MeshPC pc{}; std::memcpy(pc.viewProj, vp.constData(), 64); std::memcpy(pc.color, p.color, 16);
           pc.lightDir[0] = float(L.x); pc.lightDir[1] = float(L.y); pc.lightDir[2] = float(L.z); pc.lightDir[3] = m.mat;
           pc.params[0] = m.flat || unlitAll || m.unlit ? 1.f : 0.f; pc.params[1] = 1.3f; pc.params[2] = 1.7f; pc.params[3] = float((p.flags & 15) | (cam.ortho() ? 16 : 0));
+          if (pass == 1) pc.params[1] = 2.f;                       // (toon.frag: the over-the-hair pass)
+          else if (tds) pc.params[1] = 0.f;
+          if (pass == 2) { pc.params[1] = float(R.width() / dpr); pc.params[2] = float(R.height() / dpr); }   // (the outline's width in the pane's pixels)
           VkDescriptorSet ds = (p.flags & 32) && paintDs_ ? paintDs_ : p.ds;
           if (p.other >= 0 && size_t(p.other) < paintOtherNames_.size()) { const auto f = paintOtherDs_.find(paintOtherNames_[size_t(p.other)]); if (f != paintOtherDs_.end()) ds = f->second; }
           pc.extra[0] = float(cam.pos.x); pc.extra[1] = float(cam.pos.y); pc.extra[2] = float(cam.pos.z); pc.extra[3] = topoRoom ? float(w_->topoPdo(m.itemId)) : 0.f;
           { const double op = opOf(m.itemId); if (op < 0.995) { pc.color[3] *= float(op); pc.params[3] = float(int(pc.params[3]) | 8); } }
           if (!topoRoom && !haloHere(m.itemId) && w_->room() != "paint" && w_->isItemSelected(m.itemId)) {   // (as drawMesh: the Topology room and the Hair room's imported meshes have the halo; the Paint room's maps shown as painted)
             float e[4]; toLinear(QColor(0x4a, 0x28, 0x00), e); for (int k = 0; k < 3; k++) pc.color[k] += e[k] * 3.14159f; }
-          df_->vkCmdPushConstants(cb, texLayout_, VF, 0, sizeof(pc), &pc);
-          df_->vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, texLayout_, 0, 1, &ds, 0, nullptr);
+          df_->vkCmdPushConstants(cb, lay, VF, 0, sizeof(pc), &pc);
+          const VkDescriptorSet both[2] = {ds, tds};
+          df_->vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, lay, 0, tds ? 2 : 1, both, 0, nullptr);
           df_->vkCmdBindVertexBuffers(cb, 0, 1, &m.vb.buf, &zero);
           df_->vkCmdBindIndexBuffer(cb, m.ib.buf, 0, VK_INDEX_TYPE_UINT32);
           df_->vkCmdDrawIndexed(cb, p.count, 1, p.first, 0, 0);
         }
       }
     };
-    drawTex(false);
-    drawTex(true);
+    if (!toonMode) { drawTex(false, -1, 0); drawTex(true, -1, 0); }
+    else {
+      if (anyOver) {                                             // (the stencil cleared in this pane: its marks are the over parts' of this frame)
+        VkClearAttachment ca{}; ca.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT; ca.clearValue.depthStencil = {1.f, 0};
+        VkClearRect cr{}; cr.rect = sc; cr.baseArrayLayer = 0; cr.layerCount = 1; df_->vkCmdClearAttachments(cb, 1, &ca, 1, &cr); }
+      drawTex(false, 1, 0); drawTex(false, 0, 0); drawTex(false, 2, 0);
+      drawTex(false, -1, 2);                                     // (the outline round the solid parts)
+      drawTex(true, 1, 0); drawTex(true, 0, 0); drawTex(true, 2, 0);
+      if (anyOver) { drawTex(false, 1, 1); drawTex(true, 1, 1); }
+    }
     // (a see-through mesh: its depth first — then only its surface nearest the camera blended in; its far side and its
     // inner layers not seen through it)
     for (const GpuMesh& m : S) if (seeThrough(m) && plainShown(m) && opOf(m.itemId) >= 0.01) { df_->vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, meshDepthPipe_); drawMesh(m);

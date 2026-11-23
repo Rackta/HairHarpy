@@ -51,6 +51,16 @@ int averageCurve(Scene& sc, const CurveCache& samples, int c1, int c2);
 bool isNewLogic(const Scene& sc, const Item& it);
 bool segNetCurve(const Item& c);
 
+// ---- ◒ caps: a lock's cut tip — curve ends that count as one common anchor of its curves (its strands end at one tip
+// for the cocoon), closed by one polygon (an n-gon) on conversion. An item 'cap' with raw.ends — the anchors ----
+std::vector<int> capAnchors(const Scene& sc, const Item& cap);      // (its anchors still there; a cap of an older file — none)
+std::map<int, int> capTips(const Scene& sc);                        // anchor → its cap's first anchor (every cap of ≥ 2)
+int capOfAnchor(const Scene& sc, int anchor);                       // the cap holding it (-1: none)
+// the selected anchors that are curve ends → a cap (into the group of the first curve ending there; an anchor already in
+// another cap leaves it) → the message ("!…" — nothing done)
+QString makeCap(Scene& sc, const std::vector<int>& anchors, Selection& sel);
+QString removeCaps(Scene& sc, const std::vector<int>& anchors, Selection& sel);   // the caps holding these anchors
+
 // ---- cocoons ----
 // the lock the selection names: the selected curves, the selected walls' curves, a selected group's curves (an edge
 // curve — the curves it runs along)
